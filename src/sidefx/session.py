@@ -110,6 +110,8 @@ def ensure_persisted_session(db_path: Path, *, prefix: str = "sess") -> str:
     created_dir = not journal_dir.exists()
     journal_dir.mkdir(parents=True, exist_ok=True)
     if created_dir:
+        with suppress(OSError):
+            os.chmod(journal_dir, 0o700)
         _write_journal_gitignore(journal_dir)
 
     target = session_file_path(db_path)
@@ -175,6 +177,8 @@ def rotate_session(
     created_dir = not journal_dir.exists()
     journal_dir.mkdir(parents=True, exist_ok=True)
     if created_dir:
+        with suppress(OSError):
+            os.chmod(journal_dir, 0o700)
         _write_journal_gitignore(journal_dir)
 
     target = session_file_path(db_path)

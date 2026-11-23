@@ -48,6 +48,7 @@ from sidefx.reconcilers import (
     inspect_git_push,
     reconcile_action,
 )
+from sidefx.reconcilers.base import sanitize_text
 from sidefx.reconcilers.git_push import _resolve_push_endpoint, redact_remote_for_display
 from sidefx.reconcilers.github import _is_loopback_host, parse_github_repo
 from sidefx.session import resolve_session_id
@@ -119,8 +120,56 @@ class _CommandPlan:
     kind: str
 
 
+_TELEGRAM_BOT_SEG_RE = re.compile(r"^bot\d+:.+$")
+_KNOWN_SECRET_PREFIX_RE = re.compile(
+    r"^(?:xox[baprs]-|gh[pousr]_|github_pat_|sk_|pk_|rk_|whsec_|AIza|AKIA|eyJ)"
+)
+_HEX_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{24,}$")
+_OPAQUE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]{20,}$")
+_MAX_ERR_DETAIL_CHARS = 300
+
+
+def _mask_segment(segment: str, *, prefix: str = "") -> str:
+    digest = hashlib.sha256(segment.encode("utf-8")).hexdigest()[:8]
+    return f"{prefix}<redacted:{digest}>"
+
+
+def _is_token_like_path_segment(segment: str) -> bool:
+    """Return True when a URL path segment looks like an embedded webhook or API secret."""
+    if not segment:
+        return False
+    if _KNOWN_SECRET_PREFIX_RE.match(segment):
+        return True
+    if _HEX_TOKEN_RE.match(segment):
+        return True
+    if _OPAQUE_TOKEN_RE.match(segment):
+        has_lower = any("a" <= ch <= "z" for ch in segment)
+        has_upper = any("A" <= ch <= "Z" for ch in segment)
+        has_digit = any("0" <= ch <= "9" for ch in segment)
+        # Mixed case + digits (Slack/Discord/Stripe webhook tokens) or long mixed-case base64url.
+        if (has_lower and has_upper and has_digit) or (
+            len(segment) >= 24 and has_lower and has_upper
+        ):
+            return True
+    return False
+
+
+def _redact_url_path(path: str) -> str:
+    if not path or "/" not in path:
+        return path
+    out: list[str] = []
+    for seg in path.split("/"):
+        if _TELEGRAM_BOT_SEG_RE.match(seg):
+            out.append(_mask_segment(seg, prefix="bot"))
+        elif _is_token_like_path_segment(seg):
+            out.append(_mask_segment(seg))
+        else:
+            out.append(seg)
+    return "/".join(out)
+
+
 def _redact_url_for_display(url: str) -> str:
-    """Strip userinfo and query/fragment from URLs before storing in target/summary."""
+    """Strip userinfo, query/fragment, and token-like path segments from URLs."""
     parsed = urllib.parse.urlsplit(url)
     if not parsed.scheme or not parsed.netloc:
         return url
@@ -128,7 +177,8 @@ def _redact_url_for_display(url: str) -> str:
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
-    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    safe_path = _redact_url_path(parsed.path)
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, safe_path, "", ""))
 
 
 def _parse_gh_repo_arg(raw: str) -> tuple[str | None, str | None]:
@@ -1788,9 +1838,14 @@ def wrap_command(
         )
 
     # Non-zero exit code: classify ambiguous crash/transport errors as `unknown`.
-    err_detail = (stderr.strip().splitlines()[-1] if stderr.strip() else None) or (
+    raw_err_detail = (stderr.strip().splitlines()[-1] if stderr.strip() else None) or (
         f"Command exited with code {returncode}"
     )
+    err_detail = sanitize_text(raw_err_detail)
+    if len(err_detail) > _MAX_ERR_DETAIL_CHARS:
+        err_detail = f"{err_detail[: _MAX_ERR_DETAIL_CHARS - 1]}…"
+    if not err_detail:
+        err_detail = f"Command exited with code {returncode}"
     if _is_ambiguous_nonzero_exit(plan, returncode):
         status, _, conflict = _safe_finalize(
             journal,

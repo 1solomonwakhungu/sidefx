@@ -98,8 +98,8 @@ Only when the user asks to protect an MCP server they already have configured. U
 | Result ref (URL or `ref@sha` from stdout) and last stderr line on failure | Raw MCP tool arguments or full stdout/stderr |
 | `git push`: repo path, remote, ref, SHAs; MCP: first 1,000 chars of text result | |
 
-- The URL **path** is stored unless you pass `--target <label>`.
-- When `sidefx` creates `.sidefx/`, it writes `.sidefx/.gitignore` containing `*`. With a custom `--db` path, gitignore it yourself and never commit or share the journal.
+- Token-like URL path segments (such as Slack/Discord/Telegram webhook tokens) are masked automatically; pass `--target <label>` if you want a custom label instead of the URL path.
+- When `sidefx` creates `.sidefx/`, it restricts directory permissions to `0700` (and `journal.db` to `0600` on POSIX) and writes `.sidefx/.gitignore` containing `*`. With a custom `--db` path, gitignore it yourself and never commit or share the journal.
 
 ## Optional: Stop-Hook Receipt
 
