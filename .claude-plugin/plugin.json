@@ -1,0 +1,21 @@
+{
+  "name": "sidefx",
+  "version": "0.1.0",
+  "description": "Outbound effects journal, transparent stdio MCP proxy, CLI mutation wrapper, crash reconciler, and ground-truth session receipts for AI agents.",
+  "author": {
+    "name": "Solomon Wakhungu",
+    "url": "https://github.com/1solomonwakhungu"
+  },
+  "homepage": "https://github.com/1solomonwakhungu/sidefx",
+  "repository": "https://github.com/1solomonwakhungu/sidefx",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "idempotency",
+    "journal",
+    "agents",
+    "safety",
+    "receipts"
+  ],
+  "skills": "./skills/"
+}

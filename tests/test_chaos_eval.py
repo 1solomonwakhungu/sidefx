@@ -316,9 +316,7 @@ class TestCLISmokeEndToEnd:
         )
         assert snippet_proc.returncode == 0, snippet_proc.stderr
         snippet = json.loads(snippet_proc.stdout)
-        assert (
-            snippet["hooks"]["Stop"][0]["hooks"][0]["command"] == "sidefx report --format markdown"
-        )
+        assert snippet["hooks"]["Stop"][0]["hooks"][0]["command"] == "sidefx hook claude-code"
 
         settings_file = tmp_path / ".claude" / "settings.json"
         merge_proc = subprocess.run(

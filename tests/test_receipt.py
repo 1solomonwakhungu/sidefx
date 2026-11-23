@@ -18,6 +18,14 @@ from sidefx.receipt import (
     sanitize_text,
 )
 from sidefx.reconcilers.base import format_summary_with_meta
+from sidefx.session import ENV_CLAUDE_CODE_SESSION_ID, ENV_SESSION_ID
+
+
+@pytest.fixture(autouse=True)
+def _clean_session_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep receipt tests hermetic even when executed inside a Claude Code session."""
+    monkeypatch.delenv(ENV_SESSION_ID, raising=False)
+    monkeypatch.delenv(ENV_CLAUDE_CODE_SESSION_ID, raising=False)
 
 
 def _populate_sample_journal(db_path: Path) -> None:
@@ -305,9 +313,7 @@ class TestClaudeCodeStopHookInit:
         assert merged["hooks"]["PreToolUse"] == existing["hooks"]["PreToolUse"]
         assert len(merged["hooks"]["Stop"]) == 2
         assert merged["hooks"]["Stop"][0]["hooks"][0]["command"] == "echo existing-stop"
-        assert (
-            merged["hooks"]["Stop"][1]["hooks"][0]["command"] == "sidefx report --format markdown"
-        )
+        assert merged["hooks"]["Stop"][1]["hooks"][0]["command"] == DEFAULT_STOP_HOOK_COMMAND
 
         # Idempotent re-run
         rc2 = main(["init", "--claude-code", "--settings", str(settings_link)])
