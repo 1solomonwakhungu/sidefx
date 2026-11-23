@@ -707,7 +707,9 @@ def _kill_upstream_tree(proc: subprocess.Popen[bytes], pgid: int | None) -> bool
             except ProcessLookupError:
                 return True
             except PermissionError:
-                return False
+                # macOS returns EPERM transiently while a process group still holds unreaped
+                # zombies before transitioning to ESRCH; keep polling until the deadline.
+                pass
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.02)
@@ -1600,6 +1602,7 @@ class MCPProxy:
         target_key = _rpc_id_key(params["requestId"])
         mapped_upstream_id: str | None = None
         with self._state_lock:
+            self._pending_passthrough.pop(target_key, None)
             for entry in self._pending_mutations.values():
                 if entry.has_client_id and _rpc_id_key(entry.client_id) == target_key:
                     mapped_upstream_id = entry.upstream_id

@@ -505,6 +505,36 @@ _GH_DYNAMIC_RANDOM_FLAGS = frozenset(
 _MAX_GH_BODY_FILE_BYTES = 4 * 1024 * 1024  # 4 MiB cap when hashing --body-file
 
 
+_GH_VALUE_FLAGS = frozenset(
+    {
+        "-R",
+        "--repo",
+        "-t",
+        "--title",
+        "-b",
+        "--body",
+        "-F",
+        "--body-file",
+        "-a",
+        "--assignee",
+        "-l",
+        "--label",
+        "-m",
+        "--milestone",
+        "-p",
+        "--project",
+        "-B",
+        "--base",
+        "-H",
+        "--head",
+        "-r",
+        "--reviewer",
+        "-T",
+        "--template",
+    }
+)
+
+
 def _normalize_gh_argv(cmd: Sequence[str]) -> list[str]:
     """Normalize a ``gh issue|pr create|comment`` argv for deterministic action ID derivation."""
     normalized: list[str] = ["gh", cmd[1].lower(), cmd[2].lower()]
@@ -521,6 +551,23 @@ def _normalize_gh_argv(cmd: Sequence[str]) -> list[str]:
             normalized.append(tok)
             idx += 1
             continue
+        if tok in ("-R", "--repo") and idx + 1 < len(cmd):
+            normalized.extend(["-R", cmd[idx + 1]])
+            idx += 2
+            continue
+        if tok in ("-F", "--body-file") and idx + 1 < len(cmd):
+            normalized.extend(["-F", cmd[idx + 1]])
+            idx += 2
+            continue
+        if tok in ("-H", "--head") and idx + 1 < len(cmd):
+            normalized.extend(["-H", cmd[idx + 1]])
+            idx += 2
+            continue
+        if tok in _GH_VALUE_FLAGS and idx + 1 < len(cmd):
+            # Preserve the flag value verbatim so values like `-Fx` are never rewritten as flags.
+            normalized.extend([tok, cmd[idx + 1]])
+            idx += 2
+            continue
         if tok.startswith("-R="):
             normalized.extend(["-R", tok.split("=", 1)[1]])
             idx += 1
@@ -528,10 +575,6 @@ def _normalize_gh_argv(cmd: Sequence[str]) -> list[str]:
         if tok.startswith("-R") and len(tok) > 2:
             normalized.extend(["-R", tok[2:]])
             idx += 1
-            continue
-        if tok == "--repo" and idx + 1 < len(cmd):
-            normalized.extend(["-R", cmd[idx + 1]])
-            idx += 2
             continue
         if tok.startswith("--repo="):
             normalized.extend(["-R", tok.split("=", 1)[1]])
@@ -541,10 +584,6 @@ def _normalize_gh_argv(cmd: Sequence[str]) -> list[str]:
             normalized.extend(["-F", tok[2:].lstrip("=")])
             idx += 1
             continue
-        if tok == "--body-file" and idx + 1 < len(cmd):
-            normalized.extend(["-F", cmd[idx + 1]])
-            idx += 2
-            continue
         if tok.startswith("--body-file="):
             normalized.extend(["-F", tok.split("=", 1)[1]])
             idx += 1
@@ -552,10 +591,6 @@ def _normalize_gh_argv(cmd: Sequence[str]) -> list[str]:
         if tok.startswith("-H") and len(tok) > 2:
             normalized.extend(["-H", tok[2:].lstrip("=")])
             idx += 1
-            continue
-        if tok == "--head" and idx + 1 < len(cmd):
-            normalized.extend(["-H", cmd[idx + 1]])
-            idx += 2
             continue
         if tok.startswith("--head="):
             normalized.extend(["-H", tok.split("=", 1)[1]])
@@ -625,14 +660,25 @@ def _derive_gh_auto_context(
 
     norm = _normalize_gh_argv(cmd)
     has_head_flag = False
+    has_positional_selector = False
     body_file_digests: list[str] = []
 
     idx = 3
     while idx < len(norm):
         tok = norm[idx]
         if tok == "--":
+            if idx + 1 < len(norm):
+                has_positional_selector = True
             break
         if tok in _GH_DYNAMIC_RANDOM_FLAGS:
+            return None
+        if (
+            tok.startswith("-")
+            and not tok.startswith("--")
+            and len(tok) > 2
+            and not tok.startswith(("-R", "-F", "-H", "-t", "-b", "-B"))
+            and (set(tok[1:]) & {"f", "w", "e"})
+        ):
             return None
         if tok == "-H" and idx + 1 < len(norm):
             has_head_flag = True
@@ -654,16 +700,23 @@ def _derive_gh_auto_context(
             body_file_digests.append(content_digest)
             idx += 2
             continue
-        if tok in ("-R", "--title", "-t", "--body", "-b", "--base", "-B"):
+        if tok in _GH_VALUE_FLAGS:
             idx += 2
             continue
+        if tok.startswith("-"):
+            idx += 1
+            continue
+        has_positional_selector = True
         idx += 1
 
     extra: dict[str, Any] = {}
     if body_file_digests:
         extra["body_file_sha256"] = body_file_digests
 
-    if sub1 == "pr" and sub2 == "create" and not has_head_flag:
+    needs_branch_context = (sub1 == "pr" and sub2 == "create" and not has_head_flag) or (
+        sub1 == "pr" and sub2 == "comment" and not has_positional_selector
+    )
+    if needs_branch_context:
         branch, head_sha = _resolve_git_head_identity(cwd)
         if not branch and not head_sha:
             return None
@@ -677,6 +730,27 @@ def _derive_gh_auto_context(
         ensure_ascii=True,
     ).encode("ascii")
     return f"gh-{sub1}-{sub2}-{hashlib.sha256(encoded).hexdigest()[:16]}", extra
+
+
+def _git_push_has_set_upstream(cmd: Sequence[str]) -> bool:
+    """Return True if ``git push`` arguments include ``-u`` / ``--set-upstream``."""
+    try:
+        push_idx = list(cmd).index("push")
+    except ValueError:
+        return False
+    for tok in cmd[push_idx + 1 :]:
+        if tok == "--":
+            break
+        if tok in ("-u", "--set-upstream"):
+            return True
+        if (
+            tok.startswith("-")
+            and not tok.startswith("--")
+            and not tok.startswith("-o")
+            and "u" in tok[1:]
+        ):
+            return True
+    return False
 
 
 def _resolved_git_push_endpoint(push_spec: GitPushSpec) -> str | None:
@@ -1284,22 +1358,47 @@ def wrap_command(
             error=payload_mismatch_message(exc, id_source="--action-id", payload_noun="command"),
         )
 
-    # For auto-derived `git push` IDs, if the prior push was confirmed/reconciled but our
-    # fresh `git ls-remote` probe proves the remote ref has since moved or been deleted,
-    # do NOT silently skip the push: derive a disambiguated ID and execute cleanly.
+    # For auto-derived `git push` IDs on REPLAY:
+    #   1. If `before_known` is False (pre-push `ls-remote` probe failed/timed out), refuse
+    #      to blindly replay exit 0 because the remote ref may have moved or been deleted!
+    #   2. If the remote ref has moved/been deleted OR `-u`/`--set-upstream` was requested
+    #      (which has a local git-config side effect even when remote is up to date), execute
+    #      under a disambiguated ID instead of silently skipping.
     if (
         begin_res.decision == BeginDecision.REPLAY
         and auto_git_push_id
         and pre_push_spec is not None
-        and pre_push_spec.before_known
     ):
+        if not pre_push_spec.before_known:
+            rec_unverified = begin_res.record
+            msg = (
+                f"OUTCOME UNKNOWN — reconcile before retrying "
+                f"(action_id={rec_unverified.action_id}, marker={rec_unverified.marker}): "
+                "could not verify remote ref via git ls-remote before replaying prior push"
+            )
+            return WrapResult(
+                exit_code=EXIT_OUTCOME_UNKNOWN,
+                action_id=rec_unverified.action_id,
+                marker=rec_unverified.marker,
+                target=rec_unverified.target,
+                tool_name=rec_unverified.tool_name,
+                status=rec_unverified.status,
+                executed=False,
+                error=msg,
+            )
+
+        wants_set_upstream = _git_push_has_set_upstream(cmd)
         remote_needs_push = (
             pre_push_spec.before_sha is not None
             if pre_push_spec.is_delete
             else pre_push_spec.before_sha != pre_push_spec.expected_sha
         )
-        if remote_needs_push:
-            disambig = f"from:{pre_push_spec.before_sha or 'absent'}"
+        if remote_needs_push or wants_set_upstream:
+            disambig = (
+                f"set-upstream:{pre_push_spec.before_sha or 'absent'}"
+                if wants_set_upstream and not remote_needs_push
+                else f"from:{pre_push_spec.before_sha or 'absent'}"
+            )
             alt_id = _derive_git_push_action_id(
                 pre_push_spec, session_id=session_id, disambiguator=disambig
             )
@@ -1318,7 +1417,7 @@ def wrap_command(
                 summary=summary_str,
             )
             if alt_begin.decision == BeginDecision.REPLAY:
-                # Remote moved/deleted a second time from the same state -> allocate fresh ID.
+                # Remote moved/deleted a second time or `-u` repeated -> allocate fresh ID.
                 alt_id = f"git-push-{uuid.uuid4().hex[:16]}"
                 alt_marker = derive_marker(actor, plan.target, alt_id)
                 alt_begin = journal.begin_action(

@@ -1290,10 +1290,22 @@ class TestWrapAutomaticDeterministicIds:
             assert r2.reconciled is True
             assert r2.executed is False
 
-            # 3. Same SHA with different flags (`git push -u origin feat/auto`) replays cleanly
-            #    without a spurious PayloadMismatchError!
-            r_flags = wrap_command(
+            # 3. Same SHA with `-u` (`git push -u origin feat/auto`) MUST execute so git sets
+            #    local upstream tracking (`branch.feat/auto.remote`) instead of silently skipping!
+            r_upstream = wrap_command(
                 ["git", "push", "-u", "origin", "feat/auto"],
+                journal=journal,
+                cwd=work,
+                env=git_env,
+                timeout_seconds=5.0,
+            )
+            assert r_upstream.exit_code == 0
+            assert r_upstream.executed is True
+            assert run_git("config", "--get", "branch.feat/auto.remote", cwd=work) == "origin"
+
+            # 3b. Plain replay with non-tracking flag (`--verbose`) still replays cleanly!
+            r_flags = wrap_command(
+                ["git", "push", "--verbose", "origin", "feat/auto"],
                 journal=journal,
                 cwd=work,
                 env=git_env,
@@ -1318,7 +1330,29 @@ class TestWrapAutomaticDeterministicIds:
             ls_out = run_git("ls-remote", str(bare), "refs/heads/feat/auto", cwd=work)
             assert "refs/heads/feat/auto" in ls_out
 
-            # 5. New commit on same branch -> NEW deterministic action ID and pushes cleanly!
+            # 5. If pre-push `ls-remote` probe fails (remote unreachable), MUST NOT blindly replay!
+            saved_url = run_git("remote", "get-url", "origin", cwd=work)
+            # Temporarily break remote reachability while keeping the same endpoint URL
+            # by moving the bare repo aside!
+            bare_moved = tmp_path / "remote_moved.git"
+            bare.rename(bare_moved)
+            try:
+                r_probe_fail = wrap_command(
+                    ["git", "push", "origin", "feat/auto"],
+                    journal=journal,
+                    cwd=work,
+                    env=git_env,
+                    timeout_seconds=5.0,
+                )
+                assert r_probe_fail.exit_code == 75
+                assert r_probe_fail.replayed is False
+                assert r_probe_fail.executed is False
+                assert "ls-remote" in (r_probe_fail.error or "")
+            finally:
+                bare_moved.rename(bare)
+                assert run_git("remote", "get-url", "origin", cwd=work) == saved_url
+
+            # 6. New commit on same branch -> NEW deterministic action ID and pushes cleanly!
             (work / "b.txt").write_text("v2\n", encoding="utf-8")
             run_git("add", "b.txt", cwd=work)
             run_git("commit", "-m", "feat 2", cwd=work)
@@ -1389,13 +1423,31 @@ class TestWrapAutomaticDeterministicIds:
         assert ctx_b1 is not None and ctx_b2 is not None
         assert ctx_b1[0] != ctx_b2[0]
 
-        # `gh pr create` without `--head` distinguishes branch `feat-a` from `feat-b`!
+        # `gh pr create` without `--head` AND selector-less `gh pr comment` distinguish branches!
         pr_cmd = ["gh", "pr", "create", "--title", "WIP", "--body", "hi"]
+        comment_cmd = ["gh", "pr", "comment", "--body", "LGTM"]
         ctx_a = _derive_gh_auto_context(pr_cmd, session_id="s", cwd=repo)
+        comment_a = _derive_gh_auto_context(comment_cmd, session_id="s", cwd=repo)
         subprocess.run(["git", "checkout", "-b", "feat-b"], cwd=str(repo), env=git_env, check=True)
         ctx_b = _derive_gh_auto_context(pr_cmd, session_id="s", cwd=repo)
+        comment_b = _derive_gh_auto_context(comment_cmd, session_id="s", cwd=repo)
         assert ctx_a is not None and ctx_b is not None
         assert ctx_a[0] != ctx_b[0]
+        assert comment_a is not None and comment_b is not None
+        assert comment_a[0] != comment_b[0]
+
+        # Clustered `-df` (`--draft --fill`) falls back to random, and `--body -Fx` is not mangled!
+        assert (
+            _derive_gh_auto_context(["gh", "pr", "create", "-df"], session_id="s", cwd=repo) is None
+        )
+        c1 = _derive_gh_auto_context(
+            ["gh", "issue", "create", "--title", "T", "--body", "-Fx"], session_id="s", cwd=repo
+        )
+        c2 = _derive_gh_auto_context(
+            ["gh", "issue", "create", "--title", "T", "--body", "-F=x"], session_id="s", cwd=repo
+        )
+        assert c1 is not None and c2 is not None
+        assert c1[0] != c2[0]
 
     def test_gh_issue_create_auto_id_reconciles_and_random_action_id_allows_duplicate(
         self, tmp_path: Path

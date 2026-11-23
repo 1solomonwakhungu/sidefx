@@ -18,6 +18,7 @@ from sidefx.reconcilers.base import sanitize_text
 from sidefx.session import (
     ENV_CLAUDE_CODE_SESSION_ID,
     ENV_SESSION_ID,
+    read_current_session,
     resolve_session_id,
 )
 
@@ -117,13 +118,18 @@ def format_claude_code_stop_message(
     if other_unresolved:
         warning_lines.append("")
         warning_lines.append(f"### Unresolved in Other Session(s) ({len(other_unresolved)})")
-        for rec in other_unresolved:
+        for rec in other_unresolved[:10]:
             err_suffix = f" — error: `{sanitize_text(rec.error)}`" if rec.error else ""
             warning_lines.append(
                 f"- `{sanitize_text(rec.action_id)}` · [{rec.status.value}] · "
                 f"session `{sanitize_text(rec.session_id)}` · `{rec.surface.value}` · "
                 f"`{sanitize_text(rec.tool_name)}` · target `{sanitize_text(rec.target)}`"
                 f"{err_suffix} (marker: `{sanitize_text(rec.marker)}`)"
+            )
+        if len(other_unresolved) > 10:
+            warning_lines.append(
+                f"- ... (+{len(other_unresolved) - 10} more; run "
+                "`sidefx status --status pending --status unknown`)"
             )
     if receipt_md:
         warning_lines.append("")
@@ -208,6 +214,14 @@ def run_claude_code_stop_hook(
     try:
         if writer_source in _WRITER_AUTHORITATIVE_SOURCES and writer_session is not None:
             data = load_receipt_data(db_path, session_id=writer_session)
+            if data.total == 0 and writer_source == f"env:{ENV_CLAUDE_CODE_SESSION_ID}":
+                # Mixed-writer fallback: if MCP proxy wrote to current-session without
+                # CLAUDE_CODE_SESSION_ID, check persisted file session when current env has 0 rows.
+                file_session = read_current_session(db_path)
+                if file_session is not None and file_session != writer_session:
+                    file_data = load_receipt_data(db_path, session_id=file_session)
+                    if file_data.total > 0:
+                        data = file_data
         elif payload_session_clean is not None:
             payload_data = load_receipt_data(db_path, session_id=payload_session_clean)
             if payload_data.total > 0:

@@ -38,9 +38,9 @@ if [ -f "$REPO_ROOT/pyproject.toml" ] && command -v uv >/dev/null 2>&1; then
   exec uv run --quiet --project "$REPO_ROOT" sidefx "$@"
 fi
 
-# 4. Fallback to uvx pinned to the sidefx package if available.
+# 4. Fallback to uvx pinned to the upstream git release tag if available.
 if command -v uvx >/dev/null 2>&1; then
-  exec uvx --from "sidefx==0.1.0" sidefx "$@"
+  exec uvx --from "git+https://github.com/1solomonwakhungu/sidefx@v0.1.0" sidefx "$@"
 fi
 
 echo "sidefx: could not locate Python >= 3.11, sidefx on PATH, or uv" >&2

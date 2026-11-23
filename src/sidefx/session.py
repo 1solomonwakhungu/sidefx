@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import uuid
 from contextlib import suppress
 from pathlib import Path
@@ -137,9 +138,11 @@ def ensure_persisted_session(db_path: Path, *, prefix: str = "sess") -> str:
             # Filesystem without hardlink support: use atomic O_CREAT|O_EXCL create-if-absent.
             if _create_session_file_excl(target, candidate):
                 return candidate
-            winner = read_current_session(db_path)
-            if winner is not None:
-                return winner
+            for _ in range(5):
+                winner = read_current_session(db_path)
+                if winner is not None:
+                    return winner
+                time.sleep(0.01)
             os.replace(tmp_path, target)
             tmp_path = None  # type: ignore[assignment]
             return candidate
