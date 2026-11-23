@@ -17,9 +17,10 @@ from typing import Any
 from sidefx.config import CONFIG_FILENAME, ConfigError, SidefxConfig, load_config
 from sidefx.journal import ActionRecord, ActionStatus, Journal, resolve_db_path
 from sidefx.reconcilers.base import parse_summary_meta, sanitize_text
+from sidefx.session import resolve_session_id
 
 DEFAULT_CLAUDE_SETTINGS_PATH = Path(".claude") / "settings.json"
-DEFAULT_STOP_HOOK_COMMAND = "sidefx report --format markdown"
+DEFAULT_STOP_HOOK_COMMAND = "sidefx hook claude-code"
 
 
 def _md_code(text: str) -> str:
@@ -300,7 +301,13 @@ def _build_report_parser() -> argparse.ArgumentParser:
         "--session-id",
         dest="session_id",
         default=None,
-        help="Filter receipt to a single session ID.",
+        help="Filter receipt to a single session ID (defaults to active session when present).",
+    )
+    parser.add_argument(
+        "--all",
+        dest="all_sessions",
+        action="store_true",
+        help="Include actions from all sessions in the journal (overrides active-session scoping).",
     )
     parser.add_argument(
         "--format",
@@ -354,8 +361,17 @@ def handle_report_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
 
     effective_config = load_config(sub_args.config_path) if sub_args.config_path else config
     db_raw = sub_args.db_path or getattr(args, "db_path", None)
-    session_id = sub_args.session_id or getattr(args, "session_id", None)
     db_path = resolve_db_path(db_raw, config=effective_config)
+    if sub_args.all_sessions:
+        session_id: str | None = None
+    else:
+        explicit_session = sub_args.session_id or getattr(args, "session_id", None)
+        session_id, _ = resolve_session_id(
+            explicit=explicit_session,
+            config=effective_config,
+            db_path=db_path,
+            create=False,
+        )
 
     data = load_receipt_data(db_path, session_id=session_id)
     print(render_receipt(data, fmt=fmt))
@@ -509,7 +525,7 @@ def handle_init_claude_code_cli(args: argparse.Namespace, config: SidefxConfig) 
         )
         return 2
 
-    cmd_parts = ["sidefx", "report", "--format", "markdown"]
+    cmd_parts = ["sidefx", "hook", "claude-code"]
     db_raw = getattr(args, "db_path", None)
     if db_raw:
         abs_db = str(Path(str(db_raw)).expanduser().resolve())

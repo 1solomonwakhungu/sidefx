@@ -242,9 +242,15 @@ class _ResolvedEntry:
     path: str
     value: Any
     intermediate_type_error: str | None = None
+    missing: bool = False
 
 
-def _resolve_arg_values(arguments: Mapping[str, Any], arg_path: str) -> list[_ResolvedEntry]:
+def _resolve_arg_values(
+    arguments: Mapping[str, Any],
+    arg_path: str,
+    *,
+    report_missing_in_collections: bool = False,
+) -> list[_ResolvedEntry]:
     """Resolve top-level or dotted nested argument values.
 
     Checks both literal key match and dotted nested traversal so neither form can
@@ -266,10 +272,19 @@ def _resolve_arg_values(arguments: Mapping[str, Any], arg_path: str) -> list[_Re
     if any(not seg for seg in segments):
         return results
 
-    def _walk(current: Any, idx: int, prefix: str) -> None:
+    def _walk(current: Any, idx: int, prefix: str, in_collection: bool) -> None:
         if isinstance(current, (list, tuple)):
+            if not current and report_missing_in_collections:
+                results.append(
+                    _ResolvedEntry(
+                        path=f"{prefix}.{'.'.join(segments[idx:])}" if prefix else arg_path,
+                        value=None,
+                        missing=True,
+                    )
+                )
+                return
             for item_idx, item in enumerate(current):
-                _walk(item, idx, f"{prefix}[{item_idx}]")
+                _walk(item, idx, f"{prefix}[{item_idx}]", True)
             return
         if not isinstance(current, Mapping):
             # An intermediate key was present, but its value is not a mapping/list.
@@ -287,15 +302,19 @@ def _resolve_arg_values(arguments: Mapping[str, Any], arg_path: str) -> list[_Re
             return
         seg = segments[idx]
         if seg not in current:
+            if in_collection and report_missing_in_collections:
+                missing_tail = ".".join(segments[idx:])
+                missing_path = f"{prefix}.{missing_tail}" if prefix else missing_tail
+                results.append(_ResolvedEntry(path=missing_path, value=None, missing=True))
             return
         next_path = f"{prefix}.{seg}" if prefix else seg
         val = current[seg]
         if idx == len(segments) - 1:
             results.append(_ResolvedEntry(path=next_path, value=val))
         else:
-            _walk(val, idx + 1, next_path)
+            _walk(val, idx + 1, next_path, in_collection)
 
-    _walk(arguments, 0, "")
+    _walk(arguments, 0, "", False)
     return results
 
 
@@ -851,7 +870,11 @@ def evaluate_preflight(
             if not _tool_matches_rule(tool_name, rule.tool):
                 continue
             try:
-                resolved_entries = _resolve_arg_values(args_mapping, rule.arg)
+                resolved_entries = _resolve_arg_values(
+                    args_mapping,
+                    rule.arg,
+                    report_missing_in_collections=rule.required,
+                )
             except RecursionError:
                 violations.append(
                     PreflightViolation(
@@ -863,7 +886,38 @@ def evaluate_preflight(
                     )
                 )
                 continue
+            if not resolved_entries:
+                if rule.required:
+                    violations.append(
+                        PreflightViolation(
+                            tool=tool_name,
+                            arg=rule.arg,
+                            constraint="required",
+                            value=None,
+                            rule_reason=rule.reason,
+                            message=_format_violation_message(
+                                f"Required argument {rule.arg!r} is missing",
+                                rule.reason,
+                            ),
+                        )
+                    )
+                continue
             for entry in resolved_entries:
+                if entry.missing:
+                    violations.append(
+                        PreflightViolation(
+                            tool=tool_name,
+                            arg=entry.path,
+                            constraint="required",
+                            value=None,
+                            rule_reason=rule.reason,
+                            message=_format_violation_message(
+                                f"Required argument {entry.path!r} is missing",
+                                rule.reason,
+                            ),
+                        )
+                    )
+                    continue
                 if entry.intermediate_type_error is not None:
                     violations.append(
                         PreflightViolation(
@@ -892,7 +946,37 @@ def evaluate_preflight(
                         )
                     )
                     continue
+                if not scalar_items and rule.required:
+                    violations.append(
+                        PreflightViolation(
+                            tool=tool_name,
+                            arg=entry.path,
+                            constraint="required",
+                            value=entry.value,
+                            rule_reason=rule.reason,
+                            message=_format_violation_message(
+                                f"Required argument {entry.path!r} must not be empty",
+                                rule.reason,
+                            ),
+                        )
+                    )
+                    continue
                 for scalar_path, scalar_val in scalar_items:
+                    if rule.required and scalar_val is None:
+                        violations.append(
+                            PreflightViolation(
+                                tool=tool_name,
+                                arg=scalar_path,
+                                constraint="required",
+                                value=None,
+                                rule_reason=rule.reason,
+                                message=_format_violation_message(
+                                    f"Required argument {scalar_path!r} must not be null",
+                                    rule.reason,
+                                ),
+                            )
+                        )
+                        continue
                     _evaluate_rule_value(
                         tool_name=tool_name,
                         rule=rule,

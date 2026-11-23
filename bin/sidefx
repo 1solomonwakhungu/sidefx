@@ -1,0 +1,36 @@
+#!/usr/bin/env sh
+set -eu
+
+SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "$SELF_DIR/.." && pwd)"
+
+# 1. Running from a plugin checkout/install with src/sidefx: use python3 directly (zero deps).
+if [ -d "$REPO_ROOT/src/sidefx" ] && command -v python3 >/dev/null 2>&1; then
+  export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+  exec python3 -m sidefx "$@"
+fi
+
+# 2. Look for an installed `sidefx` executable on PATH other than this launcher script.
+SELF_PATH="$SELF_DIR/$(basename -- "$0")"
+OLD_IFS="$IFS"
+IFS=":"
+for dir in $PATH; do
+  [ -n "$dir" ] || dir="."
+  cand="$dir/sidefx"
+  if [ -x "$cand" ] && [ ! -d "$cand" ]; then
+    cand_dir="$(CDPATH= cd -- "$(dirname -- "$cand")" 2>/dev/null && pwd || true)"
+    if [ -n "$cand_dir" ] && [ "$cand_dir/$(basename -- "$cand")" != "$SELF_PATH" ]; then
+      IFS="$OLD_IFS"
+      exec "$cand" "$@"
+    fi
+  fi
+done
+IFS="$OLD_IFS"
+
+# 3. Fallback to uvx if available.
+if command -v uvx >/dev/null 2>&1; then
+  exec uvx --from "git+https://github.com/1solomonwakhungu/sidefx" sidefx "$@"
+fi
+
+echo "sidefx: could not locate python3, sidefx on PATH, or uvx" >&2
+exit 127

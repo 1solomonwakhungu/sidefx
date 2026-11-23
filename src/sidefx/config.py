@@ -64,6 +64,7 @@ _ALLOWED_RULE_KEYS = frozenset(
     {
         "tool",
         "arg",
+        "required",
         "max",
         "min",
         "allow",
@@ -104,6 +105,7 @@ class PreflightRule:
 
     tool: str
     arg: str
+    required: bool = False
     max_value: int | float | None = None
     min_value: int | float | None = None
     allow: tuple[str, ...] = ()
@@ -115,6 +117,8 @@ class PreflightRule:
     def to_dict(self) -> dict[str, Any]:
         """Serialize rule back to `.sidefx.json` dictionary shape."""
         data: dict[str, Any] = {"tool": self.tool, "arg": self.arg}
+        if self.required:
+            data["required"] = True
         if self.min_value is not None:
             data["min"] = self.min_value
         if self.max_value is not None:
@@ -465,6 +469,13 @@ def _parse_preflight_rule(raw: Any, index: int) -> PreflightRule:
         raise ConfigError(f"{ctx}.arg is required")
     arg = _expect_non_empty_str(raw["arg"], f"{ctx}.arg", reject_surrounding_whitespace=True)
 
+    required = False
+    if "required" in raw:
+        raw_required = raw["required"]
+        if not isinstance(raw_required, bool):
+            raise ConfigError(f"{ctx}.required must be a boolean")
+        required = raw_required
+
     max_value = _expect_finite_number(raw["max"], f"{ctx}.max") if "max" in raw else None
     min_value = _expect_finite_number(raw["min"], f"{ctx}.min") if "min" in raw else None
     if min_value is not None and max_value is not None and min_value > max_value:
@@ -502,6 +513,7 @@ def _parse_preflight_rule(raw: Any, index: int) -> PreflightRule:
 
     has_constraint = any(
         (
+            required,
             max_value is not None,
             min_value is not None,
             bool(allow),
@@ -513,12 +525,13 @@ def _parse_preflight_rule(raw: Any, index: int) -> PreflightRule:
     if not has_constraint:
         raise ConfigError(
             f"{ctx} must specify at least one constraint "
-            "(min, max, allow, deny, allow_domains, or deny_domains)"
+            "(required, min, max, allow, deny, allow_domains, or deny_domains)"
         )
 
     return PreflightRule(
         tool=tool,
         arg=arg,
+        required=required,
         max_value=max_value,
         min_value=min_value,
         allow=allow,

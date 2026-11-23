@@ -42,11 +42,15 @@ Next steps:
      .cursor/mcp.json (Cursor), prefix the server's own command:
        "command": "sidefx",
        "args": ["mcp-proxy", "--deterministic-ids", "--", "<server command>", "<its args>"]
-  2. Wrap mutating shell commands with a stable action ID:
-       sidefx wrap --action-id push-my-branch -- git push origin my-branch
-  3. Add guardrails under "preflight.rules" (caps, allowlists, denylists; see README).
-  4. See what happened:      sidefx status   |   sidefx report
-     Clear a blocked retry:  sidefx reconcile   |   sidefx resolve --help"""
+  2. Wrap mutating shell commands (git push & gh issue/pr create/comment auto-derive stable IDs):
+       sidefx wrap -- git push origin my-branch
+       sidefx wrap --action-id deploy-v1 -- ./scripts/deploy.sh
+  3. Add guardrails under "preflight.rules" (use "required": true to block omitted args), e.g.:
+       {"tool": "refund_payment", "arg": "amount", "required": true, "max": 50}
+  4. Wire Claude Code Stop hook:  sidefx init --claude-code --write
+     Verify setup:                sidefx doctor
+     Manage sessions & receipts:  sidefx session current   |   sidefx report
+     Clear a blocked retry:       sidefx reconcile         |   sidefx resolve --help"""
 
 
 def _positive_int(raw: str) -> int:
@@ -226,6 +230,27 @@ def build_parser() -> argparse.ArgumentParser:
         help_text="Run the automated chaos fault-injection evaluation suite.",
         module_name="sidefx.chaos",
         func_name="handle_eval_cli",
+    )
+    _register_passthrough_subcommand(
+        subparsers,
+        name="session",
+        help_text="Inspect or rotate the workspace-scoped active session ID.",
+        module_name="sidefx.session",
+        func_name="handle_session_cli",
+    )
+    _register_passthrough_subcommand(
+        subparsers,
+        name="hook",
+        help_text="Run agent harness hooks (e.g. Claude Code Stop hook).",
+        module_name="sidefx.hook",
+        func_name="handle_hook_cli",
+    )
+    _register_passthrough_subcommand(
+        subparsers,
+        name="doctor",
+        help_text="Check installation, config, journal, and Claude Code hook setup.",
+        module_name="sidefx.doctor",
+        func_name="handle_doctor_cli",
     )
 
     return parser
@@ -426,9 +451,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif extras:
         parser.error(f"unrecognized arguments: {' '.join(extras)}")
 
-    skip_config_load = args.config_path is None and (
-        (args.command == "init" and not getattr(args, "claude_code", False))
-        or args.command == "eval"
+    skip_config_load = args.command in ("doctor", "hook") or (
+        args.config_path is None
+        and (
+            (args.command == "init" and not getattr(args, "claude_code", False))
+            or args.command == "eval"
+        )
     )
     if skip_config_load:
         config = SidefxConfig()

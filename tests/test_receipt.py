@@ -305,9 +305,7 @@ class TestClaudeCodeStopHookInit:
         assert merged["hooks"]["PreToolUse"] == existing["hooks"]["PreToolUse"]
         assert len(merged["hooks"]["Stop"]) == 2
         assert merged["hooks"]["Stop"][0]["hooks"][0]["command"] == "echo existing-stop"
-        assert (
-            merged["hooks"]["Stop"][1]["hooks"][0]["command"] == "sidefx report --format markdown"
-        )
+        assert merged["hooks"]["Stop"][1]["hooks"][0]["command"] == DEFAULT_STOP_HOOK_COMMAND
 
         # Idempotent re-run
         rc2 = main(["init", "--claude-code", "--settings", str(settings_link)])
