@@ -394,10 +394,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         return int(args.handler(args, config))
-    except (ConfigError, JournalError, ValueError, sqlite3.Error, OSError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
     except BrokenPipeError:
         return 0
     except KeyboardInterrupt:
         return 130
+    except (ConfigError, JournalError, ValueError, sqlite3.Error, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1

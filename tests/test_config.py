@@ -208,7 +208,7 @@ class TestConfigParsingAndValidation:
             load_config(huge_5000)
 
         deep = tmp_path / "deep.json"
-        deep.write_text("[" * 2000 + "]" * 2000, encoding="utf-8")
+        deep.write_text("[" * 200_000 + "]" * 200_000, encoding="utf-8")
         with pytest.raises(ConfigError, match="Invalid JSON structure"):
             load_config(deep)
 

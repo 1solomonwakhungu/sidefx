@@ -437,7 +437,7 @@ def _is_busy_or_locked(exc: sqlite3.OperationalError) -> bool:
 
 
 def _sqlite_ro_uri(path: Path, *, immutable: bool = False) -> str:
-    abs_path = os.path.abspath(path)
+    abs_path = os.path.normpath(os.path.abspath(path))
     encoded = quote(abs_path, safe="/:")
     if not encoded.startswith("/"):
         encoded = f"/{encoded}"
@@ -646,6 +646,14 @@ class Journal:
         conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
         conn.execute("PRAGMA foreign_keys = ON")
 
+        # Reject future schema versions BEFORE mutating journal_mode.
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > SCHEMA_VERSION:
+            raise JournalError(
+                f"Unsupported journal schema version {version}; "
+                f"maximum supported version is {SCHEMA_VERSION}"
+            )
+
         if not self._is_memory:
             current_mode_row = conn.execute("PRAGMA journal_mode").fetchone()
             current_mode = str(current_mode_row[0]).lower() if current_mode_row else ""
@@ -672,12 +680,6 @@ class Journal:
             conn.execute("PRAGMA checkpoint_fullfsync = ON")
 
         # Fast path for already-migrated journals: verify schema without taking a write lock.
-        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version > SCHEMA_VERSION:
-            raise JournalError(
-                f"Unsupported journal schema version {version}; "
-                f"maximum supported version is {SCHEMA_VERSION}"
-            )
         if version == SCHEMA_VERSION:
             self._verify_existing_schema(conn)
             return
