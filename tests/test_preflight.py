@@ -138,6 +138,24 @@ class TestClassifyTool:
     def test_malformed_tool_names_denied(self, bad_name: str) -> None:
         assert classify_tool(bad_name) == ToolKind.DENY
 
+    @pytest.mark.parametrize(
+        ("tool_name", "expected"),
+        [
+            ("fetch_and_send_email", ToolKind.MUTATE),
+            ("get_and_delete_all", ToolKind.MUTATE),
+            ("read_write_file", ToolKind.MUTATE),
+            ("search_replace_file", ToolKind.MUTATE),
+            ("github.delete_repo", ToolKind.MUTATE),
+            ("mcp__gh__delete_repo", ToolKind.MUTATE),
+            ("stripe:refund_payment", ToolKind.MUTATE),
+            ("mcp__gh__get_issue", ToolKind.READ),
+            ("github.list_repos", ToolKind.READ),
+        ],
+    )
+    def test_compound_and_namespaced_tool_names(self, tool_name: str, expected: ToolKind) -> None:
+        cfg = ToolClassificationConfig(unknown_tool_policy=UnknownToolPolicy.READ)
+        assert classify_tool(tool_name, cfg) == expected
+
 
 class TestExtractDomain:
     @pytest.mark.parametrize(
@@ -150,13 +168,14 @@ class TestExtractDomain:
             ("https://api.example.com/v1/users?fields=a,b", "api.example.com"),
             ("http://Example.COM:8080/path", "example.com"),
             ("https://example.com./v1", "example.com"),
-            ("//cdn.example.com/asset.js", "cdn.example.com"),
             ("https://good.com@evil.com/path", "evil.com"),
             ("https://user:pass@Sub.Evil.COM:8443/x", "sub.evil.com"),
             ("example.com", "example.com"),
             ("api.example.com:443", "api.example.com"),
             ("http://127.0.0.1:8000/api", "127.0.0.1"),
             ("http://[::1]:8000/api", "::1"),
+            ("http://[::ffff:127.0.0.1]/api", "127.0.0.1"),
+            ("//good.com/@evil.com", "evil.com"),
         ],
     )
     def test_valid_extractions(self, raw: str, expected: str) -> None:
@@ -167,6 +186,9 @@ class TestExtractDomain:
         [
             "",
             "   ",
+            "//cdn.example.com/asset.js",
+            "https://good.com/<a@evil.com>",
+            "https://good.com/a@evil.com",
             "user@evil.com@good.com",
             "a@good.com, b@evil.com",
             "a@good.com; b@evil.com",
@@ -183,6 +205,11 @@ class TestExtractDomain:
             "https://a@b@evil.com/path",
             "https://example.com:notaport/path",
             "https://example.com /path",
+            "http://2130706433/",
+            "http://0x7f.0.0.1/",
+            "http://127.1/",
+            "http://2852039166/",
+            "http://0x7f000001/",
             "@example.com",
             "user@",
             "user@-bad.com",
@@ -274,6 +301,11 @@ class TestEvaluatePreflightNumeric:
         bad_flat = evaluate_preflight("create_payout", {"payment.amount": 999}, cfg)
         assert bad_flat.allowed is False
         assert bad_flat.violations[0].arg == "payment.amount"
+
+        # Non-object intermediate (e.g. JSON-encoded string) must fail closed
+        bad_intermediate = evaluate_preflight("create_payout", {"payment": '{"amount": 9999}'}, cfg)
+        assert bad_intermediate.allowed is False
+        assert bad_intermediate.violations[0].constraint == "invalid_type"
 
     def test_list_of_numbers_validates_every_item(self) -> None:
         cfg = SidefxConfig(
@@ -413,3 +445,75 @@ class TestEvaluatePreflightStringsAndDomains:
         bad_args = evaluate_preflight("create_issue", ["not", "a", "dict"])  # type: ignore[arg-type]
         assert bad_args.allowed is False
         assert bad_args.violations[0].constraint == "invalid_type"
+
+    def test_url_email_ambiguity_alternate_ips_invalid_patterns_and_path_traversal(self) -> None:
+        # B2: URL-versus-email ambiguity blocked under both allow_domains and deny_domains
+        allow_cfg = SidefxConfig(
+            preflight=PreflightConfig(
+                rules=(PreflightRule(tool="send_email", arg="to", allow_domains=("good.com",)),)
+            )
+        )
+        deny_cfg = SidefxConfig(
+            preflight=PreflightConfig(
+                rules=(PreflightRule(tool="send_email", arg="to", deny_domains=("evil.com",)),)
+            )
+        )
+        for ambiguous in (
+            "//good.com/@evil.com",
+            "https://good.com/<a@evil.com>",
+            "https://good.com/a@evil.com",
+        ):
+            assert evaluate_preflight("send_email", {"to": ambiguous}, allow_cfg).allowed is False
+            assert evaluate_preflight("send_email", {"to": ambiguous}, deny_cfg).allowed is False
+
+        # N4: alternate IP encodings blocked against deny_domains
+        ip_deny_cfg = SidefxConfig(
+            preflight=PreflightConfig(
+                rules=(
+                    PreflightRule(
+                        tool="fetch_url",
+                        arg="url",
+                        deny_domains=("127.0.0.1", "169.254.169.254"),
+                    ),
+                )
+            )
+        )
+        for alt_ip_url in (
+            "http://2130706433/",
+            "http://0x7f.0.0.1/",
+            "http://127.1/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://2852039166/",
+        ):
+            assert (
+                evaluate_preflight("fetch_url", {"url": alt_ip_url}, ip_deny_cfg).allowed is False
+            )
+
+        # N5: malformed deny_domains patterns fail closed instead of silently matching nothing
+        for bad_pat in ("evil.*", "*evil.com", "https://evil.com", "evil.com:8080"):
+            bad_rule_cfg = SidefxConfig(
+                preflight=PreflightConfig(
+                    rules=(PreflightRule(tool="post_url", arg="url", deny_domains=(bad_pat,)),)
+                )
+            )
+            res = evaluate_preflight("post_url", {"url": "https://example.com"}, bad_rule_cfg)
+            assert res.allowed is False
+            assert res.violations[0].constraint == "invalid_rule"
+
+        # N7: case-insensitive deny + path traversal blocked on path allowlists
+        str_cfg = SidefxConfig(
+            preflight=PreflightConfig(
+                rules=(
+                    PreflightRule(tool="push_branch", arg="repo", deny=("myorg/prod",)),
+                    PreflightRule(tool="write_file", arg="path", allow=("/workspace/*",)),
+                )
+            )
+        )
+        assert evaluate_preflight("push_branch", {"repo": "MyOrg/Prod"}, str_cfg).allowed is False
+        assert (
+            evaluate_preflight("write_file", {"path": "/workspace/../etc/passwd"}, str_cfg).allowed
+            is False
+        )
+        assert (
+            evaluate_preflight("write_file", {"path": "/workspace/app.py"}, str_cfg).allowed is True
+        )

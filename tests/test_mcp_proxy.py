@@ -52,7 +52,7 @@ write_lock = threading.Lock()
 
 
 def send(obj):
-    data = json.dumps(obj, separators=(",", ":")) + "\n"
+    data = json.dumps(obj, separators=(",", ":"), ensure_ascii=True) + "\n"
     with write_lock:
         sys.stdout.write(data)
         sys.stdout.flush()
@@ -97,6 +97,13 @@ def handle_message(msg):
         send({"jsonrpc": "2.0", "method": "notifications/message", "params": {"text": "ready"}})
         return
 
+    if method == "notifications/cancelled":
+        req_cancel_id = (msg.get("params") or {}).get("requestId")
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"cancelled_request_id": req_cancel_id}) + "\n")
+            fh.flush()
+        return
+
     if method == "tools/list":
         send({
             "jsonrpc": "2.0",
@@ -122,11 +129,28 @@ def handle_message(msg):
         arguments = params.get("arguments") or {}
 
         if name == "get_issue":
+            text_out = (
+                "broken-\ud83d-surrogate"
+                if arguments.get("return_surrogate")
+                else f"issue #{arguments.get('id')}"
+            )
             send({
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
-                    "content": [{"type": "text", "text": f"issue #{arguments.get('id')}"}],
+                    "content": [{"type": "text", "text": text_out}],
+                    "isError": False,
+                },
+            })
+            return
+
+        if name == "fetch_url":
+            record_mutation(name, arguments)
+            send({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": f"fetched {arguments.get('url')}"}],
                     "isError": False,
                 },
             })
@@ -161,6 +185,25 @@ def handle_message(msg):
             })
             return
 
+        if arguments.get("timeout_tool_error"):
+            send({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": "upstream gateway timed out"}],
+                    "isError": True,
+                },
+            })
+            return
+
+        if arguments.get("return_empty_response"):
+            record_mutation(name, arguments)
+            send({"jsonrpc": "2.0", "id": req_id})
+            return
+
+        if arguments.get("delay_before_write_ms"):
+            time.sleep(arguments["delay_before_write_ms"] / 1000.0)
+
         seq = record_mutation(name, arguments)
 
         if arguments.get("crash_after_write"):
@@ -171,6 +214,19 @@ def handle_message(msg):
             time.sleep(delay_ms / 1000.0)
 
         url = f"https://example.test/items/{seq}"
+        text_val = f"Created {name} #{seq}: {url}"
+        if arguments.get("return_surrogate"):
+            text_val = f"Created \ud83d #{seq}: {url}"
+        structured = {
+            "url": url,
+            "received_keys": sorted(arguments.keys()),
+            "seq": seq,
+        }
+        if arguments.get("return_deep_nesting"):
+            nested = {"leaf": url}
+            for _ in range(600):
+                nested = {"child": nested}
+            structured["nested"] = nested
         if has_id:
             send({
                 "jsonrpc": "2.0",
@@ -179,14 +235,10 @@ def handle_message(msg):
                     "content": [
                         {
                             "type": "text",
-                            "text": f"Created {name} #{seq}: {url}",
+                            "text": text_val,
                         }
                     ],
-                    "structuredContent": {
-                        "url": url,
-                        "received_keys": sorted(arguments.keys()),
-                        "seq": seq,
-                    },
+                    "structuredContent": structured,
                     "isError": False,
                 },
             })
@@ -211,6 +263,7 @@ for raw in sys.stdin:
         and isinstance((message.get("params") or {}).get("arguments"), dict)
         and (
             (message["params"]["arguments"].get("delay_ms") or 0) > 0
+            or (message["params"]["arguments"].get("delay_before_write_ms") or 0) > 0
             or message["params"]["arguments"].get("ask_client_roots")
         )
     ):
@@ -626,7 +679,8 @@ class TestMCPProxySafetyAndFaults:
             assert rec is not None
             assert rec.status == ActionStatus.UNKNOWN
 
-            # Wait for the late upstream reply (400ms total) to arrive and be dropped cleanly.
+            # Wait for the late upstream reply (400ms total) to arrive, reconcile in SQLite,
+            # and be dropped from client stdout without corrupting subsequent frames.
             time.sleep(0.4)
 
             # Reuse the EXACT SAME client id=1 on a subsequent call: must NOT receive stale reply!
@@ -646,7 +700,12 @@ class TestMCPProxySafetyAndFaults:
             assert "error" not in fresh_resp
             assert fresh_resp["result"]["structuredContent"]["seq"] == 2
 
-            # Retry of the timed-out action is still blocked (no duplicate write!)
+            # N1: Late success reconciled in SQLite -> retry replays cached result (0 dup writes!)
+            rec_late = journal.get_action("agent", "mcp:mock", "slow-1")
+            assert rec_late is not None
+            assert rec_late.status == ActionStatus.RECONCILED
+            assert rec_late.result_ref == "https://example.test/items/1"
+
             h.send(
                 {
                     "jsonrpc": "2.0",
@@ -662,10 +721,10 @@ class TestMCPProxySafetyAndFaults:
                     },
                 }
             )
-            blocked = h.recv()
-            assert blocked["id"] == 2
-            assert blocked["error"]["code"] == ERR_OUTCOME_UNKNOWN
-            assert OUTCOME_UNKNOWN_BANNER in blocked["error"]["message"]
+            replayed = h.recv()
+            assert replayed["id"] == 2
+            assert "error" not in replayed
+            assert replayed["result"]["structuredContent"]["seq"] == 1
 
         # Exactly 2 total writes: slow-1 (once) + fresh-2 (once). Zero duplicates!
         writes = _read_upstream_writes(log_path)
@@ -1086,6 +1145,459 @@ class TestMCPProxySafetyAndFaults:
             h.send({"jsonrpc": "2.0", "id": 7, "method": "ping"})
             assert h.recv()["result"]["pong"] is True
             assert _read_upstream_writes(log_path) == []
+
+    def test_b1_surrogates_huge_floats_and_deep_nesting_never_crash_proxy(
+        self, tmp_path: Path, mock_mcp_server: tuple[Path, Path]
+    ) -> None:
+        script, log_path = mock_mcp_server
+        db_path = tmp_path / "journal.db"
+
+        with (
+            Journal(db_path) as journal,
+            _LiveProxyHarness(server_script=script, log_path=log_path, journal=journal) as h,
+        ):
+            # 1. Client read/ping with lone surrogate survives round-trip
+            h.send_raw(b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{"s":"\\ud83d"}}\n')
+            assert h.recv()["result"]["pong"] is True
+
+            # 2. Client 1e999 (float overflow -> inf) rejected cleanly as Parse error
+            h.send_raw(b'{"jsonrpc":"2.0","id":2,"method":"ping","params":{"x":1e999}}\n')
+            assert h.recv()["error"]["code"] == JSONRPC_PARSE_ERROR
+
+            # 3. Client mutating call with lone surrogate succeeds and journals cleanly
+            h.send_raw(
+                b'{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_issue",'
+                b'"arguments":{"title":"hi \\ud83d","return_surrogate":true,'
+                b'"_sidefx_action_id":"surr-1"}}}\n'
+            )
+            r3 = h.recv()
+            assert r3["id"] == 3
+            assert r3["result"]["isError"] is False
+            rec3 = journal.get_action("agent", "mcp:mock", "surr-1")
+            assert rec3 is not None
+            assert rec3.status == ActionStatus.CONFIRMED
+
+            # 4. Upstream read call returning lone surrogate does not kill reader thread
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "get_issue",
+                        "arguments": {"id": 1, "return_surrogate": True},
+                    },
+                }
+            )
+            r4 = h.recv()
+            assert r4["id"] == 4
+            assert "surrogate" in r4["result"]["content"][0]["text"]
+
+            # 5. Client deeply nested arguments rejected BEFORE creating a pending row
+            deep_raw = (
+                b'{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"create_issue",'
+                b'"arguments":{"_sidefx_action_id":"deep-client","x":'
+                + b'{"a":' * 1500
+                + b"1"
+                + b"}" * 1500
+                + b"}}}\n"
+            )
+            h.send_raw(deep_raw)
+            r5 = h.recv()
+            assert r5["error"]["code"] in (JSONRPC_PARSE_ERROR, JSONRPC_INVALID_PARAMS)
+            assert journal.get_action("agent", "mcp:mock", "deep-client") is None
+
+            # 6. Upstream 600-deep mutation result confirms and replays without deepcopy error
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "create_issue",
+                        "arguments": {
+                            "title": "deep-resp",
+                            "return_deep_nesting": True,
+                            "_sidefx_action_id": "deep-up",
+                        },
+                    },
+                }
+            )
+            r6 = h.recv()
+            assert r6["id"] == 6
+            assert r6["result"]["isError"] is False
+            rec6 = journal.get_action("agent", "mcp:mock", "deep-up")
+            assert rec6 is not None
+            assert rec6.status == ActionStatus.CONFIRMED
+
+            # Replay of deeply nested cached response works without RecursionError
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "create_issue",
+                        "arguments": {
+                            "title": "deep-resp",
+                            "return_deep_nesting": True,
+                            "_sidefx_action_id": "deep-up",
+                        },
+                    },
+                }
+            )
+            r7 = h.recv()
+            assert r7["id"] == 7
+            assert r7["result"]["structuredContent"]["url"] == "https://example.test/items/2"
+
+            # Proxy still alive and responsive
+            h.send({"jsonrpc": "2.0", "id": 8, "method": "ping"})
+            assert h.recv()["result"]["pong"] is True
+
+    def test_b3_preflight_rules_enforced_on_read_tools_without_journaling(
+        self, tmp_path: Path, mock_mcp_server: tuple[Path, Path]
+    ) -> None:
+        script, log_path = mock_mcp_server
+        db_path = tmp_path / "journal.db"
+        cfg = SidefxConfig(
+            preflight=PreflightConfig(
+                rules=(PreflightRule(tool="*", arg="url", deny_domains=("evil.com",)),)
+            )
+        )
+
+        with (
+            Journal(db_path) as journal,
+            _LiveProxyHarness(
+                server_script=script, log_path=log_path, journal=journal, config=cfg
+            ) as h,
+        ):
+            # Denied read tool is blocked before upstream
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "fetch_url",
+                        "arguments": {"url": "https://evil.com/secret"},
+                    },
+                }
+            )
+            denied = h.recv()
+            assert denied["error"]["code"] == ERR_PREFLIGHT_DENIED
+            assert _read_upstream_writes(log_path) == []
+
+            # Allowed read tool passes through without journaling
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "fetch_url", "arguments": {"url": "https://good.com/page"}},
+                }
+            )
+            ok = h.recv()
+            assert ok["result"]["isError"] is False
+            assert journal.list_actions() == []
+            assert len(_read_upstream_writes(log_path)) == 1
+
+    def test_b4_reconciler_not_found_blocked_while_timed_out_request_still_inflight(
+        self, tmp_path: Path, mock_mcp_server: tuple[Path, Path]
+    ) -> None:
+        script, log_path = mock_mcp_server
+        db_path = tmp_path / "journal.db"
+
+        def hook_not_found(_rec: ActionRecord) -> ReconcileHookResult:
+            return ReconcileHookResult(state=ReconcileState.NOT_FOUND, details="not visible yet")
+
+        with (
+            Journal(db_path) as journal,
+            _LiveProxyHarness(
+                server_script=script,
+                log_path=log_path,
+                journal=journal,
+                timeout_seconds=0.15,
+                reconciler_hook=hook_not_found,
+            ) as h,
+        ):
+            # Upstream sleeps 500ms BEFORE writing -> timed out at 150ms while still running!
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "create_issue",
+                        "arguments": {
+                            "title": "in-flight race",
+                            "delay_before_write_ms": 500,
+                            "idempotency_key": "race-key-1",
+                        },
+                    },
+                }
+            )
+            r1 = h.recv(timeout=2.0)
+            assert r1["error"]["code"] == ERR_OUTCOME_UNKNOWN
+
+            # Retry immediately while upstream is still executing attempt 1:
+            # reconciler says NOT_FOUND, but proxy MUST block re-dispatch!
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "create_issue",
+                        "arguments": {
+                            "title": "in-flight race",
+                            "delay_before_write_ms": 500,
+                            "idempotency_key": "race-key-1",
+                        },
+                    },
+                }
+            )
+            r2 = h.recv(timeout=2.0)
+            assert r2["error"]["code"] == ERR_OUTCOME_UNKNOWN
+
+            # Wait for original attempt 1 to complete on upstream
+            time.sleep(0.55)
+
+        # Upstream executed EXACTLY ONCE despite reconciler saying NOT_FOUND!
+        assert len(_read_upstream_writes(log_path)) == 1
+
+    def test_n2_n8_n10_empty_response_ambiguous_error_and_cancellation_translation(
+        self, tmp_path: Path, mock_mcp_server: tuple[Path, Path]
+    ) -> None:
+        script, log_path = mock_mcp_server
+        db_path = tmp_path / "journal.db"
+
+        with (
+            Journal(db_path) as journal,
+            _LiveProxyHarness(
+                server_script=script, log_path=log_path, journal=journal, timeout_seconds=2.0
+            ) as h,
+        ):
+            # N2: empty JSON-RPC response (no result, no error) -> marked UNKNOWN, not confirmed
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "create_issue",
+                        "arguments": {
+                            "return_empty_response": True,
+                            "_sidefx_action_id": "empty-resp-1",
+                        },
+                    },
+                }
+            )
+            r1 = h.recv()
+            assert r1["error"]["code"] == ERR_OUTCOME_UNKNOWN
+            rec1 = journal.get_action("agent", "mcp:mock", "empty-resp-1")
+            assert rec1 is not None
+            assert rec1.status == ActionStatus.UNKNOWN
+
+            # N10: ambiguous timeout tool error -> marked UNKNOWN (prevents blind retry)
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "create_issue",
+                        "arguments": {
+                            "timeout_tool_error": True,
+                            "_sidefx_action_id": "ambig-err-1",
+                        },
+                    },
+                }
+            )
+            r2 = h.recv()
+            assert r2["error"]["code"] == ERR_OUTCOME_UNKNOWN
+            rec2 = journal.get_action("agent", "mcp:mock", "ambig-err-1")
+            assert rec2 is not None
+            assert rec2.status == ActionStatus.UNKNOWN
+
+            # N8: notifications/cancelled rewrites client requestId to upstream __sidefx_ ID
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 42,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "create_issue",
+                        "arguments": {"title": "cancel-me", "delay_ms": 200},
+                    },
+                }
+            )
+            time.sleep(0.05)
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": 42, "reason": "user cancelled"},
+                }
+            )
+            r42 = h.recv()
+            assert r42["id"] == 42
+
+        log_entries = [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        cancelled_ids = [
+            e["cancelled_request_id"] for e in log_entries if "cancelled_request_id" in e
+        ]
+        assert len(cancelled_ids) == 1
+        assert isinstance(cancelled_ids[0], str)
+        assert cancelled_ids[0].startswith("__sidefx_")
+
+    def test_oversized_frame_id_null_client_eof_inflight_and_two_proxies_sharing_journal(
+        self,
+        tmp_path: Path,
+        mock_mcp_server: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        script, log_path = mock_mcp_server
+        db_path = tmp_path / "journal.db"
+
+        # 1. Oversized frame + id=null handling
+        import sidefx.mcp_proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "MAX_MESSAGE_BYTES", 256)
+        with (
+            Journal(db_path) as journal,
+            _LiveProxyHarness(server_script=script, log_path=log_path, journal=journal) as h,
+        ):
+            oversized = (
+                b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{"pad":"' + b"x" * 400 + b'"}}\n'
+            )
+            h.send_raw(oversized)
+            err = h.recv()
+            assert err["error"]["code"] == JSONRPC_PARSE_ERROR
+
+            # Framing stays synchronized; id=null ping works cleanly
+            h.send({"jsonrpc": "2.0", "id": None, "method": "ping"})
+            r_null = h.recv()
+            assert r_null["id"] is None
+            assert r_null["result"]["pong"] is True
+        monkeypatch.undo()
+
+        # 2. Client EOF while a mutating call is in flight still delivers response cleanly
+        env = dict(os.environ)
+        env["MOCK_MCP_LOG"] = str(log_path)
+        req_in = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "create_issue",
+                        "arguments": {
+                            "title": "eof-inflight",
+                            "delay_ms": 150,
+                            "_sidefx_action_id": "eof-1",
+                        },
+                    },
+                }
+            )
+            + "\n"
+        ).encode("utf-8")
+        out_buf = io.BytesIO()
+        with Journal(db_path) as journal:
+            proxy = MCPProxy(
+                [sys.executable, "-u", str(script)],
+                journal=journal,
+                target="mcp:mock",
+                timeout_seconds=3.0,
+                client_in=io.BytesIO(req_in),
+                client_out=out_buf,
+                err_stream=io.BytesIO(),
+                upstream_env=env,
+            )
+            assert proxy.run() == 0
+            rec = journal.get_action("agent", "mcp:mock", "eof-1")
+            assert rec is not None
+            assert rec.status == ActionStatus.CONFIRMED
+        out_resp = json.loads(out_buf.getvalue().decode("utf-8").strip())
+        assert out_resp["id"] == 99
+        assert out_resp["result"]["isError"] is False
+
+        # 3. Two concurrent proxies sharing one SQLite journal racing on same action_id -> 1 write
+        shared_log = tmp_path / "shared_writes.jsonl"
+        shared_db = tmp_path / "shared_journal.db"
+        barrier = threading.Barrier(2)
+        results: list[dict[str, Any]] = []
+        results_lock = threading.Lock()
+
+        def worker(idx: int) -> None:
+            with (
+                Journal(shared_db) as j,
+                _LiveProxyHarness(
+                    server_script=script,
+                    log_path=shared_log,
+                    journal=j,
+                    target="mcp:shared",
+                ) as h,
+            ):
+                barrier.wait(timeout=5.0)
+                h.send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": idx,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "create_issue",
+                            "arguments": {
+                                "title": "concurrent-write",
+                                "delay_ms": 150,
+                                "_sidefx_action_id": "shared-act-1",
+                            },
+                        },
+                    }
+                )
+                resp = h.recv(timeout=5.0)
+                with results_lock:
+                    results.append(resp)
+
+        t1 = threading.Thread(target=worker, args=(1,))
+        t2 = threading.Thread(target=worker, args=(2,))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10.0)
+        t2.join(timeout=10.0)
+
+        assert len(results) == 2
+        # Exactly one proxy dispatched & confirmed; the other saw OUTCOME_UNKNOWN or REPLAY.
+        assert len(_read_upstream_writes(shared_log)) == 1
+        successes = [r for r in results if "result" in r]
+        assert len(successes) >= 1
+
+    def test_n3_n9_default_target_distinguishes_commands_and_env_session_precedence(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db_path = tmp_path / "j.db"
+        cfg = SidefxConfig(default_session_id="cfg-sess")
+        monkeypatch.setenv("SIDEFX_SESSION_ID", "env-sess")
+
+        with Journal(db_path) as journal:
+            p_a = MCPProxy(["python3", "server_a.py"], journal=journal, config=cfg)
+            p_b = MCPProxy(["python3", "server_b.py"], journal=journal, config=cfg)
+            p_a2 = MCPProxy(["python3", "server_a.py"], journal=journal, config=cfg)
+            assert p_a.target != p_b.target
+            assert p_a.target == p_a2.target
+            assert p_a.session_id == "env-sess"
+
+            p_explicit = MCPProxy(
+                ["python3", "server_a.py"],
+                journal=journal,
+                config=cfg,
+                session_id="cli-sess",
+            )
+            assert p_explicit.session_id == "cli-sess"
 
 
 class TestMCPProxyCLI:

@@ -5,9 +5,11 @@ from __future__ import annotations
 import fnmatch
 import ipaddress
 import math
+import posixpath
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from email.utils import getaddresses
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urlsplit
@@ -22,8 +24,12 @@ from sidefx.config import (
 
 _GLOB_CHARS = frozenset("*?[")
 _DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_HEX_LITERAL_RE = re.compile(r"^0x[0-9a-f]+$")
 _CONTROL_OR_WHITESPACE_RE = re.compile(r"[\x00-\x1f\x7f\s]")
 _DISALLOWED_EMAIL_CHARS = frozenset(",;\\()\"'")
+_NAMESPACE_SEPARATORS = ("__", ".", ":", "/")
+_COMPOUND_MUTATE_PREFIXES = ("read_write_", "search_replace_")
+_PATH_TRAVERSAL_RE = re.compile(r"(?:^|[/\\])\.\.(?:$|[/\\])")
 
 
 class ToolKind(StrEnum):
@@ -104,16 +110,65 @@ def _extract_preflight_config(
     return config
 
 
+def _unqualified_tool_suffix(tool_name: str) -> str | None:
+    """Extract the action suffix from namespaced tool names like `mcp__gh__delete_repo`."""
+    best_idx = -1
+    best_sep_len = 0
+    for sep in _NAMESPACE_SEPARATORS:
+        idx = tool_name.rfind(sep)
+        if idx > best_idx:
+            best_idx = idx
+            best_sep_len = len(sep)
+    if best_idx == -1:
+        return None
+    suffix = tool_name[best_idx + best_sep_len :]
+    return suffix if suffix else None
+
+
+def _classify_by_prefixes(
+    lower_name: str,
+    tools_cfg: ToolClassificationConfig,
+) -> ToolKind | None:
+    # Check compound read+mutate prefixes first (e.g. `read_write_file`, `search_replace_file`).
+    if any(lower_name.startswith(comp) for comp in _COMPOUND_MUTATE_PREFIXES):
+        return ToolKind.MUTATE
+
+    mutate_prefixes_lower = tuple(p.lower() for p in tools_cfg.mutate_prefixes if p)
+    read_prefixes_lower = tuple(p.lower() for p in tools_cfg.read_prefixes if p)
+
+    best_mutate_len = max(
+        (len(p) for p in mutate_prefixes_lower if lower_name.startswith(p)),
+        default=0,
+    )
+    matched_read_prefixes = [p for p in read_prefixes_lower if lower_name.startswith(p)]
+    best_read_len = max((len(p) for p in matched_read_prefixes), default=0)
+
+    if best_mutate_len > 0 or best_read_len > 0:
+        if best_mutate_len >= best_read_len:
+            return ToolKind.MUTATE
+        # Guard against compound names like `fetch_and_send_email` or `get_and_delete_all`.
+        rest = lower_name[best_read_len:]
+        if rest.startswith("and_"):
+            after_and = rest[4:]
+            if any(after_and.startswith(mp) for mp in mutate_prefixes_lower):
+                return ToolKind.MUTATE
+        return ToolKind.READ
+
+    return None
+
+
 def classify_tool(
     tool_name: str,
     config: SidefxConfig | ToolClassificationConfig | None = None,
 ) -> ToolKind:
     """Classify a tool as ``read``, ``mutate``, or ``deny``.
 
-    Precedence (fail-safe: ``mutate``/``deny`` wins any conflict):
+    Precedence (explicit lists override prefix heuristics; ``mutate`` wins any conflict
+    at the same precedence level):
       1. Exact matches in ``mutate_tools`` / ``read_tools`` (mutate wins if in both).
       2. Glob/fnmatch matches in ``mutate_tools`` / ``read_tools`` (mutate wins if in both).
-      3. Longest matching prefix in ``mutate_prefixes`` / ``read_prefixes``
+      3. Prefix rules on the tool name (or its namespace suffix after ``__``, ``.``, ``:``,
+         or ``/``), using longest prefix match with compound read+mutate protection
          (case-insensitive; mutate wins on equal-length tie).
       4. Fallback to ``unknown_tool_policy``.
     """
@@ -143,20 +198,17 @@ def classify_tool(
     if any(fnmatch.fnmatchcase(tool_name, pat) for pat in glob_read):
         return ToolKind.READ
 
-    # 3. Prefix rules (case-insensitive, longest prefix wins, mutate wins ties).
+    # 3. Prefix rules on full name, then on namespace-stripped suffix (e.g. `mcp__gh__delete_repo`).
     lower_name = tool_name.lower()
-    best_mutate_len = max(
-        (len(p) for p in tools_cfg.mutate_prefixes if p and lower_name.startswith(p.lower())),
-        default=0,
-    )
-    best_read_len = max(
-        (len(p) for p in tools_cfg.read_prefixes if p and lower_name.startswith(p.lower())),
-        default=0,
-    )
-    if best_mutate_len > 0 or best_read_len > 0:
-        if best_mutate_len >= best_read_len:
-            return ToolKind.MUTATE
-        return ToolKind.READ
+    prefix_kind = _classify_by_prefixes(lower_name, tools_cfg)
+    if prefix_kind is not None:
+        return prefix_kind
+
+    suffix = _unqualified_tool_suffix(tool_name)
+    if suffix is not None:
+        suffix_kind = _classify_by_prefixes(suffix.lower(), tools_cfg)
+        if suffix_kind is not None:
+            return suffix_kind
 
     # 4. Unknown tool policy fallback.
     if tools_cfg.unknown_tool_policy == UnknownToolPolicy.READ:
@@ -174,22 +226,30 @@ def _tool_matches_rule(tool_name: str, rule_tool: str) -> bool:
     return tool_name == rule_tool
 
 
-def _resolve_arg_values(arguments: Mapping[str, Any], arg_path: str) -> list[tuple[str, Any]]:
+@dataclass(frozen=True, slots=True)
+class _ResolvedEntry:
+    path: str
+    value: Any
+    intermediate_type_error: str | None = None
+
+
+def _resolve_arg_values(arguments: Mapping[str, Any], arg_path: str) -> list[_ResolvedEntry]:
     """Resolve top-level or dotted nested argument values.
 
-    Returns ``(resolved_path, value)`` pairs. Checks both literal key match and
-    dotted nested traversal so neither form can bypass a rule. Also traverses into
-    lists/tuples of mappings when intermediate segments encounter sequences.
+    Checks both literal key match and dotted nested traversal so neither form can
+    bypass a rule. Also traverses into lists/tuples of mappings and reports an
+    ``intermediate_type_error`` when an intermediate container segment is present
+    with a non-object value (fail-closed against JSON-in-string bypasses).
     """
-    results: list[tuple[str, Any]] = []
+    results: list[_ResolvedEntry] = []
     if "." not in arg_path:
         if arg_path in arguments:
-            results.append((arg_path, arguments[arg_path]))
+            results.append(_ResolvedEntry(path=arg_path, value=arguments[arg_path]))
         return results
 
     # Also check exact literal key containing dots in case an upstream uses flat dotted keys.
     if arg_path in arguments:
-        results.append((arg_path, arguments[arg_path]))
+        results.append(_ResolvedEntry(path=arg_path, value=arguments[arg_path]))
 
     segments = arg_path.split(".")
     if any(not seg for seg in segments):
@@ -201,6 +261,18 @@ def _resolve_arg_values(arguments: Mapping[str, Any], arg_path: str) -> list[tup
                 _walk(item, idx, f"{prefix}[{item_idx}]")
             return
         if not isinstance(current, Mapping):
+            # An intermediate key was present, but its value is not a mapping/list.
+            if idx > 0:
+                results.append(
+                    _ResolvedEntry(
+                        path=prefix or arg_path,
+                        value=current,
+                        intermediate_type_error=(
+                            f"Argument {prefix!r} must be an object to evaluate {arg_path!r}, "
+                            f"got {type(current).__name__}"
+                        ),
+                    )
+                )
             return
         seg = segments[idx]
         if seg not in current:
@@ -208,7 +280,7 @@ def _resolve_arg_values(arguments: Mapping[str, Any], arg_path: str) -> list[tup
         next_path = f"{prefix}.{seg}" if prefix else seg
         val = current[seg]
         if idx == len(segments) - 1:
-            results.append((next_path, val))
+            results.append(_ResolvedEntry(path=next_path, value=val))
         else:
             _walk(val, idx + 1, next_path)
 
@@ -227,7 +299,12 @@ def _iter_scalar_values(path: str, value: Any) -> list[tuple[str, Any]]:
 
 
 def _normalize_host(host: str) -> str | None:
-    """Normalize and validate a hostname, domain, or IP literal."""
+    """Normalize and validate a hostname, domain, or canonical IP literal.
+
+    Unmaps IPv4-mapped IPv6 literals (e.g. ``::ffff:127.0.0.1`` -> ``127.0.0.1``)
+    and rejects alternate numeric/hex/octal IP encodings (e.g. ``2130706433``,
+    ``0x7f.0.0.1``, ``127.1``) that could bypass IP/domain denylists.
+    """
     if not host or _CONTROL_OR_WHITESPACE_RE.search(host) is not None:
         return None
     raw = host.lower()
@@ -237,10 +314,12 @@ def _normalize_host(host: str) -> str | None:
         if not raw or raw.endswith("."):
             return None
 
-    # Handle bracketed or bare IP literals (e.g. ::1 or 127.0.0.1).
+    # Handle bracketed or bare IP literals (e.g. ::1, ::ffff:127.0.0.1, 127.0.0.1).
     ip_candidate = raw[1:-1] if raw.startswith("[") and raw.endswith("]") else raw
     try:
         ip_obj = ipaddress.ip_address(ip_candidate)
+        if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+            return str(ip_obj.ipv4_mapped)
         return str(ip_obj)
     except ValueError:
         pass
@@ -255,19 +334,61 @@ def _normalize_host(host: str) -> str | None:
     labels = ascii_host.split(".")
     if any(not _DNS_LABEL_RE.match(label) for label in labels):
         return None
+
+    # Reject non-canonical numeric/hex/octal IPv4 shorthands (RFC 1123 / WHATWG URL):
+    # A valid DNS TLD (last label) cannot be purely numeric or a hex literal.
+    last_label = labels[-1]
+    if last_label.isdigit() or _HEX_LITERAL_RE.match(last_label):
+        return None
+
     return ascii_host
 
 
-def extract_domain(raw: str) -> str | None:
-    """Extract and normalize a lowercase domain/host from an email, URL, or bare host.
+def _extract_email_domain(trimmed: str) -> str | None:
+    if "," in trimmed or ";" in trimmed or "\\" in trimmed:
+        return None
+    addr = trimmed
+    if "<" in trimmed or ">" in trimmed:
+        if (
+            trimmed.count("<") != 1
+            or trimmed.count(">") != 1
+            or not trimmed.endswith(">")
+            or trimmed.index("<") >= trimmed.index(">") - 1
+        ):
+            return None
+        display_part, bracketed = trimmed.split("<", 1)
+        # Disallow '@' in display name to defeat display-name spoofing.
+        if "@" in display_part:
+            return None
+        addr = bracketed[:-1].strip()
+    if not addr or _CONTROL_OR_WHITESPACE_RE.search(addr) is not None:
+        return None
+    if any(ch in _DISALLOWED_EMAIL_CHARS for ch in addr):
+        return None
+    if addr.count("@") != 1:
+        return None
+    local, domain = addr.split("@", 1)
+    if not local or not domain:
+        return None
+    if local.startswith(".") or local.endswith(".") or ".." in local:
+        return None
+    # Reject port/path suffixes attached to email domain.
+    if ":" in domain or "/" in domain or "?" in domain or "#" in domain:
+        return None
+    return _normalize_host(domain)
+
+
+def extract_candidate_domains(raw: str) -> tuple[str, ...] | None:
+    """Extract all plausible normalized domains from an email, URL, or bare host.
 
     Returns ``None`` on malformed, ambiguous, or obfuscated inputs (fail-closed):
       - Rejects NUL bytes, control characters, and embedded newlines.
-      - Rejects multi-address email strings (``a@good.com, b@evil.com``).
-      - Rejects multiple ``@`` symbols in emails (``user@evil.com@good.com``).
-      - Rejects backslashes in URL authority/netloc (``https://good.com\\@evil.com``).
-      - Extracts the true authority hostname from URLs with userinfo
-        (``https://good.com@evil.com/`` -> ``evil.com``) and strips ports.
+      - Rejects scheme-less protocol-relative ``//...`` strings (eliminates URL/email
+        ambiguity like ``//good.com/@evil.com`` unless unambiguously parsed as email).
+      - Rejects ``<`` or ``>`` inside URL-shaped values (blocks ``https://good.com/<a@evil.com>``).
+      - When ``@`` appears outside a URL's authority, evaluates BOTH the URL authority
+        host AND any email-parsed address domains so every candidate must satisfy
+        allowlists and any candidate triggers denylists.
     """
     if not isinstance(raw, str):
         return None
@@ -277,20 +398,21 @@ def extract_domain(raw: str) -> str | None:
     if not trimmed:
         return None
 
-    # Case 1: URL (scheme://... or protocol-relative //...)
-    if "://" in trimmed or trimmed.startswith("//"):
+    # Case 1: Explicit scheme URL (scheme://...)
+    if "://" in trimmed:
         if _CONTROL_OR_WHITESPACE_RE.search(trimmed) is not None:
+            return None
+        if "<" in trimmed or ">" in trimmed:
             return None
         try:
             parsed = urlsplit(trimmed)
         except ValueError:
             return None
-        if not parsed.netloc or "\\" in parsed.netloc:
+        if not parsed.scheme or not parsed.netloc or "\\" in parsed.netloc:
             return None
         # Reject ambiguous multiple '@' inside authority (e.g. user@good.com@evil.com)
         if parsed.netloc.count("@") > 1:
             return None
-        # Validate port if present (urlsplit raises ValueError on invalid port access)
         try:
             _ = parsed.port
         except ValueError:
@@ -298,41 +420,33 @@ def extract_domain(raw: str) -> str | None:
         hostname = parsed.hostname
         if not hostname:
             return None
-        return _normalize_host(hostname)
+        url_host = _normalize_host(hostname)
+        if url_host is None:
+            return None
+
+        candidates: list[str] = [url_host]
+        # If '@' appears outside authority (path/query/fragment), also evaluate email reading.
+        after_authority = f"{parsed.path}?{parsed.query}#{parsed.fragment}"
+        if "@" in after_authority:
+            for _display, parsed_addr in getaddresses([trimmed]):
+                if "@" in parsed_addr:
+                    email_part = parsed_addr.rsplit("@", 1)[1]
+                    # Strip any trailing path/query/fragment from email candidate
+                    email_host_raw = re.split(r"[/?#]", email_part, maxsplit=1)[0]
+                    email_host = _normalize_host(email_host_raw)
+                    if email_host is not None and email_host not in candidates:
+                        candidates.append(email_host)
+        return tuple(candidates)
+
+    # Reject scheme-less protocol-relative URLs without '@' (e.g. //cdn.example.com/x)
+    # and handle `//good.com/@evil.com` strictly via email extraction below.
+    if trimmed.startswith("//") and "@" not in trimmed:
+        return None
 
     # Case 2: Email address (plain local@domain or RFC 5322 "Display Name <local@domain>")
     if "@" in trimmed:
-        if "," in trimmed or ";" in trimmed or "\\" in trimmed:
-            return None
-        addr = trimmed
-        if "<" in trimmed or ">" in trimmed:
-            if (
-                trimmed.count("<") != 1
-                or trimmed.count(">") != 1
-                or not trimmed.endswith(">")
-                or trimmed.index("<") >= trimmed.index(">") - 1
-            ):
-                return None
-            display_part, bracketed = trimmed.split("<", 1)
-            # Disallow '@' in display name to defeat display-name spoofing.
-            if "@" in display_part:
-                return None
-            addr = bracketed[:-1].strip()
-        if not addr or _CONTROL_OR_WHITESPACE_RE.search(addr) is not None:
-            return None
-        if any(ch in _DISALLOWED_EMAIL_CHARS for ch in addr):
-            return None
-        if addr.count("@") != 1:
-            return None
-        local, domain = addr.split("@", 1)
-        if not local or not domain:
-            return None
-        if local.startswith(".") or local.endswith(".") or ".." in local:
-            return None
-        # Reject port/path suffixes attached to email domain.
-        if ":" in domain or "/" in domain or "?" in domain or "#" in domain:
-            return None
-        return _normalize_host(domain)
+        email_domain = _extract_email_domain(trimmed)
+        return (email_domain,) if email_domain is not None else None
 
     # Case 3: Bare hostname / domain (with optional :port)
     if _CONTROL_OR_WHITESPACE_RE.search(trimmed) is not None or any(
@@ -341,7 +455,6 @@ def extract_domain(raw: str) -> str | None:
         return None
     host_part = trimmed
     if trimmed.startswith("["):
-        # Bracketed IPv6 literal with optional :port
         end_bracket = trimmed.find("]")
         if end_bracket == -1:
             return None
@@ -355,16 +468,38 @@ def extract_domain(raw: str) -> str | None:
                 return None
     elif ":" in trimmed:
         if trimmed.count(":") > 1:
-            # Possibly bare IPv6 literal
-            return _normalize_host(trimmed)
+            host = _normalize_host(trimmed)
+            return (host,) if host is not None else None
         host_part, port_str = trimmed.split(":", 1)
         if not port_str.isdigit() or not (1 <= int(port_str) <= 65535):
             return None
-    return _normalize_host(host_part)
+    host = _normalize_host(host_part)
+    return (host,) if host is not None else None
+
+
+def extract_domain(raw: str) -> str | None:
+    """Extract a single unambiguous normalized domain, or ``None`` if invalid/ambiguous."""
+    candidates = extract_candidate_domains(raw)
+    if candidates is None or len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
+def _is_valid_domain_pattern(pattern: str) -> bool:
+    raw_pat = pattern.strip().lower()
+    if not raw_pat:
+        return False
+    if raw_pat == "*":
+        return True
+    if raw_pat.startswith("*."):
+        return _normalize_host(raw_pat[2:]) is not None
+    if raw_pat.startswith("."):
+        return _normalize_host(raw_pat[1:]) is not None
+    return _normalize_host(raw_pat) is not None
 
 
 def _domain_matches(domain: str, pattern: str, *, match_subdomains_by_default: bool) -> bool:
-    """Match a normalized domain against a domain rule pattern."""
+    """Match a normalized domain against a validated domain rule pattern."""
     raw_pat = pattern.strip().lower()
     if not raw_pat:
         return False
@@ -393,10 +528,16 @@ def _domain_matches(domain: str, pattern: str, *, match_subdomains_by_default: b
     return False
 
 
-def _string_matches_pattern(value: str, pattern: str) -> bool:
-    if _has_glob(pattern):
-        return fnmatch.fnmatchcase(value, pattern)
-    return value == pattern
+def _string_matches_pattern(value: str, pattern: str, *, case_insensitive: bool = False) -> bool:
+    val = value.lower() if case_insensitive else value
+    pat = pattern.lower() if case_insensitive else pattern
+    if _has_glob(pat):
+        return fnmatch.fnmatchcase(val, pat)
+    return val == pat
+
+
+def _has_path_separator(pattern: str) -> bool:
+    return "/" in pattern or "\\" in pattern
 
 
 def _format_violation_message(base: str, rule_reason: str | None) -> str:
@@ -495,10 +636,16 @@ def _evaluate_rule_value(
         else:
             if rule.deny:
                 stripped = value.strip()
+                norm_posix = posixpath.normpath(stripped.replace("\\", "/"))
+                deny_candidates = [value]
+                if stripped != value:
+                    deny_candidates.append(stripped)
+                if "/" in stripped or "\\" in stripped:
+                    deny_candidates.append(norm_posix)
                 if any(
-                    _string_matches_pattern(value, pat)
-                    or (stripped != value and _string_matches_pattern(stripped, pat))
+                    _string_matches_pattern(cand, pat, case_insensitive=True)
                     for pat in rule.deny
+                    for cand in deny_candidates
                 ):
                     violations.append(
                         PreflightViolation(
@@ -513,23 +660,50 @@ def _evaluate_rule_value(
                             ),
                         )
                     )
-            if rule.allow and not any(_string_matches_pattern(value, pat) for pat in rule.allow):
-                violations.append(
-                    PreflightViolation(
-                        tool=tool_name,
-                        arg=resolved_path,
-                        constraint="allow",
-                        value=value,
-                        rule_reason=rule.reason,
-                        message=_format_violation_message(
-                            f"Argument {resolved_path!r} value {value!r} is not in allowlist",
-                            rule.reason,
-                        ),
+            if rule.allow:
+                path_rule = any(_has_path_separator(pat) for pat in rule.allow)
+                has_traversal = path_rule and _PATH_TRAVERSAL_RE.search(value) is not None
+                if has_traversal or not any(
+                    _string_matches_pattern(value, pat, case_insensitive=False)
+                    for pat in rule.allow
+                ):
+                    violations.append(
+                        PreflightViolation(
+                            tool=tool_name,
+                            arg=resolved_path,
+                            constraint="allow",
+                            value=value,
+                            rule_reason=rule.reason,
+                            message=_format_violation_message(
+                                f"Argument {resolved_path!r} value {value!r} is not in allowlist",
+                                rule.reason,
+                            ),
+                        )
                     )
-                )
 
     # Domain allowlist / denylist constraints
     if rule.allow_domains or rule.deny_domains:
+        # Fail closed on malformed rule patterns so a misconfigured rule never fails open.
+        invalid_deny = [p for p in rule.deny_domains if not _is_valid_domain_pattern(p)]
+        invalid_allow = [p for p in rule.allow_domains if not _is_valid_domain_pattern(p)]
+        if invalid_deny or invalid_allow:
+            bad = ", ".join(repr(p) for p in (*invalid_deny, *invalid_allow))
+            violations.append(
+                PreflightViolation(
+                    tool=tool_name,
+                    arg=resolved_path,
+                    constraint="invalid_rule",
+                    value=value,
+                    rule_reason=rule.reason,
+                    message=_format_violation_message(
+                        f"Preflight rule for {resolved_path!r} contains invalid domain "
+                        f"pattern(s): {bad}",
+                        rule.reason,
+                    ),
+                )
+            )
+            return
+
         if not isinstance(value, str):
             violations.append(
                 PreflightViolation(
@@ -546,8 +720,8 @@ def _evaluate_rule_value(
                 )
             )
         else:
-            domain = extract_domain(value)
-            if domain is None:
+            candidates = extract_candidate_domains(value)
+            if not candidates:
                 violations.append(
                     PreflightViolation(
                         tool=tool_name,
@@ -563,41 +737,46 @@ def _evaluate_rule_value(
                     )
                 )
             else:
-                if rule.deny_domains and any(
-                    _domain_matches(domain, pat, match_subdomains_by_default=True)
-                    for pat in rule.deny_domains
-                ):
-                    violations.append(
-                        PreflightViolation(
-                            tool=tool_name,
-                            arg=resolved_path,
-                            constraint="deny_domains",
-                            value=domain,
-                            rule_reason=rule.reason,
-                            message=_format_violation_message(
-                                f"Argument {resolved_path!r} domain {domain!r} is denied by policy",
-                                rule.reason,
-                            ),
-                        )
-                    )
-                if rule.allow_domains and not any(
-                    _domain_matches(domain, pat, match_subdomains_by_default=False)
-                    for pat in rule.allow_domains
-                ):
-                    violations.append(
-                        PreflightViolation(
-                            tool=tool_name,
-                            arg=resolved_path,
-                            constraint="allow_domains",
-                            value=domain,
-                            rule_reason=rule.reason,
-                            message=_format_violation_message(
-                                f"Argument {resolved_path!r} domain {domain!r} is not in "
-                                "allowed domains",
-                                rule.reason,
-                            ),
-                        )
-                    )
+                if rule.deny_domains:
+                    for domain in candidates:
+                        if any(
+                            _domain_matches(domain, pat, match_subdomains_by_default=True)
+                            for pat in rule.deny_domains
+                        ):
+                            violations.append(
+                                PreflightViolation(
+                                    tool=tool_name,
+                                    arg=resolved_path,
+                                    constraint="deny_domains",
+                                    value=domain,
+                                    rule_reason=rule.reason,
+                                    message=_format_violation_message(
+                                        f"Argument {resolved_path!r} domain {domain!r} is "
+                                        "denied by policy",
+                                        rule.reason,
+                                    ),
+                                )
+                            )
+                if rule.allow_domains:
+                    for domain in candidates:
+                        if not any(
+                            _domain_matches(domain, pat, match_subdomains_by_default=False)
+                            for pat in rule.allow_domains
+                        ):
+                            violations.append(
+                                PreflightViolation(
+                                    tool=tool_name,
+                                    arg=resolved_path,
+                                    constraint="allow_domains",
+                                    value=domain,
+                                    rule_reason=rule.reason,
+                                    message=_format_violation_message(
+                                        f"Argument {resolved_path!r} domain {domain!r} is not "
+                                        "in allowed domains",
+                                        rule.reason,
+                                    ),
+                                )
+                            )
 
 
 def evaluate_preflight(
@@ -652,9 +831,49 @@ def evaluate_preflight(
         for rule in preflight_cfg.rules:
             if not _tool_matches_rule(tool_name, rule.tool):
                 continue
-            resolved_entries = _resolve_arg_values(args_mapping, rule.arg)
-            for resolved_path, raw_val in resolved_entries:
-                for scalar_path, scalar_val in _iter_scalar_values(resolved_path, raw_val):
+            try:
+                resolved_entries = _resolve_arg_values(args_mapping, rule.arg)
+            except RecursionError:
+                violations.append(
+                    PreflightViolation(
+                        tool=tool_name,
+                        arg=rule.arg,
+                        constraint="invalid_type",
+                        message=f"Argument {rule.arg!r} exceeded maximum nesting depth",
+                        rule_reason=rule.reason,
+                    )
+                )
+                continue
+            for entry in resolved_entries:
+                if entry.intermediate_type_error is not None:
+                    violations.append(
+                        PreflightViolation(
+                            tool=tool_name,
+                            arg=entry.path,
+                            constraint="invalid_type",
+                            value=entry.value,
+                            rule_reason=rule.reason,
+                            message=_format_violation_message(
+                                entry.intermediate_type_error,
+                                rule.reason,
+                            ),
+                        )
+                    )
+                    continue
+                try:
+                    scalar_items = _iter_scalar_values(entry.path, entry.value)
+                except RecursionError:
+                    violations.append(
+                        PreflightViolation(
+                            tool=tool_name,
+                            arg=entry.path,
+                            constraint="invalid_type",
+                            message=f"Argument {entry.path!r} exceeded maximum nesting depth",
+                            rule_reason=rule.reason,
+                        )
+                    )
+                    continue
+                for scalar_path, scalar_val in scalar_items:
                     _evaluate_rule_value(
                         tool_name=tool_name,
                         rule=rule,

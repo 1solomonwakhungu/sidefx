@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import copy
 import hashlib
 import json
 import math
@@ -35,21 +34,30 @@ from sidefx.journal import (
     compute_payload_hash,
     resolve_db_path,
 )
-from sidefx.preflight import ToolKind, classify_tool, evaluate_preflight
+from sidefx.preflight import ToolKind, evaluate_preflight
 
 ENV_SESSION_ID = "SIDEFX_SESSION_ID"
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024  # 16 MiB per newline-delimited JSON-RPC frame
 _MAX_TIMED_OUT_HISTORY = 10_000
+_MAX_CONFIRMED_CACHE_ENTRIES = 256
+_MAX_CONFIRMED_CACHE_BYTES = 8 * 1024 * 1024  # 8 MiB total in-memory replay cache budget
+_MAX_SINGLE_CACHE_BYTES = 1 * 1024 * 1024  # Skip caching individual responses > 1 MiB
 _SHUTDOWN_GRACE_SECONDS = 2.0
 _MAX_REF_LENGTH = 500
 _MAX_SUMMARY_LENGTH = 1000
 _URL_RE = re.compile(r"https?://[^\s<>\"'\]\)]+")
 _RESULT_REF_KEYS = ("result_ref", "url", "html_url", "uri", "id")
+_AMBIGUOUS_ERROR_RE = re.compile(
+    r"\b(?:timed?\s*out|timeout|deadline\s+exceeded|econnreset|connection\s+reset|"
+    r"broken\s+pipe|eof\s+before|504\s+gateway)\b",
+    re.IGNORECASE,
+)
 
 # Standard JSON-RPC 2.0 and sidefx application error codes
 JSONRPC_PARSE_ERROR = -32700
 JSONRPC_INVALID_REQUEST = -32600
 JSONRPC_INVALID_PARAMS = -32602
+JSONRPC_INTERNAL_ERROR = -32603
 ERR_PREFLIGHT_DENIED = -32001
 ERR_OUTCOME_UNKNOWN = -32002
 ERR_UPSTREAM_UNAVAILABLE = -32003
@@ -97,14 +105,50 @@ class _InFlightMutation:
     settled: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _TimedOutMutation:
+    """Tracks an upstream mutation that timed out so late responses and retries stay safe."""
+
+    upstream_id: str
+    client_id: Any
+    has_client_id: bool
+    action_id: str
+    marker: str
+    tool_name: str
+    attempt: int
+
+
 def _reject_json_constant(token: str) -> Any:
     raise ValueError(f"Invalid JSON constant: {token!r}")
 
 
+def _parse_finite_float(raw: str) -> float:
+    val = float(raw)
+    if not math.isfinite(val):
+        raise ValueError(f"Non-finite float literal: {raw!r}")
+    return val
+
+
+def _loads_strict_json(text: str) -> Any:
+    return json.loads(
+        text,
+        parse_constant=_reject_json_constant,
+        parse_float=_parse_finite_float,
+    )
+
+
+def _rpc_id_key(rpc_id: Any) -> tuple[type, Any]:
+    """Build a collision-free dict key distinguishing e.g. `0`, `False`, `1`, `1.0`, `'1'`."""
+    return (type(rpc_id), rpc_id)
+
+
 def _sanitize_text(text: str | None, *, max_len: int | None = None) -> str | None:
+    """Strip NUL bytes and replace lone UTF-16 surrogates so SQLite UTF-8 encoding never fails."""
     if text is None:
         return None
     cleaned = text.replace("\x00", "")
+    # Replace lone surrogates cleanly so SQLite accepts the string without UnicodeEncodeError.
+    cleaned = cleaned.encode("utf-8", errors="replace").decode("utf-8")
     if max_len is not None and len(cleaned) > max_len:
         cleaned = f"{cleaned[: max_len - 3]}..."
     return cleaned
@@ -127,13 +171,38 @@ def _jsonrpc_result_response(req_id: Any, result: Any) -> dict[str, Any]:
 
 
 def _serialize_message(message: dict[str, Any]) -> bytes:
+    """Serialize a JSON-RPC message as ASCII-safe UTF-8 JSON + newline.
+
+    ``ensure_ascii=True`` ensures lone UTF-16 surrogates (e.g. from sliced JS strings)
+    round-trip cleanly as ``\\uXXXX`` escapes instead of raising ``UnicodeEncodeError``.
+    """
     encoded = json.dumps(
         message,
         separators=(",", ":"),
-        ensure_ascii=False,
+        ensure_ascii=True,
         allow_nan=False,
     )
-    return encoded.encode("utf-8") + b"\n"
+    return encoded.encode("ascii") + b"\n"
+
+
+def _serialize_json_value(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+
+
+def _build_cached_response_frame(client_id: Any, cached_result_json: bytes) -> bytes:
+    id_bytes = _serialize_json_value(client_id)
+    return b'{"jsonrpc":"2.0","id":' + id_bytes + b',"result":' + cached_result_json + b"}\n"
+
+
+def _is_ambiguous_error_text(error_text: str | None) -> bool:
+    if not error_text:
+        return False
+    return _AMBIGUOUS_ERROR_RE.search(error_text) is not None
 
 
 def _extract_result_ref_and_summary(result: Any) -> tuple[str | None, str | None]:
@@ -170,11 +239,10 @@ def _extract_result_ref_and_summary(result: Any) -> tuple[str | None, str | None
 
     joined_text = "\n".join(text_chunks).strip()
     if result_ref is None and joined_text:
-        # Check if the text content itself is a JSON object with a known ref key.
         if joined_text.startswith("{") and joined_text.endswith("}"):
             try:
-                parsed_text = json.loads(joined_text)
-            except ValueError:
+                parsed_text = _loads_strict_json(joined_text)
+            except (ValueError, RecursionError):
                 parsed_text = None
             if isinstance(parsed_text, dict):
                 result_ref = _find_ref_in_dict(parsed_text)
@@ -188,10 +256,10 @@ def _extract_result_ref_and_summary(result: Any) -> tuple[str | None, str | None
     elif structured is not None:
         try:
             summary = _sanitize_text(
-                json.dumps(structured, sort_keys=True, separators=(",", ":")),
+                json.dumps(structured, sort_keys=True, separators=(",", ":"), ensure_ascii=True),
                 max_len=_MAX_SUMMARY_LENGTH,
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             summary = _sanitize_text(str(structured), max_len=_MAX_SUMMARY_LENGTH)
     else:
         summary = result_ref
@@ -235,12 +303,14 @@ def _build_replay_result(record: ActionRecord) -> dict[str, Any]:
 
 
 def _default_target_from_cmd(upstream_cmd: Sequence[str]) -> str:
+    """Derive a deterministic target identifier from the full upstream command."""
     if not upstream_cmd:
         return "mcp:upstream"
-    base = Path(upstream_cmd[0]).name.strip()
-    if not base:
-        return "mcp:upstream"
-    return f"mcp:{base}"
+    base = Path(upstream_cmd[0]).name.strip() or "upstream"
+    cmd_digest = hashlib.sha256(
+        json.dumps(list(upstream_cmd), separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    ).hexdigest()[:8]
+    return f"mcp:{base}:{cmd_digest}"
 
 
 def _derive_deterministic_action_id(
@@ -309,10 +379,11 @@ class MCPProxy:
         self._upstream_cmd = [str(part) for part in upstream_cmd]
         self._journal = journal
         self._config = config if config is not None else SidefxConfig()
+        # Precedence matches --db: explicit CLI/arg > SIDEFX_SESSION_ID env > config > random.
         self._session_id = (
             session_id
-            or self._config.default_session_id
             or os.environ.get(ENV_SESSION_ID, "").strip()
+            or self._config.default_session_id
             or f"mcp-{uuid.uuid4().hex[:12]}"
         )
         self._actor = actor or self._config.default_actor
@@ -344,9 +415,12 @@ class MCPProxy:
         self._pending_cond = threading.Condition(self._state_lock)
 
         self._pending_mutations: dict[str, _InFlightMutation] = {}
-        self._timed_out_upstream_ids: OrderedDict[str, str] = OrderedDict()
-        self._confirmed_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._timed_out_upstream_ids: OrderedDict[str, _TimedOutMutation] = OrderedDict()
+        self._confirmed_cache: OrderedDict[tuple[str, str, str], bytes] = OrderedDict()
+        self._confirmed_cache_bytes = 0
+        self._active_finalizers = 0
         self._upstream_closed = False
+        self._reader_fatal_error = False
         self._proc: subprocess.Popen[bytes] | None = None
 
     @property
@@ -377,6 +451,36 @@ class MCPProxy:
         with self._state_lock:
             self._seq_counter += 1
             return f"__sidefx_{self._proxy_nonce}_{self._seq_counter}"
+
+    def _cache_confirmed_result(self, key: tuple[str, str, str], result: Any) -> None:
+        if not isinstance(result, dict):
+            return
+        try:
+            serialized = _serialize_json_value(result)
+        except (TypeError, ValueError, RecursionError):
+            return
+        size = len(serialized)
+        if size > _MAX_SINGLE_CACHE_BYTES:
+            return
+        with self._state_lock:
+            old = self._confirmed_cache.pop(key, None)
+            if old is not None:
+                self._confirmed_cache_bytes -= len(old)
+            while self._confirmed_cache and (
+                len(self._confirmed_cache) >= _MAX_CONFIRMED_CACHE_ENTRIES
+                or self._confirmed_cache_bytes + size > _MAX_CONFIRMED_CACHE_BYTES
+            ):
+                _, evicted = self._confirmed_cache.popitem(last=False)
+                self._confirmed_cache_bytes -= len(evicted)
+            self._confirmed_cache[key] = serialized
+            self._confirmed_cache_bytes += size
+
+    def _get_cached_result_bytes(self, key: tuple[str, str, str]) -> bytes | None:
+        with self._state_lock:
+            cached = self._confirmed_cache.get(key)
+            if cached is not None:
+                self._confirmed_cache.move_to_end(key)
+            return cached
 
     def _write_client_bytes(self, payload: bytes) -> None:
         with self._client_write_lock:
@@ -418,8 +522,16 @@ class MCPProxy:
             return b"", True
         return chunk, False
 
-    def _record_timed_out_id_locked(self, upstream_id: str, action_id: str) -> None:
-        self._timed_out_upstream_ids[upstream_id] = action_id
+    def _record_timed_out_entry_locked(self, entry: _InFlightMutation) -> None:
+        self._timed_out_upstream_ids[entry.upstream_id] = _TimedOutMutation(
+            upstream_id=entry.upstream_id,
+            client_id=entry.client_id,
+            has_client_id=entry.has_client_id,
+            action_id=entry.action_id,
+            marker=entry.marker,
+            tool_name=entry.tool_name,
+            attempt=entry.attempt,
+        )
         while len(self._timed_out_upstream_ids) > _MAX_TIMED_OUT_HISTORY:
             self._timed_out_upstream_ids.popitem(last=False)
 
@@ -463,30 +575,100 @@ class MCPProxy:
                 return
             entry.settled = True
             self._pending_mutations.pop(upstream_id, None)
-            self._record_timed_out_id_locked(upstream_id, entry.action_id)
-            self._pending_cond.notify_all()
+            self._record_timed_out_entry_locked(entry)
+            self._active_finalizers += 1
 
-        detail = f"upstream MCP server timed out after {self._timeout_seconds:g}s"
         try:
-            self._journal.mark_unknown(
+            detail = f"upstream MCP server timed out after {self._timeout_seconds:g}s"
+            try:
+                self._journal.mark_unknown(
+                    self._actor,
+                    self._target,
+                    entry.action_id,
+                    attempt=entry.attempt,
+                    error=detail,
+                )
+            except (StaleAttemptError, InvalidStateTransitionError, JournalError) as exc:
+                self._log_err(f"failed to mark timed-out action {entry.action_id} unknown: {exc}")
+
+            self._send_outcome_unknown(
+                has_client_id=entry.has_client_id,
+                client_id=entry.client_id,
+                action_id=entry.action_id,
+                marker=entry.marker,
+                tool_name=entry.tool_name,
+                status=ActionStatus.UNKNOWN,
+                detail=detail,
+            )
+        finally:
+            with self._pending_cond:
+                self._active_finalizers -= 1
+                self._pending_cond.notify_all()
+
+    def _finalize_late_timed_out_response(
+        self,
+        timed_out: _TimedOutMutation,
+        msg: dict[str, Any],
+    ) -> None:
+        """Reconcile a late upstream reply in SQLite while dropping it from client stdout."""
+        if "error" in msg and msg["error"] is not None:
+            err_obj = msg["error"]
+            if isinstance(err_obj, dict):
+                err_text = _sanitize_text(
+                    f"JSON-RPC error {err_obj.get('code')}: "
+                    f"{err_obj.get('message', 'upstream JSON-RPC error')}",
+                    max_len=_MAX_SUMMARY_LENGTH,
+                )
+            else:
+                err_text = _sanitize_text(str(err_obj), max_len=_MAX_SUMMARY_LENGTH)
+            if not _is_ambiguous_error_text(err_text):
+                with contextlib.suppress(
+                    StaleAttemptError, InvalidStateTransitionError, JournalError
+                ):
+                    self._journal.mark_failed(
+                        self._actor,
+                        self._target,
+                        timed_out.action_id,
+                        attempt=timed_out.attempt,
+                        error=err_text,
+                    )
+            return
+
+        result = msg.get("result")
+        if not isinstance(result, dict):
+            return
+
+        if result.get("isError") is True:
+            err_text = _extract_tool_error_text(result)
+            if not _is_ambiguous_error_text(err_text):
+                with contextlib.suppress(
+                    StaleAttemptError, InvalidStateTransitionError, JournalError
+                ):
+                    self._journal.mark_failed(
+                        self._actor,
+                        self._target,
+                        timed_out.action_id,
+                        attempt=timed_out.attempt,
+                        error=err_text,
+                    )
+            return
+
+        result_ref, summary = _extract_result_ref_and_summary(result)
+        try:
+            self._journal.mark_reconciled(
                 self._actor,
                 self._target,
-                entry.action_id,
-                attempt=entry.attempt,
-                error=detail,
+                timed_out.action_id,
+                attempt=timed_out.attempt,
+                result_ref=result_ref,
+                summary=summary,
             )
         except (StaleAttemptError, InvalidStateTransitionError, JournalError) as exc:
-            self._log_err(f"failed to mark timed-out action {entry.action_id} unknown: {exc}")
-
-        self._send_outcome_unknown(
-            has_client_id=entry.has_client_id,
-            client_id=entry.client_id,
-            action_id=entry.action_id,
-            marker=entry.marker,
-            tool_name=entry.tool_name,
-            status=ActionStatus.UNKNOWN,
-            detail=detail,
-        )
+            self._log_err(
+                f"failed to reconcile late upstream reply for {timed_out.action_id}: {exc}"
+            )
+            return
+        self._cache_confirmed_result((self._actor, self._target, timed_out.action_id), result)
 
     def _handle_upstream_response_for_mutation(
         self,
@@ -498,6 +680,7 @@ class MCPProxy:
         Returns True if the message belonged to an intercepted mutation (handled or dropped
         as a late response), False if it should be passed through verbatim to the client.
         """
+        late_entry: _TimedOutMutation | None = None
         with self._pending_cond:
             entry = self._pending_mutations.get(upstream_id)
             if entry is not None:
@@ -506,45 +689,66 @@ class MCPProxy:
                 entry.settled = True
                 self._pending_mutations.pop(upstream_id, None)
                 timer = entry.timer
-                self._pending_cond.notify_all()
+                self._active_finalizers += 1
             else:
-                late_action_id = self._timed_out_upstream_ids.pop(upstream_id, None)
-                if late_action_id is not None:
-                    self._log_err(
-                        f"dropping late upstream response for timed-out action {late_action_id}"
+                late_entry = self._timed_out_upstream_ids.pop(upstream_id, None)
+                if late_entry is not None:
+                    self._active_finalizers += 1
+                else:
+                    return False
+
+        if late_entry is not None:
+            try:
+                self._log_err(
+                    f"reconciling and dropping late upstream response for timed-out action "
+                    f"{late_entry.action_id}"
+                )
+                self._finalize_late_timed_out_response(late_entry, msg)
+            finally:
+                with self._pending_cond:
+                    self._active_finalizers -= 1
+                    self._pending_cond.notify_all()
+            return True
+
+        assert entry is not None
+        try:
+            if timer is not None:
+                timer.cancel()
+
+            # Finalize journal row BEFORE forwarding response back to the client.
+            if "error" in msg and msg["error"] is not None:
+                err_obj = msg["error"]
+                if isinstance(err_obj, dict):
+                    err_code = err_obj.get("code")
+                    err_msg = err_obj.get("message", "upstream JSON-RPC error")
+                    err_text = _sanitize_text(
+                        f"JSON-RPC error {err_code}: {err_msg}", max_len=_MAX_SUMMARY_LENGTH
+                    )
+                else:
+                    err_text = _sanitize_text(str(err_obj), max_len=_MAX_SUMMARY_LENGTH)
+
+                if _is_ambiguous_error_text(err_text):
+                    try:
+                        self._journal.mark_unknown(
+                            self._actor,
+                            self._target,
+                            entry.action_id,
+                            attempt=entry.attempt,
+                            error=err_text,
+                        )
+                    except (StaleAttemptError, InvalidStateTransitionError, JournalError) as exc:
+                        self._log_err(f"failed to mark action {entry.action_id} unknown: {exc}")
+                    self._send_outcome_unknown(
+                        has_client_id=entry.has_client_id,
+                        client_id=entry.client_id,
+                        action_id=entry.action_id,
+                        marker=entry.marker,
+                        tool_name=entry.tool_name,
+                        status=ActionStatus.UNKNOWN,
+                        detail=err_text or "ambiguous upstream error",
                     )
                     return True
-                return False
 
-        if timer is not None:
-            timer.cancel()
-
-        # Finalize journal row BEFORE forwarding response back to the client.
-        if "error" in msg and msg["error"] is not None:
-            err_obj = msg["error"]
-            if isinstance(err_obj, dict):
-                err_code = err_obj.get("code")
-                err_msg = err_obj.get("message", "upstream JSON-RPC error")
-                err_text = _sanitize_text(
-                    f"JSON-RPC error {err_code}: {err_msg}", max_len=_MAX_SUMMARY_LENGTH
-                )
-            else:
-                err_text = _sanitize_text(str(err_obj), max_len=_MAX_SUMMARY_LENGTH)
-            try:
-                self._journal.mark_failed(
-                    self._actor,
-                    self._target,
-                    entry.action_id,
-                    attempt=entry.attempt,
-                    error=err_text,
-                )
-            except (StaleAttemptError, InvalidStateTransitionError, JournalError) as exc:
-                self._log_err(f"failed to mark action {entry.action_id} failed: {exc}")
-        else:
-            result = msg.get("result")
-            is_tool_error = isinstance(result, dict) and result.get("isError") is True
-            if is_tool_error:
-                err_text = _extract_tool_error_text(result)
                 try:
                     self._journal.mark_failed(
                         self._actor,
@@ -555,30 +759,97 @@ class MCPProxy:
                     )
                 except (StaleAttemptError, InvalidStateTransitionError, JournalError) as exc:
                     self._log_err(f"failed to mark action {entry.action_id} failed: {exc}")
-            else:
-                result_ref, summary = _extract_result_ref_and_summary(result)
+            elif "result" not in msg or not isinstance(msg["result"], dict):
+                # Missing or non-object result in tools/call response -> outcome is ambiguous!
+                detail = "upstream MCP response missing valid 'result' object"
                 try:
-                    self._journal.mark_confirmed(
+                    self._journal.mark_unknown(
                         self._actor,
                         self._target,
                         entry.action_id,
                         attempt=entry.attempt,
-                        result_ref=result_ref,
-                        summary=summary,
+                        error=detail,
                     )
                 except (StaleAttemptError, InvalidStateTransitionError, JournalError) as exc:
-                    self._log_err(f"failed to mark action {entry.action_id} confirmed: {exc}")
-                if isinstance(result, dict):
-                    with self._state_lock:
-                        self._confirmed_cache[(self._actor, self._target, entry.action_id)] = (
-                            copy.deepcopy(result)
+                    self._log_err(
+                        f"failed to mark malformed reply {entry.action_id} unknown: {exc}"
+                    )
+                self._send_outcome_unknown(
+                    has_client_id=entry.has_client_id,
+                    client_id=entry.client_id,
+                    action_id=entry.action_id,
+                    marker=entry.marker,
+                    tool_name=entry.tool_name,
+                    status=ActionStatus.UNKNOWN,
+                    detail=detail,
+                )
+                return True
+            else:
+                result = msg["result"]
+                is_tool_error = result.get("isError") is True
+                if is_tool_error:
+                    err_text = _extract_tool_error_text(result)
+                    if _is_ambiguous_error_text(err_text):
+                        try:
+                            self._journal.mark_unknown(
+                                self._actor,
+                                self._target,
+                                entry.action_id,
+                                attempt=entry.attempt,
+                                error=err_text,
+                            )
+                        except (
+                            StaleAttemptError,
+                            InvalidStateTransitionError,
+                            JournalError,
+                        ) as exc:
+                            self._log_err(f"failed to mark action {entry.action_id} unknown: {exc}")
+                        self._send_outcome_unknown(
+                            has_client_id=entry.has_client_id,
+                            client_id=entry.client_id,
+                            action_id=entry.action_id,
+                            marker=entry.marker,
+                            tool_name=entry.tool_name,
+                            status=ActionStatus.UNKNOWN,
+                            detail=err_text,
                         )
+                        return True
+                    try:
+                        self._journal.mark_failed(
+                            self._actor,
+                            self._target,
+                            entry.action_id,
+                            attempt=entry.attempt,
+                            error=err_text,
+                        )
+                    except (StaleAttemptError, InvalidStateTransitionError, JournalError) as exc:
+                        self._log_err(f"failed to mark action {entry.action_id} failed: {exc}")
+                else:
+                    result_ref, summary = _extract_result_ref_and_summary(result)
+                    try:
+                        self._journal.mark_confirmed(
+                            self._actor,
+                            self._target,
+                            entry.action_id,
+                            attempt=entry.attempt,
+                            result_ref=result_ref,
+                            summary=summary,
+                        )
+                    except (StaleAttemptError, InvalidStateTransitionError, JournalError) as exc:
+                        self._log_err(f"failed to mark action {entry.action_id} confirmed: {exc}")
+                    self._cache_confirmed_result(
+                        (self._actor, self._target, entry.action_id), result
+                    )
 
-        if entry.has_client_id:
-            outbound = dict(msg)
-            outbound["id"] = entry.client_id
-            self._send_client_message(outbound)
-        return True
+            if entry.has_client_id:
+                outbound = dict(msg)
+                outbound["id"] = entry.client_id
+                self._send_client_message(outbound)
+            return True
+        finally:
+            with self._pending_cond:
+                self._active_finalizers -= 1
+                self._pending_cond.notify_all()
 
     def _fail_all_inflight_on_upstream_eof(self) -> None:
         with self._pending_cond:
@@ -589,31 +860,39 @@ class MCPProxy:
                     entry.settled = True
                     orphaned.append(entry)
             self._pending_mutations.clear()
-            self._pending_cond.notify_all()
+            self._timed_out_upstream_ids.clear()
+            self._active_finalizers += 1
 
-        detail = "upstream MCP server closed connection or crashed before responding"
-        for entry in orphaned:
-            if entry.timer is not None:
-                entry.timer.cancel()
-            try:
-                self._journal.mark_unknown(
-                    self._actor,
-                    self._target,
-                    entry.action_id,
-                    attempt=entry.attempt,
-                    error=detail,
+        try:
+            detail = "upstream MCP server closed connection or crashed before responding"
+            for entry in orphaned:
+                if entry.timer is not None:
+                    entry.timer.cancel()
+                try:
+                    self._journal.mark_unknown(
+                        self._actor,
+                        self._target,
+                        entry.action_id,
+                        attempt=entry.attempt,
+                        error=detail,
+                    )
+                except (StaleAttemptError, InvalidStateTransitionError, JournalError) as exc:
+                    self._log_err(
+                        f"failed to mark orphaned action {entry.action_id} unknown: {exc}"
+                    )
+                self._send_outcome_unknown(
+                    has_client_id=entry.has_client_id,
+                    client_id=entry.client_id,
+                    action_id=entry.action_id,
+                    marker=entry.marker,
+                    tool_name=entry.tool_name,
+                    status=ActionStatus.UNKNOWN,
+                    detail=detail,
                 )
-            except (StaleAttemptError, InvalidStateTransitionError, JournalError) as exc:
-                self._log_err(f"failed to mark orphaned action {entry.action_id} unknown: {exc}")
-            self._send_outcome_unknown(
-                has_client_id=entry.has_client_id,
-                client_id=entry.client_id,
-                action_id=entry.action_id,
-                marker=entry.marker,
-                tool_name=entry.tool_name,
-                status=ActionStatus.UNKNOWN,
-                detail=detail,
-            )
+        finally:
+            with self._pending_cond:
+                self._active_finalizers -= 1
+                self._pending_cond.notify_all()
 
     def _upstream_reader_loop(self, upstream_stdout: BinaryIO) -> None:
         try:
@@ -628,38 +907,50 @@ class MCPProxy:
                     continue
                 try:
                     decoded = raw_line.decode("utf-8")
-                    msg = json.loads(decoded, parse_constant=_reject_json_constant)
+                    msg = _loads_strict_json(decoded)
                 except (UnicodeDecodeError, ValueError, RecursionError) as exc:
                     self._log_err(f"ignored non-JSON line from upstream stdout: {exc}")
                     continue
 
-                if isinstance(msg, dict) and "method" not in msg and "id" in msg:
-                    msg_id = msg["id"]
-                    if isinstance(msg_id, str) and self._handle_upstream_response_for_mutation(
-                        msg_id, msg
-                    ):
-                        continue
+                try:
+                    if isinstance(msg, dict) and "method" not in msg and "id" in msg:
+                        msg_id = msg["id"]
+                        if isinstance(msg_id, str) and self._handle_upstream_response_for_mutation(
+                            msg_id, msg
+                        ):
+                            continue
 
-                # Passthrough response, notification, or server-initiated request.
-                if isinstance(msg, dict):
-                    self._send_client_message(msg)
-                else:
-                    self._log_err("ignored non-object JSON message from upstream stdout")
+                    # Passthrough response, notification, or server-initiated request.
+                    if isinstance(msg, dict):
+                        self._send_client_message(msg)
+                    else:
+                        self._log_err("ignored non-object JSON message from upstream stdout")
+                except Exception as exc:
+                    self._log_err(f"error processing upstream message: {exc}")
+        except Exception as exc:
+            with self._state_lock:
+                self._reader_fatal_error = True
+            self._log_err(f"fatal error in upstream reader thread: {exc}")
+            if self._proc is not None and self._proc.poll() is None:
+                with contextlib.suppress(OSError):
+                    self._proc.terminate()
         finally:
             self._fail_all_inflight_on_upstream_eof()
 
     def _stderr_pump_loop(self, upstream_stderr: BinaryIO) -> None:
+        write_failed = False
         try:
             while True:
                 chunk = upstream_stderr.read(4096)
                 if not chunk:
                     break
-                if self._err_stream is not None:
+                if self._err_stream is not None and not write_failed:
                     try:
                         self._err_stream.write(chunk)
                         self._err_stream.flush()
                     except OSError:
-                        break
+                        # Keep draining upstream stderr so the child pipe never deadlocks.
+                        write_failed = True
         except OSError:
             pass
 
@@ -674,19 +965,27 @@ class MCPProxy:
         if not has_client_id:
             return
         if explicit_result is not None:
-            result = copy.deepcopy(explicit_result)
-        else:
-            with self._state_lock:
-                cached = self._confirmed_cache.get((record.actor, record.target, record.action_id))
-            result = copy.deepcopy(cached) if cached is not None else _build_replay_result(record)
-        self._send_client_message(_jsonrpc_result_response(client_id, result))
+            self._send_client_message(_jsonrpc_result_response(client_id, explicit_result))
+            return
+        cached_bytes = self._get_cached_result_bytes(
+            (record.actor, record.target, record.action_id)
+        )
+        if cached_bytes is not None:
+            self._write_client_bytes(_build_cached_response_frame(client_id, cached_bytes))
+            return
+        self._send_client_message(_jsonrpc_result_response(client_id, _build_replay_result(record)))
 
-    def _is_action_currently_inflight(self, action_id: str) -> bool:
+    def _is_action_active_on_upstream(self, action_id: str) -> tuple[bool, bool]:
+        """Return ``(in_pending, in_timed_out_while_alive)`` for ``action_id``."""
         with self._state_lock:
-            return any(
+            in_pending = any(
                 not entry.settled and entry.action_id == action_id
                 for entry in self._pending_mutations.values()
             )
+            in_timed_out = (not self._upstream_closed) and any(
+                entry.action_id == action_id for entry in self._timed_out_upstream_ids.values()
+            )
+            return in_pending, in_timed_out
 
     def _try_reconcile_unknown(
         self,
@@ -698,11 +997,12 @@ class MCPProxy:
         """Attempt recovery via ``reconciler_hook``.
 
         Returns:
-          - ``"handled"`` if a response was already sent to the client (recovered or blocked).
-          - ``"retry"`` if reconciler proved ``not_found`` and transitioned row to ``failed``.
+          - ``"handled"`` if a response was already sent to the client.
+          - ``"retry"`` if reconciler proved ``not_found`` and it is safe to re-dispatch.
+          - ``"block"`` if retry must be blocked with ``OUTCOME UNKNOWN``.
         """
-        # Never reconcile a row that is still actively in-flight in this proxy instance.
-        if self._reconciler_hook is None or self._is_action_currently_inflight(record.action_id):
+        in_pending, in_timed_out_alive = self._is_action_active_on_upstream(record.action_id)
+        if self._reconciler_hook is None or in_pending:
             return "block"
 
         try:
@@ -747,10 +1047,9 @@ class MCPProxy:
                 return "block"
 
             if hook_res.cached_result is not None:
-                with self._state_lock:
-                    self._confirmed_cache[(record.actor, record.target, record.action_id)] = (
-                        copy.deepcopy(hook_res.cached_result)
-                    )
+                self._cache_confirmed_result(
+                    (record.actor, record.target, record.action_id), hook_res.cached_result
+                )
             self._send_replay_for_record(
                 has_client_id=has_client_id,
                 client_id=client_id,
@@ -759,8 +1058,9 @@ class MCPProxy:
             )
             return "handled"
 
-        # ReconcileState.NOT_FOUND: only safe to transition an `unknown` record to `failed`.
-        if record.status != ActionStatus.UNKNOWN:
+        # ReconcileState.NOT_FOUND: NEVER re-dispatch while the earlier timed-out attempt
+        # may still be executing inside a live upstream process, nor on a `pending` row.
+        if in_timed_out_alive or record.status != ActionStatus.UNKNOWN:
             return "block"
         try:
             self._journal.mark_failed(
@@ -776,6 +1076,31 @@ class MCPProxy:
         except (StaleAttemptError, InvalidStateTransitionError, JournalError):
             return "block"
         return "retry"
+
+    def _translate_cancelled_notification(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Rewrite `notifications/cancelled` requestId to the upstream ID when intercepted."""
+        params = msg.get("params")
+        if not isinstance(params, dict) or "requestId" not in params:
+            return msg
+        target_key = _rpc_id_key(params["requestId"])
+        mapped_upstream_id: str | None = None
+        with self._state_lock:
+            for entry in self._pending_mutations.values():
+                if entry.has_client_id and _rpc_id_key(entry.client_id) == target_key:
+                    mapped_upstream_id = entry.upstream_id
+                    break
+            if mapped_upstream_id is None:
+                for timed_out in self._timed_out_upstream_ids.values():
+                    if timed_out.has_client_id and _rpc_id_key(timed_out.client_id) == target_key:
+                        mapped_upstream_id = timed_out.upstream_id
+                        break
+        if mapped_upstream_id is None:
+            return msg
+        rewritten = dict(msg)
+        rewritten_params = dict(params)
+        rewritten_params["requestId"] = mapped_upstream_id
+        rewritten["params"] = rewritten_params
+        return rewritten
 
     def _handle_tools_call(
         self,
@@ -824,36 +1149,11 @@ class MCPProxy:
                 )
             return
 
-        tool_kind = classify_tool(tool_name, self._config)
-
-        # Read-only calls pass straight through without journaling.
-        if tool_kind == ToolKind.READ:
-            self._forward_passthrough(msg, has_client_id=has_client_id, client_id=client_id)
-            return
-
-        # Extract explicit action ID before stripping private `_sidefx_*` metadata keys.
-        explicit_action_id: str | None = None
-        if "_sidefx_action_id" in tool_args:
-            raw_aid = tool_args["_sidefx_action_id"]
-            if not isinstance(raw_aid, str) or not raw_aid.strip() or "\x00" in raw_aid:
-                if has_client_id:
-                    self._send_client_message(
-                        _jsonrpc_error_response(
-                            client_id,
-                            JSONRPC_INVALID_PARAMS,
-                            "Invalid params: '_sidefx_action_id' must be a non-empty string",
-                        )
-                    )
-                return
-            explicit_action_id = raw_aid.strip()
-        elif "idempotency_key" in tool_args:
-            raw_ik = tool_args["idempotency_key"]
-            if isinstance(raw_ik, str) and raw_ik.strip() and "\x00" not in raw_ik:
-                explicit_action_id = raw_ik.strip()
-
+        # Strip private `_sidefx_*` keys for preflight evaluation & upstream forwarding.
         forwarded_args = {k: v for k, v in tool_args.items() if not k.startswith("_sidefx_")}
 
-        # Run deterministic preflight checks BEFORE journaling or touching upstream.
+        # Always evaluate deterministic preflight rules for ALL tools (reads, mutations, denied)
+        # so proxy enforcement stays 100% consistent with `evaluate_preflight(...)`.
         preflight_res = evaluate_preflight(tool_name, forwarded_args, self._config)
         if not preflight_res.allowed:
             if has_client_id:
@@ -873,17 +1173,72 @@ class MCPProxy:
                 )
             return
 
-        # Compute canonical payload hash over (tool_name, forwarded_args).
+        # Read-only calls pass straight through without journaling after preflight passes.
+        if preflight_res.tool_kind == ToolKind.READ:
+            self._forward_passthrough(msg, has_client_id=has_client_id, client_id=client_id)
+            return
+
+        # Extract explicit action ID from `_sidefx_action_id` or `idempotency_key`.
+        explicit_action_id: str | None = None
+        if "_sidefx_action_id" in tool_args:
+            raw_aid = tool_args["_sidefx_action_id"]
+            if not isinstance(raw_aid, str) or not raw_aid.strip() or "\x00" in raw_aid:
+                if has_client_id:
+                    self._send_client_message(
+                        _jsonrpc_error_response(
+                            client_id,
+                            JSONRPC_INVALID_PARAMS,
+                            "Invalid params: '_sidefx_action_id' must be a non-empty string",
+                        )
+                    )
+                return
+            explicit_action_id = raw_aid.strip()
+        elif "idempotency_key" in tool_args and tool_args["idempotency_key"] is not None:
+            raw_ik = tool_args["idempotency_key"]
+            if not isinstance(raw_ik, str) or not raw_ik.strip() or "\x00" in raw_ik:
+                if has_client_id:
+                    self._send_client_message(
+                        _jsonrpc_error_response(
+                            client_id,
+                            JSONRPC_INVALID_PARAMS,
+                            "Invalid params: 'idempotency_key' must be a non-empty string",
+                        )
+                    )
+                return
+            explicit_action_id = raw_ik.strip()
+
+        # Compute canonical payload hash AND pre-serialize outbound frame BEFORE `begin_action`
+        # so any serialization or nesting error fails cleanly without creating a pending row.
         canonical_payload = {"tool": tool_name, "arguments": forwarded_args}
         try:
             payload_hash = compute_payload_hash(canonical_payload)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, RecursionError) as exc:
             if has_client_id:
                 self._send_client_message(
                     _jsonrpc_error_response(
                         client_id,
                         JSONRPC_INVALID_PARAMS,
                         f"Invalid tool arguments for canonical hashing: {exc}",
+                    )
+                )
+            return
+
+        upstream_id = self._next_upstream_id()
+        forwarded_params = dict(params)
+        if raw_arguments is not _MISSING or forwarded_args:
+            forwarded_params["arguments"] = forwarded_args
+        forwarded_msg = dict(msg)
+        forwarded_msg["id"] = upstream_id
+        forwarded_msg["params"] = forwarded_params
+        try:
+            forwarded_bytes = _serialize_message(forwarded_msg)
+        except (TypeError, ValueError, RecursionError) as exc:
+            if has_client_id:
+                self._send_client_message(
+                    _jsonrpc_error_response(
+                        client_id,
+                        JSONRPC_INVALID_PARAMS,
+                        f"Failed to serialize tools/call request: {exc}",
                     )
                 )
             return
@@ -913,15 +1268,6 @@ class MCPProxy:
             return
 
         record = begin_res.record
-
-        # Build forwarded message with `_sidefx_*` keys stripped and unique upstream request ID.
-        upstream_id = self._next_upstream_id()
-        forwarded_params = dict(params)
-        if raw_arguments is not _MISSING or forwarded_args:
-            forwarded_params["arguments"] = forwarded_args
-        forwarded_msg = dict(msg)
-        forwarded_msg["id"] = upstream_id
-        forwarded_msg["params"] = forwarded_params
 
         entry = _InFlightMutation(
             upstream_id=upstream_id,
@@ -973,7 +1319,7 @@ class MCPProxy:
             return
 
         timer.start()
-        sent = self._write_upstream_bytes(_serialize_message(forwarded_msg))
+        sent = self._write_upstream_bytes(forwarded_bytes)
         if not sent:
             # Pipe broke during write: fail-safe as unknown because partial delivery is possible.
             with self._pending_cond:
@@ -1101,9 +1447,22 @@ class MCPProxy:
         has_client_id: bool,
         client_id: Any,
     ) -> None:
+        try:
+            serialized = _serialize_message(msg)
+        except (TypeError, ValueError, RecursionError) as exc:
+            if has_client_id:
+                self._send_client_message(
+                    _jsonrpc_error_response(
+                        client_id,
+                        JSONRPC_INVALID_PARAMS,
+                        f"Failed to serialize JSON-RPC message: {exc}",
+                    )
+                )
+            return
+
         with self._state_lock:
             dead = self._upstream_closed
-        if (dead or not self._write_upstream_bytes(_serialize_message(msg))) and has_client_id:
+        if (dead or not self._write_upstream_bytes(serialized)) and has_client_id:
             self._send_client_message(
                 _jsonrpc_error_response(
                     client_id,
@@ -1127,7 +1486,7 @@ class MCPProxy:
             return
         try:
             decoded = raw_line.decode("utf-8")
-            msg = json.loads(decoded, parse_constant=_reject_json_constant)
+            msg = _loads_strict_json(decoded)
         except (UnicodeDecodeError, ValueError, RecursionError) as exc:
             self._send_client_message(
                 _jsonrpc_error_response(
@@ -1152,24 +1511,40 @@ class MCPProxy:
         client_id = msg.get("id")
         method = msg.get("method")
 
-        if method == "tools/call":
-            self._handle_tools_call(msg, has_client_id=has_client_id, client_id=client_id)
-            return
+        try:
+            if method == "tools/call":
+                self._handle_tools_call(msg, has_client_id=has_client_id, client_id=client_id)
+                return
 
-        # Pass through protocol methods, notifications, and client replies to server requests.
-        is_request_or_notification = isinstance(method, str) and bool(method)
-        is_response = "method" not in msg and has_client_id and ("result" in msg or "error" in msg)
-        if not is_request_or_notification and not is_response:
-            self._send_client_message(
-                _jsonrpc_error_response(
-                    client_id if has_client_id else None,
-                    JSONRPC_INVALID_REQUEST,
-                    "Invalid Request: missing valid 'method' or response payload",
-                )
+            if method == "notifications/cancelled":
+                msg = self._translate_cancelled_notification(msg)
+
+            # Pass through protocol methods, notifications, and client replies to server requests.
+            is_request_or_notification = isinstance(method, str) and bool(method)
+            is_response = (
+                "method" not in msg and has_client_id and ("result" in msg or "error" in msg)
             )
-            return
+            if not is_request_or_notification and not is_response:
+                self._send_client_message(
+                    _jsonrpc_error_response(
+                        client_id if has_client_id else None,
+                        JSONRPC_INVALID_REQUEST,
+                        "Invalid Request: missing valid 'method' or response payload",
+                    )
+                )
+                return
 
-        self._forward_passthrough(msg, has_client_id=has_client_id, client_id=client_id)
+            self._forward_passthrough(msg, has_client_id=has_client_id, client_id=client_id)
+        except Exception as exc:
+            self._log_err(f"internal error handling client message: {exc}")
+            if has_client_id:
+                self._send_client_message(
+                    _jsonrpc_error_response(
+                        client_id,
+                        JSONRPC_INTERNAL_ERROR,
+                        f"Internal proxy error: {exc}",
+                    )
+                )
 
     def run(self) -> int:
         """Spawn the upstream MCP server and proxy stdio JSON-RPC messages until EOF."""
@@ -1217,7 +1592,8 @@ class MCPProxy:
         finally:
             self._shutdown(proc, reader_thread, stderr_thread)
 
-        return 0
+        with self._state_lock:
+            return 1 if self._reader_fatal_error else 0
 
     def _shutdown(
         self,
@@ -1225,10 +1601,12 @@ class MCPProxy:
         reader_thread: threading.Thread,
         stderr_thread: threading.Thread | None,
     ) -> None:
-        # Wait for in-flight intercepted mutations to settle (response or timeout) before closing
-        # upstream stdin so piped single-shot clients still receive their responses.
+        # Wait for in-flight intercepted mutations AND active timer/response finalizers
+        # to finish writing SQLite and client responses before closing upstream stdin.
         with self._pending_cond:
-            while self._pending_mutations and not self._upstream_closed:
+            while (
+                self._pending_mutations and not self._upstream_closed
+            ) or self._active_finalizers > 0:
                 self._pending_cond.wait(timeout=0.5)
 
         # Signal clean EOF to upstream stdin.
@@ -1255,12 +1633,14 @@ class MCPProxy:
         if stderr_thread is not None:
             stderr_thread.join(timeout=1.0)
 
-        # Cancel any leftover timers defensively.
+        # Cancel any leftover timers and wait for any racing finalizer before returning.
         with self._pending_cond:
             for entry in self._pending_mutations.values():
                 if entry.timer is not None:
                     entry.timer.cancel()
             self._pending_mutations.clear()
+            while self._active_finalizers > 0:
+                self._pending_cond.wait(timeout=0.5)
 
         if proc.stdout is not None:
             with contextlib.suppress(OSError):
