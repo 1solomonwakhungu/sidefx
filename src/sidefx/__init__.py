@@ -12,6 +12,7 @@ from sidefx.config import (
     load_config,
 )
 from sidefx.journal import (
+    SCHEMA_VERSION,
     ActionNotFoundError,
     ActionRecord,
     ActionStatus,
@@ -21,6 +22,7 @@ from sidefx.journal import (
     Journal,
     JournalError,
     PayloadMismatchError,
+    StaleAttemptError,
     Surface,
     compute_payload_hash,
     derive_marker,
@@ -30,6 +32,7 @@ from sidefx.journal import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "SCHEMA_VERSION",
     "ActionNotFoundError",
     "ActionRecord",
     "ActionStatus",
@@ -43,6 +46,7 @@ __all__ = [
     "PreflightConfig",
     "PreflightRule",
     "SidefxConfig",
+    "StaleAttemptError",
     "Surface",
     "ToolClassificationConfig",
     "UnknownToolPolicy",

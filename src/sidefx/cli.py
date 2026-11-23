@@ -6,7 +6,10 @@ import argparse
 import importlib
 import json
 import os
+import re
+import sqlite3
 import sys
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -20,7 +23,6 @@ from sidefx.config import (
     load_config,
 )
 from sidefx.journal import (
-    ENV_DB_PATH,
     ActionRecord,
     ActionStatus,
     Journal,
@@ -30,6 +32,8 @@ from sidefx.journal import (
 )
 
 DEFAULT_STATUS_LIMIT = 20
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _positive_int(raw: str) -> int:
@@ -40,6 +44,34 @@ def _positive_int(raw: str) -> int:
     if value <= 0:
         raise argparse.ArgumentTypeError("value must be a positive integer")
     return value
+
+
+def _sanitize_terminal_text(text: str) -> str:
+    """Strip ANSI escape sequences and control characters so journal text cannot forge lines."""
+    stripped = _ANSI_ESCAPE_RE.sub("", text)
+    return _CONTROL_CHARS_RE.sub(" ", stripped)
+
+
+def _add_shared_options(parser: argparse.ArgumentParser, *, suppress_defaults: bool) -> None:
+    default_val: Any = argparse.SUPPRESS if suppress_defaults else None
+    parser.add_argument(
+        "--db",
+        dest="db_path",
+        default=default_val,
+        help="Path to SQLite journal database (overrides SIDEFX_DB and config).",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config_path",
+        default=default_val,
+        help=f"Path to {CONFIG_FILENAME} configuration file.",
+    )
+    parser.add_argument(
+        "--session-id",
+        dest="session_id",
+        default=default_val,
+        help="Session identifier filter or override.",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,30 +88,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="version",
         version=f"%(prog)s {__version__}",
     )
-    parser.add_argument(
-        "--db",
-        dest="db_path",
-        default=None,
-        help="Path to SQLite journal database (overrides SIDEFX_DB and config).",
-    )
-    parser.add_argument(
-        "--config",
-        dest="config_path",
-        default=None,
-        help=f"Path to {CONFIG_FILENAME} configuration file.",
-    )
-    parser.add_argument(
-        "--session-id",
-        dest="session_id",
-        default=None,
-        help="Session identifier filter or override.",
-    )
+    _add_shared_options(parser, suppress_defaults=False)
+
+    shared_sub_parent = argparse.ArgumentParser(add_help=False)
+    _add_shared_options(shared_sub_parent, suppress_defaults=True)
 
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
 
     # status
     status_parser = subparsers.add_parser(
         "status",
+        parents=[shared_sub_parent],
         help="Show action counts by status and list recent journaled actions.",
     )
     status_parser.add_argument(
@@ -89,12 +108,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[s.value for s in ActionStatus],
         default=None,
         help="Filter by action status (repeatable).",
-    )
-    status_parser.add_argument(
-        "--session-id",
-        dest="status_session_id",
-        default=None,
-        help="Filter actions to a specific session ID.",
     )
     status_parser.add_argument(
         "--surface",
@@ -115,11 +128,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit machine-readable JSON output.",
     )
-    status_parser.set_defaults(handler=_cmd_status)
+    status_parser.set_defaults(handler=_cmd_status, passthrough=False)
 
     # init
     init_parser = subparsers.add_parser(
         "init",
+        parents=[shared_sub_parent],
         help=f"Create a starter {CONFIG_FILENAME} configuration file.",
     )
     init_parser.add_argument(
@@ -139,67 +153,59 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Output or merge a Claude Code Stop hook snippet for session receipts.",
     )
-    init_parser.set_defaults(handler=_cmd_init)
+    init_parser.set_defaults(handler=_cmd_init, passthrough=False)
 
-    # Modular dispatch stubs for upcoming milestones (PR 2 & PR 3)
-    report_parser = subparsers.add_parser(
-        "report",
-        help="Render a ground-truth session side-effects receipt.",
+    # Passthrough subcommand dispatchers for PR 2 & PR 3.
+    # Using `add_help=False` + `parse_known_args` lets downstream subcommand handlers
+    # receive all subcommand flags (including `--help` and `-- <cmd ...>`) verbatim
+    # without conflicting edits in `cli.py`.
+    _register_passthrough_subcommand(
+        subparsers,
+        name="report",
+        help_text="Render a ground-truth session side-effects receipt.",
+        module_name="sidefx.receipt",
+        func_name="handle_report_cli",
     )
-    report_parser.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-    report_parser.set_defaults(
-        handler=lambda ns, cfg: _dispatch_optional(
-            "sidefx.receipt", "handle_report_cli", ns, cfg, "report"
-        )
+    _register_passthrough_subcommand(
+        subparsers,
+        name="reconcile",
+        help_text="Reconcile pending or unknown actions against external systems.",
+        module_name="sidefx.reconcilers",
+        func_name="handle_reconcile_cli",
     )
-
-    reconcile_parser = subparsers.add_parser(
-        "reconcile",
-        help="Reconcile pending or unknown actions against external systems.",
+    _register_passthrough_subcommand(
+        subparsers,
+        name="wrap",
+        help_text="Wrap a mutating CLI command with write-ahead journaling.",
+        module_name="sidefx.wrapper",
+        func_name="handle_wrap_cli",
     )
-    reconcile_parser.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-    reconcile_parser.set_defaults(
-        handler=lambda ns, cfg: _dispatch_optional(
-            "sidefx.reconcilers", "handle_reconcile_cli", ns, cfg, "reconcile"
-        )
-    )
-
-    wrap_parser = subparsers.add_parser(
-        "wrap",
-        help="Wrap a mutating CLI command with write-ahead journaling.",
-    )
-    wrap_parser.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-    wrap_parser.set_defaults(
-        handler=lambda ns, cfg: _dispatch_optional(
-            "sidefx.wrapper", "handle_wrap_cli", ns, cfg, "wrap"
-        )
-    )
-
-    mcp_proxy_parser = subparsers.add_parser(
-        "mcp-proxy",
-        help="Run transparent stdio JSON-RPC 2.0 MCP proxy in front of an MCP server.",
-    )
-    mcp_proxy_parser.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-    mcp_proxy_parser.set_defaults(
-        handler=lambda ns, cfg: _dispatch_optional(
-            "sidefx.mcp_proxy", "handle_mcp_proxy_cli", ns, cfg, "mcp-proxy"
-        )
+    _register_passthrough_subcommand(
+        subparsers,
+        name="mcp-proxy",
+        help_text="Run transparent stdio JSON-RPC 2.0 MCP proxy in front of an MCP server.",
+        module_name="sidefx.mcp_proxy",
+        func_name="handle_mcp_proxy_cli",
     )
 
     return parser
 
 
-def _resolve_effective_db_path(args: argparse.Namespace, config: SidefxConfig) -> Path:
-    if args.db_path is not None:
-        return resolve_db_path(args.db_path)
-    if os.environ.get(ENV_DB_PATH, "").strip():
-        return resolve_db_path()
-    if config.journal_path is not None:
-        configured = Path(config.journal_path).expanduser()
-        if not configured.is_absolute() and config.source_path is not None:
-            return (config.source_path.parent / configured).resolve()
-        return configured
-    return resolve_db_path()
+def _register_passthrough_subcommand(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+    *,
+    name: str,
+    help_text: str,
+    module_name: str,
+    func_name: str,
+) -> None:
+    sub = subparsers.add_parser(name, add_help=False, help=help_text)
+    sub.set_defaults(
+        handler=lambda ns, cfg, m=module_name, f=func_name, lbl=name: _dispatch_optional(
+            m, f, ns, cfg, lbl
+        ),
+        passthrough=True,
+    )
 
 
 def _format_status_text(
@@ -210,7 +216,7 @@ def _format_status_text(
     journal_exists: bool,
 ) -> str:
     total = sum(counts.values())
-    lines = [f"sidefx journal: {db_path}"]
+    lines = [f"sidefx journal: {_sanitize_terminal_text(str(db_path))}"]
     if not journal_exists:
         lines.append("No journal database found (0 actions).")
         return "\n".join(lines)
@@ -225,17 +231,21 @@ def _format_status_text(
     lines.append("")
     for rec in actions:
         detail = rec.result_ref or rec.error or rec.summary or ""
-        suffix = f" | {detail}" if detail else ""
+        safe_tool = _sanitize_terminal_text(rec.tool_name)
+        safe_target = _sanitize_terminal_text(rec.target)
+        safe_id = _sanitize_terminal_text(rec.action_id)
+        safe_detail = _sanitize_terminal_text(detail)
+        suffix = f" | {safe_detail}" if safe_detail else ""
         lines.append(
-            f"[{rec.status.value:<10}] {rec.surface.value:<4} {rec.tool_name} "
-            f"target={rec.target} id={rec.action_id}{suffix}"
+            f"[{rec.status.value:<10}] {rec.surface.value:<4} {safe_tool} "
+            f"target={safe_target} id={safe_id}{suffix}"
         )
     return "\n".join(lines)
 
 
 def _cmd_status(args: argparse.Namespace, config: SidefxConfig) -> int:
-    db_path = _resolve_effective_db_path(args, config)
-    session_id = args.status_session_id or args.session_id
+    db_path = resolve_db_path(args.db_path, config=config)
+    session_id = args.session_id
     statuses = [ActionStatus(s) for s in args.statuses] if args.statuses else None
     surface = Surface(args.surface) if args.surface else None
 
@@ -245,7 +255,7 @@ def _cmd_status(args: argparse.Namespace, config: SidefxConfig) -> int:
         journal_exists = False
     else:
         journal_exists = True
-        with Journal(db_path) as journal:
+        with Journal.open_readonly(db_path) as journal:
             counts = journal.count_by_status(session_id=session_id, surface=surface)
             actions = journal.list_actions(
                 session_id=session_id,
@@ -277,19 +287,48 @@ def _cmd_init(args: argparse.Namespace, config: SidefxConfig) -> int:
         )
 
     dest = Path(args.init_path).expanduser()
-    if dest.exists() and not args.force:
-        print(
-            f"error: {dest} already exists (pass --force to overwrite)",
-            file=sys.stderr,
-        )
-        return 1
-    if dest.exists() and dest.is_dir():
+    if dest.is_dir():
         print(f"error: {dest} is a directory", file=sys.stderr)
         return 1
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
     content = json.dumps(default_config_dict(), indent=2) + "\n"
-    dest.write_text(content, encoding="utf-8")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if not args.force:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(dest, flags, 0o644)
+        except FileExistsError:
+            print(
+                f"error: {dest} already exists (pass --force to overwrite)",
+                file=sys.stderr,
+            )
+            return 1
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+    else:
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=dest.parent,
+                prefix=".sidefx-init-",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                tmp_file.write(content)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+            os.replace(tmp_path, dest)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+
     print(f"Created {dest}")
     return 0
 
@@ -325,11 +364,19 @@ def _dispatch_optional(
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point returning a process exit code."""
     parser = build_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    raw_argv = list(argv) if argv is not None else None
+    args, extras = parser.parse_known_args(raw_argv)
 
     if not getattr(args, "command", None):
+        if extras:
+            parser.error(f"unrecognized arguments: {' '.join(extras)}")
         parser.print_help()
         return 0
+
+    if getattr(args, "passthrough", False):
+        args.args = extras
+    elif extras:
+        parser.error(f"unrecognized arguments: {' '.join(extras)}")
 
     skip_config_load = (
         args.command == "init"
@@ -347,6 +394,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         return int(args.handler(args, config))
-    except (ConfigError, JournalError, ValueError) as exc:
+    except (ConfigError, JournalError, ValueError, sqlite3.Error, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 130

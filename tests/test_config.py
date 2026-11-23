@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from sidefx.config import (
     discover_config_path,
     load_config,
 )
+from sidefx.journal import resolve_db_path
 
 
 def _write_json(path: Path, payload: Any) -> Path:
@@ -41,21 +43,48 @@ class TestConfigDiscoveryAndDefaults:
         assert cfg.tools.mutate_prefixes == DEFAULT_MUTATE_PREFIXES
         assert cfg.default_timeout_seconds == 30.0
 
-    def test_upward_discovery_from_nested_directory(
+    def test_upward_discovery_from_nested_directory_stops_at_git_root(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv(ENV_CONFIG_PATH, raising=False)
-        root_cfg = _write_json(
-            tmp_path / CONFIG_FILENAME,
-            {"version": 1, "default_actor": "ci-bot"},
-        )
-        nested = tmp_path / "packages" / "service" / "src"
+        # Plant a config outside the git repo
+        _write_json(tmp_path / CONFIG_FILENAME, {"version": 1, "default_actor": "outside"})
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        nested = repo / "packages" / "service"
         nested.mkdir(parents=True)
 
-        assert discover_config_path(cwd=nested) == root_cfg.resolve()
+        # Discovery MUST NOT escape past `.git` boundary
+        assert discover_config_path(cwd=nested) is None
+
+        # Config inside repo root is discovered from nested subdirectory
+        repo_cfg = _write_json(
+            repo / CONFIG_FILENAME,
+            {"version": 1, "default_actor": "ci-bot"},
+        )
+        assert discover_config_path(cwd=nested) == Path(os.path.abspath(repo_cfg))
         cfg = load_config(cwd=nested)
         assert cfg.default_actor == "ci-bot"
-        assert cfg.source_path == root_cfg.resolve()
+        assert cfg.source_path == Path(os.path.abspath(repo_cfg))
+
+    def test_symlinked_config_keeps_journal_anchored_to_project_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(ENV_CONFIG_PATH, raising=False)
+        monkeypatch.delenv("SIDEFX_DB", raising=False)
+        dotfiles = tmp_path / "dotfiles"
+        shared_cfg = _write_json(
+            dotfiles / "sidefx.json",
+            {"version": 1, "journal_path": ".sidefx/journal.db"},
+        )
+        project = tmp_path / "project_a"
+        project.mkdir()
+        link = project / CONFIG_FILENAME
+        link.symlink_to(shared_cfg)
+
+        cfg = load_config(cwd=project)
+        assert cfg.source_path == Path(os.path.abspath(link))
+        assert resolve_db_path(config=cfg, cwd=project) == project / ".sidefx" / "journal.db"
 
     def test_precedence_explicit_over_env_over_discovered(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -85,6 +114,12 @@ class TestConfigParsingAndValidation:
         cfg_file = _write_json(tmp_path / CONFIG_FILENAME, default_config_dict())
         loaded = load_config(cfg_file)
         assert loaded.to_dict() == default_config_dict()
+
+    def test_utf8_bom_config_is_accepted(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / CONFIG_FILENAME
+        cfg_file.write_bytes(b'\xef\xbb\xbf{"version": 1, "default_actor": "bom-bot"}\n')
+        cfg = load_config(cfg_file)
+        assert cfg.default_actor == "bom-bot"
 
     def test_valid_full_config_with_rules(self, tmp_path: Path) -> None:
         cfg_file = _write_json(
@@ -141,11 +176,41 @@ class TestConfigParsingAndValidation:
         assert cfg.preflight.rules[1].allow_domains == ("example.com",)
         assert cfg.preflight.rules[2].deny == ("main", "master")
 
-    def test_malformed_json_and_directory_rejected(self, tmp_path: Path) -> None:
+    def test_malformed_duplicate_keys_huge_int_deep_nesting_and_directory_rejected(
+        self, tmp_path: Path
+    ) -> None:
         bad = tmp_path / "bad.json"
         bad.write_text("{not valid json", encoding="utf-8")
         with pytest.raises(ConfigError, match="Malformed JSON"):
             load_config(bad)
+
+        dup = tmp_path / "dup.json"
+        dup.write_text(
+            '{"version": 1, "default_actor": "a", "default_actor": "b"}', encoding="utf-8"
+        )
+        with pytest.raises(ConfigError, match="Duplicate JSON key"):
+            load_config(dup)
+
+        huge_int = tmp_path / "huge400.json"
+        huge_int.write_text(
+            '{"preflight": {"rules": [{"arg": "amount", "max": ' + ("9" * 400) + "}]}}",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match="out of finite numeric range"):
+            load_config(huge_int)
+
+        huge_5000 = tmp_path / "huge5000.json"
+        huge_5000.write_text(
+            '{"preflight": {"rules": [{"arg": "amount", "max": ' + ("9" * 5000) + "}]}}",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match="Invalid JSON structure"):
+            load_config(huge_5000)
+
+        deep = tmp_path / "deep.json"
+        deep.write_text("[" * 2000 + "]" * 2000, encoding="utf-8")
+        with pytest.raises(ConfigError, match="Invalid JSON structure"):
+            load_config(deep)
 
         with pytest.raises(ConfigError, match="directory"):
             load_config(tmp_path)
@@ -159,11 +224,17 @@ class TestConfigParsingAndValidation:
             ({"version": True}, "version must be an integer"),
             ({"default_timeout_seconds": 0}, "must be > 0"),
             ({"default_timeout_seconds": -5}, "must be > 0"),
+            ({"default_timeout_seconds": 100000}, "<="),
             ({"default_timeout_seconds": True}, "finite number"),
             ({"default_actor": ""}, "non-empty string"),
+            ({"default_actor": " agent "}, "leading or trailing whitespace"),
             ({"tools": "bad"}, "'tools' must be a JSON object"),
             ({"tools": {"extra": []}}, "Unknown key"),
             ({"tools": {"read": ["x"], "mutate": ["x"]}}, "both tools.read and tools.mutate"),
+            (
+                {"tools": {"read_prefixes": ["get_"], "mutate_prefixes": ["get_"]}},
+                "both tools.read_prefixes and tools.mutate_prefixes",
+            ),
             ({"tools": {"unknown_tool_policy": "allow_all"}}, "unknown_tool_policy"),
             ({"preflight": {"extra": []}}, "Unknown key"),
             ({"preflight": {"rules": "not-a-list"}}, "must be a list"),
@@ -171,6 +242,10 @@ class TestConfigParsingAndValidation:
             ({"preflight": {"rules": [{"arg": "amount"}]}}, "at least one constraint"),
             ({"preflight": {"rules": [{"arg": "amount", "max": True}]}}, "finite number"),
             ({"preflight": {"rules": [{"arg": "amount", "min": 100, "max": 50}]}}, "min"),
+            (
+                {"preflight": {"rules": [{"arg": "env", "allow": [], "deny": ["prod"]}]}},
+                "must not be empty",
+            ),
             ({"preflight": {"rules": [{"arg": "branch", "alow": ["feat/*"]}]}}, "Unknown key"),
             ({"preflight": {"rules": [{"arg": "branch", "deny": [""]}]}}, "non-empty string"),
         ],

@@ -13,6 +13,7 @@ from typing import Any
 CONFIG_FILENAME = ".sidefx.json"
 ENV_CONFIG_PATH = "SIDEFX_CONFIG"
 SUPPORTED_CONFIG_VERSION = 1
+MAX_TIMEOUT_SECONDS = 86_400.0
 
 DEFAULT_READ_PREFIXES: tuple[str, ...] = (
     "get_",
@@ -195,17 +196,61 @@ def default_config_dict() -> dict[str, Any]:
     }
 
 
+def _is_owned_by_current_user(path: Path) -> bool:
+    """Return True if path is owned by current uid on POSIX (always True if getuid absent)."""
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return True
+    try:
+        return path.stat().st_uid == getuid()
+    except OSError:
+        return False
+
+
 def discover_config_path(cwd: Path | None = None) -> Path | None:
-    """Search upward from ``cwd`` for ``.sidefx.json``, returning the first match."""
-    start = (cwd if cwd is not None else Path.cwd()).resolve()
+    """Search upward from ``cwd`` for ``.sidefx.json`` within safe trust boundaries.
+
+    Stops walking upward after inspecting a git repository root (``.git`` present),
+    after inspecting the user's home directory, or before entering an ancestor directory
+    owned by a different user on POSIX (preventing untrusted configs planted in ``/tmp``
+    or ``/`` from altering policy).
+    """
+    start_raw = cwd if cwd is not None else Path.cwd()
+    start = Path(os.path.abspath(start_raw))
     current = start if start.is_dir() else start.parent
+    try:
+        home_dir = Path(os.path.abspath(Path.home()))
+    except RuntimeError:
+        home_dir = None
+
     while True:
         candidate = current / CONFIG_FILENAME
-        if candidate.is_file():
+        if candidate.is_file() and _is_owned_by_current_user(candidate):
             return candidate
-        if current.parent == current:
+
+        # Stop after checking repository root or user home directory.
+        if (current / ".git").exists():
             return None
-        current = current.parent
+        if home_dir is not None and current == home_dir:
+            return None
+
+        parent = current.parent
+        if parent == current:
+            return None
+
+        # Stop before crossing into directories owned by another user (e.g. /tmp or /).
+        if not _is_owned_by_current_user(parent):
+            return None
+        current = parent
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ConfigError(f"Duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
 
 
 def load_config(
@@ -218,8 +263,12 @@ def load_config(
     Resolution precedence:
       1. Explicit ``path`` argument (must exist).
       2. ``SIDEFX_CONFIG`` environment variable (must exist).
-      3. Nearest ``.sidefx.json`` searching upward from ``cwd``.
+      3. Nearest trusted ``.sidefx.json`` searching upward from ``cwd``.
       4. Default ``SidefxConfig()`` if no config file is found.
+
+    ``source_path`` preserves the logical path (without resolving symlinks) so relative
+    ``journal_path`` values stay anchored to the project directory rather than a shared
+    symlink target directory.
     """
     resolved: Path | None = None
     explicit = False
@@ -250,18 +299,23 @@ def load_config(
         raise ConfigError(f"Config path is a directory, expected a JSON file: {resolved}")
 
     try:
-        raw_text = resolved.read_text(encoding="utf-8")
+        raw_text = resolved.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as exc:
         raise ConfigError(f"Failed to read config file {resolved}: {exc}") from exc
 
     try:
-        parsed = json.loads(raw_text)
+        parsed = json.loads(raw_text, object_pairs_hook=_reject_duplicate_keys)
+    except ConfigError:
+        raise
     except json.JSONDecodeError as exc:
         raise ConfigError(
             f"Malformed JSON in {resolved} at line {exc.lineno}, column {exc.colno}: {exc.msg}"
         ) from exc
+    except (ValueError, RecursionError) as exc:
+        raise ConfigError(f"Invalid JSON structure in {resolved}: {exc}") from exc
 
-    return _parse_config_dict(parsed, source_path=resolved.resolve())
+    logical_path = Path(os.path.abspath(resolved))
+    return _parse_config_dict(parsed, source_path=logical_path)
 
 
 def _reject_unknown_keys(
@@ -275,28 +329,57 @@ def _reject_unknown_keys(
         raise ConfigError(f"Unknown key(s) in {context}: {keys}")
 
 
-def _expect_non_empty_str(value: Any, field_name: str) -> str:
+def _expect_non_empty_str(
+    value: Any,
+    field_name: str,
+    *,
+    reject_surrounding_whitespace: bool = False,
+) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"{field_name} must be a non-empty string")
+    if "\x00" in value:
+        raise ConfigError(f"{field_name} must not contain NUL bytes")
+    if reject_surrounding_whitespace and value != value.strip():
+        raise ConfigError(f"{field_name} must not have leading or trailing whitespace")
     return value
 
 
-def _expect_str_tuple(value: Any, field_name: str) -> tuple[str, ...]:
+def _expect_str_tuple(
+    value: Any,
+    field_name: str,
+    *,
+    non_empty: bool = False,
+    reject_surrounding_whitespace: bool = False,
+) -> tuple[str, ...]:
     if not isinstance(value, list):
         raise ConfigError(f"{field_name} must be a list of non-empty strings")
+    if non_empty and not value:
+        raise ConfigError(f"{field_name} must not be empty when specified")
     result: list[str] = []
     for idx, item in enumerate(value):
-        if not isinstance(item, str) or not item.strip():
-            raise ConfigError(f"{field_name}[{idx}] must be a non-empty string")
-        result.append(item)
+        result.append(
+            _expect_non_empty_str(
+                item,
+                f"{field_name}[{idx}]",
+                reject_surrounding_whitespace=reject_surrounding_whitespace,
+            )
+        )
     return tuple(result)
 
 
 def _expect_finite_number(value: Any, field_name: str) -> int | float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigError(f"{field_name} must be a finite number")
-    if math.isnan(value) or math.isinf(value):
-        raise ConfigError(f"{field_name} must be a finite number")
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ConfigError(f"{field_name} must be a finite number")
+        return value
+    # Reject arbitrarily large ints that overflow IEEE-754 floats
+    try:
+        if not math.isfinite(float(value)):
+            raise ConfigError(f"{field_name} is out of finite numeric range")
+    except OverflowError as exc:
+        raise ConfigError(f"{field_name} is out of finite numeric range") from exc
     return value
 
 
@@ -305,8 +388,16 @@ def _parse_tools_config(raw: Any) -> ToolClassificationConfig:
         raise ConfigError("'tools' must be a JSON object")
     _reject_unknown_keys(raw, _ALLOWED_TOOLS_KEYS, "'tools'")
 
-    read_tools = _expect_str_tuple(raw["read"], "tools.read") if "read" in raw else ()
-    mutate_tools = _expect_str_tuple(raw["mutate"], "tools.mutate") if "mutate" in raw else ()
+    read_tools = (
+        _expect_str_tuple(raw["read"], "tools.read", reject_surrounding_whitespace=True)
+        if "read" in raw
+        else ()
+    )
+    mutate_tools = (
+        _expect_str_tuple(raw["mutate"], "tools.mutate", reject_surrounding_whitespace=True)
+        if "mutate" in raw
+        else ()
+    )
 
     overlap = sorted(set(read_tools) & set(mutate_tools))
     if overlap:
@@ -314,15 +405,27 @@ def _parse_tools_config(raw: Any) -> ToolClassificationConfig:
         raise ConfigError(f"Tool(s) cannot appear in both tools.read and tools.mutate: {names}")
 
     read_prefixes = (
-        _expect_str_tuple(raw["read_prefixes"], "tools.read_prefixes")
+        _expect_str_tuple(
+            raw["read_prefixes"], "tools.read_prefixes", reject_surrounding_whitespace=True
+        )
         if "read_prefixes" in raw
         else DEFAULT_READ_PREFIXES
     )
     mutate_prefixes = (
-        _expect_str_tuple(raw["mutate_prefixes"], "tools.mutate_prefixes")
+        _expect_str_tuple(
+            raw["mutate_prefixes"], "tools.mutate_prefixes", reject_surrounding_whitespace=True
+        )
         if "mutate_prefixes" in raw
         else DEFAULT_MUTATE_PREFIXES
     )
+
+    prefix_overlap = sorted(set(read_prefixes) & set(mutate_prefixes))
+    if prefix_overlap:
+        names = ", ".join(repr(n) for n in prefix_overlap)
+        raise ConfigError(
+            f"Prefix(es) cannot appear in both tools.read_prefixes and "
+            f"tools.mutate_prefixes: {names}"
+        )
 
     if "unknown_tool_policy" in raw:
         raw_policy = raw["unknown_tool_policy"]
@@ -353,25 +456,41 @@ def _parse_preflight_rule(raw: Any, index: int) -> PreflightRule:
         raise ConfigError(f"{ctx} must be a JSON object")
     _reject_unknown_keys(raw, _ALLOWED_RULE_KEYS, ctx)
 
-    tool = _expect_non_empty_str(raw["tool"], f"{ctx}.tool") if "tool" in raw else "*"
+    tool = (
+        _expect_non_empty_str(raw["tool"], f"{ctx}.tool", reject_surrounding_whitespace=True)
+        if "tool" in raw
+        else "*"
+    )
     if "arg" not in raw:
         raise ConfigError(f"{ctx}.arg is required")
-    arg = _expect_non_empty_str(raw["arg"], f"{ctx}.arg")
+    arg = _expect_non_empty_str(raw["arg"], f"{ctx}.arg", reject_surrounding_whitespace=True)
 
     max_value = _expect_finite_number(raw["max"], f"{ctx}.max") if "max" in raw else None
     min_value = _expect_finite_number(raw["min"], f"{ctx}.min") if "min" in raw else None
     if min_value is not None and max_value is not None and min_value > max_value:
         raise ConfigError(f"{ctx}: min ({min_value}) cannot be greater than max ({max_value})")
 
-    allow = _expect_str_tuple(raw["allow"], f"{ctx}.allow") if "allow" in raw else ()
-    deny = _expect_str_tuple(raw["deny"], f"{ctx}.deny") if "deny" in raw else ()
+    allow = (
+        _expect_str_tuple(raw["allow"], f"{ctx}.allow", non_empty=True) if "allow" in raw else ()
+    )
+    deny = _expect_str_tuple(raw["deny"], f"{ctx}.deny", non_empty=True) if "deny" in raw else ()
     allow_domains = (
-        _expect_str_tuple(raw["allow_domains"], f"{ctx}.allow_domains")
+        _expect_str_tuple(
+            raw["allow_domains"],
+            f"{ctx}.allow_domains",
+            non_empty=True,
+            reject_surrounding_whitespace=True,
+        )
         if "allow_domains" in raw
         else ()
     )
     deny_domains = (
-        _expect_str_tuple(raw["deny_domains"], f"{ctx}.deny_domains")
+        _expect_str_tuple(
+            raw["deny_domains"],
+            f"{ctx}.deny_domains",
+            non_empty=True,
+            reject_surrounding_whitespace=True,
+        )
         if "deny_domains" in raw
         else ()
     )
@@ -448,18 +567,27 @@ def _parse_config_dict(raw: Any, *, source_path: Path | None) -> SidefxConfig:
 
     default_actor = "agent"
     if "default_actor" in raw:
-        default_actor = _expect_non_empty_str(raw["default_actor"], "default_actor")
+        default_actor = _expect_non_empty_str(
+            raw["default_actor"], "default_actor", reject_surrounding_whitespace=True
+        )
 
     default_session_id: str | None = None
     if "default_session_id" in raw and raw["default_session_id"] is not None:
-        default_session_id = _expect_non_empty_str(raw["default_session_id"], "default_session_id")
+        default_session_id = _expect_non_empty_str(
+            raw["default_session_id"],
+            "default_session_id",
+            reject_surrounding_whitespace=True,
+        )
 
     default_timeout_seconds = 30.0
     if "default_timeout_seconds" in raw:
         val = _expect_finite_number(raw["default_timeout_seconds"], "default_timeout_seconds")
-        if val <= 0:
-            raise ConfigError("default_timeout_seconds must be > 0")
-        default_timeout_seconds = float(val)
+        timeout_float = float(val)
+        if timeout_float <= 0 or timeout_float > MAX_TIMEOUT_SECONDS:
+            raise ConfigError(
+                f"default_timeout_seconds must be > 0 and <= {int(MAX_TIMEOUT_SECONDS)}"
+            )
+        default_timeout_seconds = timeout_float
 
     tools = _parse_tools_config(raw["tools"]) if "tools" in raw else ToolClassificationConfig()
     preflight = (
