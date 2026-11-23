@@ -10,7 +10,7 @@ When an AI agent mutates external state (`gh issue create`, `git push`, MCP `too
 `sidefx` places a durable SQLite write-ahead journal (`WAL` + `synchronous=FULL`) in front of mutating MCP and CLI calls:
 
 - **Write-ahead intent log:** Atomically claims `(actor, target, action_id)` as `pending` *before* dispatching any external write. Rejects modified payloads under a reused `action_id` and blocks blind retries with `OUTCOME UNKNOWN — reconcile before retrying`.
-- **Automatic MCP protocol guidance & timeout recovery:** Appends concise `sidefx` protocol instructions to MCP `initialize` responses automatically, persists a stable workspace session across proxy restarts, and restarts wedged single-threaded MCP servers after timeout without poisoning later unrelated calls.
+- **Automatic MCP protocol guidance & timeout recovery:** Appends concise `sidefx` protocol instructions to MCP `initialize` responses automatically, persists a stable workspace session across proxy restarts, and supports opt-in `--restart-on-timeout` recovery for wedged single-threaded MCP servers without poisoning later unrelated calls.
 - **Read-only crash reconciliation:** Recovers lost URLs/refs after response-loss crashes or timeouts (GitHub Issues/PRs/Comments via embedded `<!-- sidefx:id=<marker> -->` comment markers, and `git push` via read-only `git ls-remote`) instead of double-posting.
 - **Deterministic preflight guardrails:** Enforces `.sidefx.json` required arguments (`required: true`), numeric caps (`min`/`max`), string allowlists/denylists, and domain allowlists/denylists before any upstream tool is called.
 - **Ground-truth receipts:** Renders compact Markdown, plain-text, or JSON receipts strictly from SQLite rows via `sidefx report` and integrates cleanly with Claude Code's `Stop` hook (`sidefx hook claude-code` — silent when 0 side effects occurred, loud warning on unresolved actions).
@@ -22,8 +22,8 @@ When an AI agent mutates external state (`gh issue create`, `git push`, MCP `too
 ## Quick Start
 
 ```bash
-uv tool install git+https://github.com/1solomonwakhungu/sidefx   # 1. install
-cd your-repo && sidefx init                                      # 2. write .sidefx.json
+uv tool install sidefx              # 1. install (or run with zero install via `uvx sidefx`)
+cd your-repo && sidefx init         # 2. write .sidefx.json
 ```
 
 3. Put `sidefx mcp-proxy --deterministic-ids --` in front of any stdio MCP server command (full configs for Claude Code, Cursor, and Codex are [below](#drop-in-mcp-proxy-setup)):
@@ -46,20 +46,27 @@ The journal lives in `.sidefx/journal.db` next to `.sidefx.json`, and the active
 
 ## Installation
 
+### As an Agent Skill ([skills.sh](https://skills.sh))
+
+Install into Claude Code, Codex, Cursor, Antigravity, OpenCode, and other skill-compatible agents:
+
+```bash
+npx skills add 1solomonwakhungu/sidefx
+```
+
 ### Run without installing (`uvx`)
 
 ```bash
-uvx --from git+https://github.com/1solomonwakhungu/sidefx sidefx --help
+uvx sidefx --help
 ```
 
 ### Install globally with `uv` or `pip`
 
 ```bash
 # uv tool (recommended)
-uv tool install git+https://github.com/1solomonwakhungu/sidefx
-
-# pip
-pip install git+https://github.com/1solomonwakhungu/sidefx
+uv tool install sidefx
+# or pip
+pip install sidefx
 ```
 
 ### Local editable install (development)
@@ -184,7 +191,7 @@ args = [
 ]
 ```
 
-> **Tip:** If you haven't installed `sidefx` globally, use `"command": "uvx"` with `["--from", "git+https://github.com/1solomonwakhungu/sidefx", "sidefx", "mcp-proxy", ...]`.
+> **Tip:** If you haven't installed `sidefx` globally, use `"command": "uvx"` with `["sidefx", "mcp-proxy", ...]`.
 
 ---
 
@@ -192,8 +199,8 @@ args = [
 
 Wrap mutating shell commands (`gh`, `git push`, `curl`, deploy scripts). When `--action-id` is omitted, `sidefx wrap` automatically derives deterministic action IDs for:
 
-- `git push`: derived from `(remote, ref, local_sha)`, so retrying after a timeout reconciles cleanly while pushing a new commit automatically gets a fresh ID.
-- `gh issue create`, `gh pr create`, `gh issue comment`, `gh pr comment`: derived from `(session_id, normalized_argv)`, so retrying the same command reconciles without double-posting.
+- `git push`: derived from `(remote, ref, local_sha)`, so retrying after a timeout reconciles cleanly while pushing a new commit automatically gets a fresh ID (falls back to a random ID for `--tags`, `--all`, `--mirror`, `--follow-tags`, multi-refspec, or detached `HEAD` — pass `--action-id` for those).
+- `gh issue create`, `gh pr create`, `gh issue comment`, `gh pr comment`: derived from `(session_id, normalized_argv)`, so retrying the same command reconciles without double-posting (falls back to a random ID for `--fill`, `--web`, `--editor`, or `--body-file -` — prefer `--body` or pass `--action-id`).
 
 Pass `--action-id <id>` to pin a custom ID, or `--random-action-id` when you intentionally want a duplicate write.
 
@@ -363,7 +370,7 @@ Every blocking error carries its own next steps in the error text, because most 
 
 | Error | JSON-RPC code / `wrap` exit | Meaning | What to do |
 |---|---|---|---|
-| `OUTCOME UNKNOWN — reconcile before retrying` | `-32002` / exit `75` (`124` on the timeout itself) | A write was sent and the reply was lost. It may have landed. | Do not re-send or reword the call. Run the `sidefx reconcile` command from the message. If no reconciler covers the tool, verify with a read-only call and run `sidefx resolve --landed` or `--not-landed`, then repeat the original call unchanged. |
+| `OUTCOME UNKNOWN — reconcile before retrying` | `-32002` / exit `75`, `124` on timeout, or child's non-zero code | A write was sent and the reply was lost or ambiguous. It may have landed. | Do not re-send or reword the call. Run the `sidefx reconcile` command from the message. If still `unknown`, verify with a read-only call and run `sidefx resolve --landed` or `--not-landed`. If landed, stop; if not landed, re-run the original command. |
 | `Preflight check denied tool ...` | `-32001` | A `.sidefx.json` rule rejected an argument. Nothing was sent. | Do not retry unchanged. Change the argument to satisfy the rule, or ask the user. |
 | `Payload mismatch for action ...` | `-32004` / exit `2` | The action ID was already used for a different payload. Nothing was sent. | Use a new action ID for a new write, or repeat the original payload to get the original result. |
 | `[sidefx] Duplicate call not re-sent` (appended to a normal result) | none | With `--deterministic-ids`, an identical call already ran in this session. | Nothing, unless a second write was intended: then repeat with a unique `_sidefx_action_id`. |
@@ -395,17 +402,18 @@ Every blocking error carries its own next steps in the error text, because most 
 Mutating MCP calls and `sidefx wrap` commands in this repo are journaled by sidefx.
 
 - `OUTCOME UNKNOWN`: the write may have landed. Never re-send or reword the call. Run the
-  `sidefx reconcile --action-id <id>` command from the error. If it says no reconciler is
-  available, check with a read-only call whether the write exists, then run
-  `sidefx resolve --action-id <id> --landed --ref <url>` or `--not-landed`, and repeat the
-  original call unchanged.
+  `sidefx reconcile --action-id <id>` command from the error. If it still reports `unknown`,
+  check with a read-only call whether the write exists, then run
+  `sidefx resolve --action-id <id> --landed --ref <url>` (and stop) or `--not-landed` (then
+  re-run the original command).
 - `Preflight check denied`: a policy rule in `.sidefx.json` blocked the call. Do not retry
   unchanged; fix the argument or ask the user.
 - `Payload mismatch`: an action ID was reused for a different write. Use a new ID.
 - `[sidefx] Duplicate call not re-sent`: the identical call already ran this session. To run
   it again on purpose, add a unique `_sidefx_action_id` string argument.
-- Wrap mutating shell commands: `sidefx wrap --action-id <stable-id> -- <command>`. Reuse the
-  same ID when retrying the same command; use a new ID for a new write.
+- Wrap mutating shell commands: `sidefx wrap -- <command>` (`git push` and `gh issue/pr
+  create|comment` auto-derive stable IDs; pass `--action-id <stable-id>` for `curl`/scripts
+  and reuse the same ID on retries, or use a new ID for a new write).
 - Before summarizing work, run `sidefx report` and list side effects from it, not from memory.
 ```
 
