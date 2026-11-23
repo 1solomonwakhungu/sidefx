@@ -1,6 +1,6 @@
 {
   "name": "sidefx",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Outbound effects journal, transparent stdio MCP proxy, CLI mutation wrapper, crash reconciler, and ground-truth session receipts for AI agents.",
   "author": {
     "name": "Solomon Wakhungu",

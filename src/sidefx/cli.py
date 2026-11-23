@@ -30,6 +30,7 @@ from sidefx.journal import (
     Surface,
     resolve_db_path,
 )
+from sidefx.reconcilers.base import parse_summary_meta, sanitize_text
 
 DEFAULT_STATUS_LIMIT = 20
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
@@ -64,9 +65,9 @@ def _positive_int(raw: str) -> int:
 
 
 def _sanitize_terminal_text(text: str) -> str:
-    """Strip ANSI escape sequences and control characters so journal text cannot forge lines."""
+    """Strip ANSI escape sequences, BiDi overrides, and control characters."""
     stripped = _ANSI_ESCAPE_RE.sub("", text)
-    return _CONTROL_CHARS_RE.sub(" ", stripped)
+    return sanitize_text(_CONTROL_CHARS_RE.sub(" ", stripped))
 
 
 def _add_shared_options(parser: argparse.ArgumentParser, *, suppress_defaults: bool) -> None:
@@ -295,7 +296,8 @@ def _format_status_text(
 
     lines.append("")
     for rec in actions:
-        detail = rec.result_ref or rec.error or rec.summary or ""
+        summary_display = parse_summary_meta(rec.summary)[0] if rec.summary else ""
+        detail = rec.result_ref or rec.error or summary_display or ""
         safe_tool = _sanitize_terminal_text(rec.tool_name)
         safe_target = _sanitize_terminal_text(rec.target)
         safe_id = _sanitize_terminal_text(rec.action_id)
