@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -144,6 +144,7 @@ class PayloadMismatchError(JournalError):
         self.action_id = action_id
         self.expected_hash = expected_hash
         self.actual_hash = actual_hash
+        self.detail = detail
         msg = (
             f"Payload mismatch for action ({actor!r}, {target!r}, {action_id!r}): "
             f"expected {expected_hash}, got {actual_hash}"
@@ -349,6 +350,20 @@ def resolve_db_path(
     return base / DEFAULT_DB_RELATIVE_PATH
 
 
+def _write_journal_gitignore(journal_dir: Path) -> None:
+    """Keep a journal directory sidefx just created out of ``git status``.
+
+    The journal is local execution state (SQLite + WAL sidecars), so an agent running
+    ``git add -A`` must not sweep it into a commit. Best effort: a read-only or exotic
+    filesystem must never stop the journal from opening.
+    """
+    with suppress(OSError):
+        (journal_dir / ".gitignore").write_text(
+            "# Created by sidefx: the effects journal is local state, not source.\n*\n",
+            encoding="utf-8",
+        )
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -512,12 +527,16 @@ class Journal:
                 raise JournalError(
                     f"Journal database path is a directory, expected a file: {self._db_path}"
                 )
+            journal_dir = self._db_path.parent
+            created_dir = not journal_dir.exists()
             try:
-                self._db_path.parent.mkdir(parents=True, exist_ok=True)
+                journal_dir.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 raise JournalError(
-                    f"Failed to create journal directory {self._db_path.parent}: {exc}"
+                    f"Failed to create journal directory {journal_dir}: {exc}"
                 ) from exc
+            if created_dir:
+                _write_journal_gitignore(journal_dir)
             target_str = str(self._db_path)
         else:
             target_str = ":memory:"

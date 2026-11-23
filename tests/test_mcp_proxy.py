@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from sidefx.cli import main as cli_main
 from sidefx.config import (
     PreflightConfig,
     PreflightRule,
@@ -22,6 +23,7 @@ from sidefx.config import (
     ToolClassificationConfig,
     UnknownToolPolicy,
 )
+from sidefx.guidance import reconcile_command, resolve_command
 from sidefx.journal import ActionRecord, ActionStatus, Journal, Surface
 from sidefx.mcp_proxy import (
     ERR_OUTCOME_UNKNOWN,
@@ -610,6 +612,7 @@ class TestMCPProxySafetyAndFaults:
             )
             r1 = h.recv()
             assert r1["error"]["code"] == ERR_PREFLIGHT_DENIED
+            assert "unchanged retry will be denied again" in r1["error"]["message"]
             assert "max $50 without approval" in r1["error"]["message"]
             assert r1["error"]["data"]["kind"] == "preflight_denied"
 
@@ -680,6 +683,16 @@ class TestMCPProxySafetyAndFaults:
             assert "slow-1" in timeout_resp["error"]["message"]
             assert timeout_resp["error"]["data"]["action_id"] == "slow-1"
             assert timeout_resp["error"]["data"]["marker"]
+            # The error carries its own recovery steps, pinned to this proxy's journal.
+            data = timeout_resp["error"]["data"]
+            resolved_db = str(db_path.resolve())
+            assert data["journal"] == resolved_db
+            assert data["reconcile_command"] == reconcile_command("slow-1", db_path=resolved_db)
+            assert data["resolve_commands"]["not_landed"] == resolve_command(
+                "slow-1", landed=False, db_path=resolved_db
+            )
+            assert data["reconcile_command"] in timeout_resp["error"]["message"]
+            assert "Do not re-send or reword this call" in timeout_resp["error"]["message"]
 
             rec = journal.get_action("agent", "mcp:mock", "slow-1")
             assert rec is not None
@@ -851,6 +864,8 @@ class TestMCPProxySafetyAndFaults:
             assert mismatch["id"] == 2
             assert mismatch["error"]["code"] == ERR_PAYLOAD_MISMATCH
             assert mismatch["error"]["data"]["kind"] == "payload_mismatch"
+            assert "use a new `_sidefx_action_id`" in mismatch["error"]["message"]
+            assert "Nothing was sent" in mismatch["error"]["message"]
             assert len(_read_upstream_writes(log_path)) == 1
 
     def test_clean_errors_mark_failed_and_allow_safe_retry(
@@ -1097,12 +1112,100 @@ class TestMCPProxySafetyAndFaults:
             r1 = h.recv()
             h.send({**req, "id": 2})
             r2 = h.recv()
-            assert r1["result"] == r2["result"]
+            # The duplicate is answered from the journal, and says so: the caller never
+            # asked for deduplication, so a silent repeat would read as a second write.
+            original_content = r1["result"]["content"]
+            assert r2["result"]["content"][: len(original_content)] == original_content
+            notice = r2["result"]["content"][-1]["text"]
+            assert notice.startswith("[sidefx] Duplicate call not re-sent")
+            assert "action det-" in notice
+            assert "_sidefx_action_id" in notice
+            assert {k: v for k, v in r2["result"].items() if k != "content"} == {
+                k: v for k, v in r1["result"].items() if k != "content"
+            }
             assert len(_read_upstream_writes(log_path)) == 1
 
-            actions = journal.list_actions(session_id="det-sess")
-            assert len(actions) == 1
-            assert actions[0].action_id.startswith("det-")
+            # An explicit unique action ID is the documented way to repeat on purpose.
+            h.send(
+                {
+                    **req,
+                    "id": 3,
+                    "params": {
+                        "name": "create_issue",
+                        "arguments": {"title": "Same call", "_sidefx_action_id": "again-1"},
+                    },
+                }
+            )
+            r3 = h.recv()
+            assert "error" not in r3
+            assert len(r3["result"]["content"]) == len(original_content)
+            assert len(_read_upstream_writes(log_path)) == 2
+
+            actions = journal.list_actions(session_id="det-sess", descending=False)
+            assert [a.action_id.startswith("det-") for a in actions] == [True, False]
+
+    def test_manual_resolve_unblocks_unknown_action_without_reconciler(
+        self, tmp_path: Path, mock_mcp_server: tuple[Path, Path]
+    ) -> None:
+        script, log_path = mock_mcp_server
+        db_path = tmp_path / "journal.db"
+
+        def call(action_id: str, rpc_id: int) -> dict[str, Any]:
+            return {
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_issue",
+                    "arguments": {
+                        "title": "crash after write",
+                        "crash_after_write": True,
+                        "_sidefx_action_id": action_id,
+                    },
+                },
+            }
+
+        with Journal(db_path) as journal:
+            for rpc_id, action_id in enumerate(("landed-1", "lost-1"), start=1):
+                with _LiveProxyHarness(
+                    server_script=script, log_path=log_path, journal=journal
+                ) as h:
+                    h.send(call(action_id, rpc_id))
+                    assert h.recv()["error"]["code"] == ERR_OUTCOME_UNKNOWN
+            assert len(_read_upstream_writes(log_path)) == 2
+
+            base = ["resolve", "--db", str(db_path), "--target", "mcp:mock"]
+            assert (
+                cli_main(
+                    [
+                        *base,
+                        "--action-id",
+                        "landed-1",
+                        "--landed",
+                        "--ref",
+                        "https://example.test/items/1",
+                    ]
+                )
+                == 0
+            )
+            assert cli_main([*base, "--action-id", "lost-1", "--not-landed"]) == 0
+
+            with _LiveProxyHarness(server_script=script, log_path=log_path, journal=journal) as h:
+                # Attested as landed: the retry replays the recorded ref, nothing is re-sent.
+                h.send(call("landed-1", 10))
+                replayed = h.recv()
+                assert replayed["result"]["_sidefx"]["replayed"] is True
+                assert replayed["result"]["_sidefx"]["result_ref"] == "https://example.test/items/1"
+                assert len(_read_upstream_writes(log_path)) == 2
+
+                # Attested as not landed: the identical call is dispatched again.
+                h.send(call("lost-1", 11))
+                assert h.recv()["error"]["code"] == ERR_OUTCOME_UNKNOWN
+            assert len(_read_upstream_writes(log_path)) == 3
+
+            lost = journal.get_action("agent", "mcp:mock", "lost-1")
+            assert lost is not None
+            assert lost.attempt == 2
 
     def test_malformed_json_batches_and_invalid_params_handled_cleanly(
         self, tmp_path: Path, mock_mcp_server: tuple[Path, Path]

@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sidefx.config import SidefxConfig, load_config
+from sidefx.guidance import resolve_command
 from sidefx.journal import (
     ActionRecord,
     ActionStatus,
@@ -57,6 +58,7 @@ __all__ = [
     "format_marker_comment",
     "format_summary_with_meta",
     "handle_reconcile_cli",
+    "has_reconciler",
     "inject_marker_into_body",
     "inject_marker_into_gh_args",
     "inject_marker_into_json_body",
@@ -110,6 +112,18 @@ def default_reconcilers(
         ),
         GitPushReconciler(timeout_seconds=timeout_seconds),
     ]
+
+
+def has_reconciler(record: ActionRecord, reconcilers: Sequence[Reconciler] | None = None) -> bool:
+    """Return True when a built-in reconciler can verify ``record`` against its remote."""
+    adapters = list(reconcilers) if reconcilers is not None else default_reconcilers()
+    for adapter in adapters:
+        try:
+            if adapter.can_reconcile(record):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _record_age_seconds(record: ActionRecord, *, now: datetime | None = None) -> float | None:
@@ -471,6 +485,20 @@ def handle_reconcile_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
             f"[{res.state.value:<9}] {sanitize_text(rec.action_id)} "
             f"({sanitize_text(rec.tool_name)} target={sanitize_text(rec.target)}) "
             f"via {adapter}{mode}{ref_part}{detail_part}"
+        )
+
+    unchecked = [
+        o.record.action_id
+        for o in outcomes
+        if o.reconciler_name is None and not o.applied and o.result.state == ReconcileState.UNKNOWN
+    ]
+    if unchecked:
+        example = unchecked[0]
+        print(
+            "\nNo reconciler can check "
+            f"{len(unchecked)} action(s). Verify each by hand, then record the outcome, e.g.:\n"
+            f"  {resolve_command(example, landed=True, db_path=db_raw)} --ref <url-or-id>\n"
+            f"  {resolve_command(example, landed=False, db_path=db_raw)}"
         )
 
     return 1 if has_unknown else 0

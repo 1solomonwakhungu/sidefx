@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from sidefx.config import SidefxConfig, load_config
+from sidefx.guidance import outcome_unknown_cli_hint, payload_mismatch_message
 from sidefx.journal import (
     ActionStatus,
     BeginDecision,
@@ -39,6 +40,7 @@ from sidefx.reconcilers import (
     _record_age_seconds,
     default_reconcilers,
     format_summary_with_meta,
+    has_reconciler,
     inject_marker_into_gh_args,
     inject_marker_into_json_body,
     inspect_git_push,
@@ -996,7 +998,7 @@ def wrap_command(
             tool_name=plan.tool_name,
             status=None,
             executed=False,
-            error=str(exc),
+            error=payload_mismatch_message(exc, id_source="--action-id", payload_noun="command"),
         )
 
     record = begin_res.record
@@ -1520,6 +1522,24 @@ def _write_stream(stream: Any, raw_bytes: bytes, text_fallback: str) -> None:
         stream.flush()
 
 
+def _unresolved_hint(
+    journal: Journal,
+    res: WrapResult,
+    *,
+    actor: str,
+    db_raw: str | None,
+) -> str | None:
+    """Next-step text for a wrap call that left its action ``pending`` or ``unknown``."""
+    if res.exit_code == 0 or res.status not in (ActionStatus.UNKNOWN, ActionStatus.PENDING):
+        return None
+    record = journal.get_action(actor, res.target, res.action_id)
+    return outcome_unknown_cli_hint(
+        res.action_id,
+        db_path=db_raw,
+        has_reconciler=record is not None and has_reconciler(record),
+    )
+
+
 def handle_wrap_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
     """CLI handler for ``sidefx wrap``."""
     raw_extras = list(getattr(args, "args", []))
@@ -1568,9 +1588,13 @@ def handle_wrap_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
             github_api_url=sub_args.github_api_url,
             auto_reconcile=not sub_args.no_reconcile,
         )
+        hint = _unresolved_hint(journal, res, actor=actor, db_raw=db_raw)
 
     _write_stream(sys.stdout, res.stdout_bytes, res.stdout)
     _write_stream(sys.stderr, res.stderr_bytes, res.stderr)
+    if res.stderr and not res.executed and not res.stderr.endswith("\n"):
+        # A launch failure is sidefx's own message (no child output to preserve verbatim).
+        sys.stderr.write("\n")
 
     if res.replayed:
         print(
@@ -1585,5 +1609,7 @@ def handle_wrap_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
         )
     elif res.error and res.exit_code != 0 and res.error.strip() != res.stderr.strip():
         print(res.error, file=sys.stderr)
+    if hint:
+        print(hint, file=sys.stderr)
 
     return res.exit_code
