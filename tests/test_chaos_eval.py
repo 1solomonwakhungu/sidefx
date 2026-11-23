@@ -19,6 +19,7 @@ from sidefx.chaos import (
     ChaosSuiteReport,
     ScenarioResult,
     _MCPInProcessClient,
+    _MCPSubprocessClient,
     available_scenario_names,
     format_chaos_report,
     run_chaos_suite,
@@ -225,6 +226,46 @@ class TestChaosSuite:
         # Hostile caller env must be restored cleanly after run_chaos_suite exits.
         assert os.environ.get("http_proxy") == "http://127.0.0.1:9"
         assert os.environ.get("GIT_CONFIG_GLOBAL") == str(bad_gitconfig)
+
+    def test_mcp_subprocess_client_does_not_hang_on_stubborn_upstream(self, tmp_path: Path) -> None:
+        stubborn_server = tmp_path / "stubborn_mcp.py"
+        stubborn_server.write_text(
+            "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)\n",
+            encoding="utf-8",
+        )
+        db_path = tmp_path / "sub_hang.db"
+        ledger_path = tmp_path / "ledger.jsonl"
+        mode_file = tmp_path / "mode.txt"
+
+        with (
+            pytest.raises(TimeoutError),
+            _MCPSubprocessClient(
+                db_path=db_path,
+                server_script=stubborn_server,
+                ledger_path=ledger_path,
+                mode_file=mode_file,
+                session_id="sub-hang-test",
+                cwd=tmp_path,
+                timeout_seconds=1.0,
+            ) as client,
+        ):
+            client.request(
+                {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}},
+                timeout=0.3,
+            )
+
+    def test_chaos_git_repo_works_with_spaces_in_tmpdir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        spaced_tmp = tmp_path / "tmp dir with spaces"
+        spaced_tmp.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(spaced_tmp))
+        monkeypatch.setenv("GIT_NAMESPACE", "hostile-ns")
+
+        report = run_chaos_suite(scenarios=["post_commit_response_loss"])
+        assert report.passed is True, format_chaos_report(report, verbose=True)
+        assert report.duplicate_remote_writes == 0
+        assert os.environ.get("GIT_NAMESPACE") == "hostile-ns"
 
 
 class TestCLISmokeEndToEnd:

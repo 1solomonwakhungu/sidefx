@@ -542,22 +542,8 @@ def _read_mcp_ledger(ledger_path: Path) -> list[dict[str, Any]]:
 
 
 _AMBIENT_ENV_KEYS_TO_STRIP = (
-    "SIDEFX_CONFIG",
-    "SIDEFX_DB",
-    "SIDEFX_SESSION_ID",
-    "SIDEFX_GITHUB_API_URL",
     "GH_HOST",
     "GH_REPO",
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_COMMON_DIR",
-    "GIT_CONFIG",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT",
-    "GIT_SSH_COMMAND",
     "http_proxy",
     "https_proxy",
     "all_proxy",
@@ -565,7 +551,7 @@ _AMBIENT_ENV_KEYS_TO_STRIP = (
     "HTTPS_PROXY",
     "ALL_PROXY",
 )
-_AMBIENT_ENV_PREFIXES_TO_STRIP = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+_AMBIENT_ENV_PREFIXES_TO_STRIP = ("GIT_", "SIDEFX_")
 _HERMETIC_ENV_OVERRIDES = {
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_CONFIG_GLOBAL": os.devnull,
@@ -721,7 +707,10 @@ def _create_chaos_git_repo(root: Path) -> _ChaosGitRepo:
         encoding="utf-8",
     )
     receive_pack_wrapper.chmod(0o755)
-    _run_git(["config", "remote.origin.receivepack", str(receive_pack_wrapper)], cwd=work_dir)
+    _run_git(
+        ["config", "remote.origin.receivepack", shlex.quote(str(receive_pack_wrapper))],
+        cwd=work_dir,
+    )
 
     hooks_dir = bare_dir / "hooks"
     hooks_dir.mkdir(parents=True, exist_ok=True)
@@ -816,6 +805,7 @@ class _MCPSubprocessClient:
             }
         )
 
+        popen_extra: dict[str, Any] = {"start_new_session": True} if os.name == "posix" else {}
         self._proc = subprocess.Popen(
             cmd,
             cwd=str(self._cwd),
@@ -823,6 +813,7 @@ class _MCPSubprocessClient:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
+            **popen_extra,
         )
         assert self._proc.stderr is not None
         self._stderr_chunks = []
@@ -884,23 +875,48 @@ class _MCPSubprocessClient:
         try:
             self._proc.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-                self._proc.wait()
-        # Child has exited, so stdout/stderr hit EOF; join readers BEFORE closing streams.
+            if os.name == "posix":
+                try:
+                    pgid = os.getpgid(self._proc.pid)
+                except OSError:
+                    pgid = None
+                if pgid is not None:
+                    with contextlib.suppress(OSError):
+                        os.killpg(pgid, signal.SIGTERM)
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        self._proc.wait(timeout=2.0)
+                    # Always SIGKILL the entire process group so SIGTERM-ignoring grandchildren
+                    # cannot stay alive holding stdout/stderr pipes open.
+                    with contextlib.suppress(OSError):
+                        os.killpg(pgid, signal.SIGKILL)
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        self._proc.wait(timeout=2.0)
+                else:
+                    self._proc.kill()
+                    self._proc.wait(timeout=2.0)
+            else:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    self._proc.wait(timeout=2.0)
+        # Child process group has exited, so stdout/stderr hit EOF; join readers BEFORE closing.
+        still_reading_stdout = False
         for reader in self._active_readers:
             reader.join(timeout=2.0)
+            if reader.is_alive():
+                still_reading_stdout = True
         self._active_readers.clear()
+        still_reading_stderr = False
         if self._stderr_thread is not None:
             self._stderr_thread.join(timeout=2.0)
+            still_reading_stderr = self._stderr_thread.is_alive()
             self._stderr_thread = None
-        if self._proc.stdout is not None:
+        if self._proc.stdout is not None and not still_reading_stdout:
             with contextlib.suppress(OSError):
                 self._proc.stdout.close()
-        if self._proc.stderr is not None:
+        if self._proc.stderr is not None and not still_reading_stderr:
             with contextlib.suppress(OSError):
                 self._proc.stderr.close()
         self._proc = None
@@ -1001,7 +1017,7 @@ class _MCPInProcessClient:
             with contextlib.suppress(OSError):
                 self._c_in_w.close()
         if self._thread is not None:
-            self._thread.join(timeout=6.0)
+            self._thread.join(timeout=8.5)
         # 2. Close proxy->client write end BEFORE joining readers or closing _c_out_r,
         #    so any reader blocked in readline() after a timeout wakes on EOF instead of hanging.
         if self._c_out_w is not None:
@@ -2549,10 +2565,16 @@ def _scenario_session_receipt_ground_truth() -> ScenarioResult:
                     ),
                     "expected_writes": 1,
                     "actual_writes": max(len(git_events), git_attempts),
-                    "detail": (
-                        f"git_ref={expected_git_ref}, receive_pack_contacts={git_attempts}, "
-                        f"cli_fail_status={cli_fail.status}"
-                    ),
+                    "detail": (f"git_ref={expected_git_ref}, receive_pack_contacts={git_attempts}"),
+                }
+            )
+            subchecks.append(
+                {
+                    "check": "cli_failed_command_zero_writes",
+                    "passed": cli_fail.status == ActionStatus.FAILED,
+                    "expected_writes": 0,
+                    "actual_writes": 0,
+                    "detail": f"cli_fail_status={cli_fail.status}",
                 }
             )
             subchecks.append(
@@ -2562,7 +2584,6 @@ def _scenario_session_receipt_ground_truth() -> ScenarioResult:
                         len(mcp_entries) == 2
                         and len(mcp_confirmed_entries) == 1
                         and len(mcp_crashed_entries) == 1
-                        and cli_fail.status == ActionStatus.FAILED
                     ),
                     "expected_writes": 2,
                     "actual_writes": len(mcp_entries),
