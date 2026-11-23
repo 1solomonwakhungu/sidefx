@@ -86,13 +86,22 @@ class GitPushSpec:
 
 
 def redact_remote_for_display(remote: str) -> str:
-    """Strip userinfo and query strings from URL-shaped git remotes before journaling."""
+    """Strip passwords/query strings from URL-shaped git remotes while preserving SSH user."""
     parsed = urllib.parse.urlsplit(remote)
     if parsed.scheme and parsed.netloc:
         host = parsed.hostname or ""
         if ":" in host and not host.startswith("["):
             host = f"[{host}]"
-        netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+        hostport = f"{host}:{parsed.port}" if parsed.port is not None else host
+        # Preserve non-password username on ssh:// URLs so `git ls-remote` uses the right user.
+        if (
+            parsed.scheme.lower() in ("ssh", "git+ssh")
+            and parsed.username
+            and parsed.password is None
+        ):
+            netloc = f"{parsed.username}@{hostport}"
+        else:
+            netloc = hostport
         return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
     return remote
 
@@ -332,6 +341,21 @@ def inspect_git_push(
         if tok in _GIT_PUSH_VALUE_FLAGS:
             idx += 2
             continue
+        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 2:
+            # Handle combined short flags such as `-fd`, `-df`, `-fn`, `-fu`.
+            if tok.startswith("-o"):
+                idx += 1
+                continue
+            flags = set(tok[1:])
+            if "d" in flags:
+                is_delete = True
+            if "f" in flags:
+                is_force = True
+            if "n" in flags:
+                is_multi_or_unsupported = True
+                unsupported_reason = "Dry-run git push is not reconcilable"
+            idx += 1
+            continue
         if tok.startswith("-"):
             idx += 1
             continue
@@ -387,6 +411,21 @@ def inspect_git_push(
 
     if remote is None:
         remote = branch_push_remote or remote_push_default or branch_remote or "origin"
+
+    # Mirror remotes push all refs regardless of refspecs -> non-reconcilable.
+    if (_git_config_get(f"remote.{remote}.mirror", cwd=repo_cwd) or "").lower() == "true":
+        return GitPushSpec(
+            cwd=str(repo_cwd),
+            remote=redact_remote_for_display(remote),
+            remote_ref=None,
+            expected_sha=None,
+            before_sha=None,
+            before_known=False,
+            is_delete=is_delete,
+            is_force=is_force,
+            reconcilable=False,
+            reason=f"Mirror remote {remote!r} cannot be safely reconciled",
+        )
 
     remote_ref: str | None = None
     expected_sha: str | None = None
@@ -543,7 +582,51 @@ def inspect_git_push(
             if is_delete:
                 remote_ref = _normalize_remote_ref(raw_spec)
             else:
+                # Explicit colon-less refspecs can be remapped by `remote.<r>.push` or
+                # `push.default=upstream`/`tracking` — fail closed instead of guessing!
+                if _git_config_has(f"remote.{remote}.push", cwd=repo_cwd):
+                    return GitPushSpec(
+                        cwd=str(repo_cwd),
+                        remote=redact_remote_for_display(remote),
+                        remote_ref=None,
+                        expected_sha=None,
+                        before_sha=None,
+                        before_known=False,
+                        is_delete=False,
+                        is_force=is_force,
+                        reconcilable=False,
+                        reason=(
+                            f"Custom remote.{remote}.push refspec configured; "
+                            "cannot safely reconcile colon-less refspec"
+                        ),
+                    )
+                push_default = (_git_config_get("push.default", cwd=repo_cwd) or "simple").lower()
                 src_full = _resolve_symbolic_full_name(raw_spec, cwd=repo_cwd)
+                if raw_spec == "HEAD" and current_branch:
+                    branch_for_merge: str | None = current_branch
+                elif src_full and src_full.startswith("refs/heads/"):
+                    branch_for_merge = src_full[len("refs/heads/") :]
+                else:
+                    branch_for_merge = None
+                if push_default in ("upstream", "tracking") and branch_for_merge:
+                    cfg_merge = _git_config_get(f"branch.{branch_for_merge}.merge", cwd=repo_cwd)
+                    if cfg_merge:
+                        return GitPushSpec(
+                            cwd=str(repo_cwd),
+                            remote=redact_remote_for_display(remote),
+                            remote_ref=None,
+                            expected_sha=None,
+                            before_sha=None,
+                            before_known=False,
+                            is_delete=False,
+                            is_force=is_force,
+                            reconcilable=False,
+                            reason=(
+                                f"push.default={push_default} with branch.{branch_for_merge}.merge "
+                                "remaps colon-less refspec; refusing to guess destination"
+                            ),
+                        )
+
                 if raw_spec == "HEAD" and current_branch:
                     remote_ref = f"refs/heads/{current_branch}"
                 else:

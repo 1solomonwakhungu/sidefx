@@ -267,6 +267,11 @@ class TestClaudeCodeStopHookInit:
         assert "--settings" in capsys.readouterr().err
         assert cfg.read_text(encoding="utf-8") == orig
 
+        # `--write` / `--settings` without `--claude-code` also exits 2 cleanly
+        rc_no_cc = main(["init", "--write"])
+        assert rc_no_cc == 2
+        assert "--claude-code" in capsys.readouterr().err
+
     def test_merge_via_settings_flag_preserves_existing_settings_symlink_and_mode(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

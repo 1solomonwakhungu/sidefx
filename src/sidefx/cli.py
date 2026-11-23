@@ -299,6 +299,13 @@ def _cmd_init(args: argparse.Namespace, config: SidefxConfig) -> int:
             "sidefx.receipt", "handle_init_claude_code_cli", args, config, "init --claude-code"
         )
 
+    if getattr(args, "write", False) or getattr(args, "settings_path", None):
+        print(
+            "error: --write and --settings require --claude-code",
+            file=sys.stderr,
+        )
+        return 2
+
     dest = Path(args.init_path).expanduser()
     if dest.is_dir():
         print(f"error: {dest} is a directory", file=sys.stderr)

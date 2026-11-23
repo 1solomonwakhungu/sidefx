@@ -402,11 +402,26 @@ class TestWrapGitHubEndToEnd:
             assert res1.status == ActionStatus.UNKNOWN
             assert tracker.post_count == 0
 
+            # Default min_retry_age_seconds (5s) blocks immediate retry right after timeout!
             env_ok = dict(env_pre, FAKE_GH_MODE="normal")
+            res_cooldown = wrap_command(
+                cmd,
+                journal=journal,
+                action_id="gh-pre-timeout",
+                env=env_ok,
+                github_api_url=base_url,
+            )
+            assert res_cooldown.exit_code == EXIT_OUTCOME_UNKNOWN
+            assert res_cooldown.executed is False
+            assert "cooldown" in (res_cooldown.error or "")
+            assert tracker.post_count == 0
+
+            # With min_retry_age_seconds=0 (or after cooldown), NOT_FOUND retries once!
             res2 = wrap_command(
                 cmd,
                 journal=journal,
                 action_id="gh-pre-timeout",
+                min_retry_age_seconds=0.0,
                 env=env_ok,
                 github_api_url=base_url,
             )
@@ -524,6 +539,77 @@ class TestWrapGitHubEndToEnd:
             assert res.exit_code == 2
             assert res.status == ActionStatus.UNKNOWN
 
+    def test_target_flag_never_authorizes_false_not_found_for_gh(
+        self,
+        tmp_path: Path,
+        gh_harness: tuple[str, _WriteTrackingGitHubServer, Path],
+    ) -> None:
+        """Round-2 B1: `--target other/repo` must be treated as inferred, never triggering retry."""
+        base_url, tracker, gh_script = gh_harness
+        db_path = tmp_path / "journal.db"
+        # Fake `gh` posts to `org/repo` by default, while user passed `--target acme/other`!
+        cmd = [str(gh_script), "issue", "create", "--title", "T", "--body", "B"]
+
+        env_timeout = os.environ.copy()
+        env_timeout["FAKE_GH_API_URL"] = base_url
+        env_timeout["FAKE_GH_MODE"] = "timeout_after_write"
+
+        with Journal(db_path) as journal:
+            res1 = wrap_command(
+                cmd,
+                journal=journal,
+                action_id="gh-target-mismatch",
+                target="acme/other",
+                timeout_seconds=0.5,
+                env=env_timeout,
+                github_api_url=base_url,
+            )
+            assert res1.exit_code == EXIT_TIMEOUT
+            assert tracker.post_count == 1
+
+            # Even with min_retry_age_seconds=0, repo came only from --target -> capped at UNKNOWN!
+            env_ok = dict(env_timeout, FAKE_GH_MODE="normal")
+            res2 = wrap_command(
+                cmd,
+                journal=journal,
+                action_id="gh-target-mismatch",
+                target="acme/other",
+                min_retry_age_seconds=0.0,
+                env=env_ok,
+                github_api_url=base_url,
+            )
+            assert res2.executed is False
+            assert tracker.post_count == 1
+
+        # Second check: empty server + --target without -R MUST NOT retry (stays UNKNOWN)
+        tracker.issues.clear()
+        tracker.post_count = 0
+        env_pre = dict(env_timeout, FAKE_GH_MODE="timeout_before_write")
+        with Journal(db_path) as journal:
+            res_a = wrap_command(
+                cmd,
+                journal=journal,
+                action_id="gh-target-inferred-empty",
+                target="acme/other",
+                timeout_seconds=0.3,
+                env=env_pre,
+                github_api_url=base_url,
+            )
+            assert res_a.exit_code == EXIT_TIMEOUT
+            env_ok = dict(env_timeout, FAKE_GH_MODE="normal")
+            res_b = wrap_command(
+                cmd,
+                journal=journal,
+                action_id="gh-target-inferred-empty",
+                target="acme/other",
+                min_retry_age_seconds=0.0,
+                env=env_ok,
+                github_api_url=base_url,
+            )
+            assert res_b.exit_code == EXIT_OUTCOME_UNKNOWN
+            assert res_b.executed is False
+            assert tracker.post_count == 0
+
 
 def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(
@@ -537,7 +623,7 @@ class TestWrapGitPushEndToEnd:
     ) -> None:
         bare = tmp_path / "remote.git"
         bare.mkdir()
-        _git(bare, "init", "--bare")
+        _git(bare, "init", "--bare", "-b", "main")
 
         work = tmp_path / "work"
         work.mkdir()
@@ -589,6 +675,7 @@ class TestWrapGitPushEndToEnd:
                 journal=journal,
                 action_id="push-c2",
                 cwd=work,
+                min_retry_age_seconds=0.0,
             )
             assert res_retry_ok.exit_code == 0
             assert res_retry_ok.executed is True
@@ -782,18 +869,25 @@ class TestWrapCliAndEdgeCases:
     ) -> None:
         """B1: External mid-exec state mutation must preserve stdout and avoid crashing."""
         db_path = tmp_path / "journal.db"
-        script = textwrap.dedent(
+        script_fail = textwrap.dedent(
             f"""\
-            import sys
             from sidefx.journal import Journal
             with Journal({str(db_path)!r}) as j:
                 j.mark_failed("agent", "t", "race-wrap", attempt=1, error="external")
             print("important-stdout")
             """
         )
+        script_reconcile = textwrap.dedent(
+            f"""\
+            from sidefx.journal import Journal
+            with Journal({str(db_path)!r}) as j:
+                j.mark_reconciled("agent", "t", "race-reconcile", attempt=1, result_ref="https://ok")
+            print("reconciled-stdout")
+            """
+        )
         with Journal(db_path) as journal:
             res = wrap_command(
-                [sys.executable, "-c", script],
+                [sys.executable, "-c", script_fail],
                 journal=journal,
                 action_id="race-wrap",
                 target="t",
@@ -801,6 +895,17 @@ class TestWrapCliAndEdgeCases:
             assert res.exit_code == 1
             assert "important-stdout" in res.stdout
             assert "concurrently" in (res.error or "")
+
+            # If concurrently reconciled while command succeeded, exit code is 0!
+            res_ok = wrap_command(
+                [sys.executable, "-c", script_reconcile],
+                journal=journal,
+                action_id="race-reconcile",
+                target="t",
+            )
+            assert res_ok.exit_code == 0
+            assert res_ok.status == ActionStatus.RECONCILED
+            assert "reconciled-stdout" in res_ok.stdout
 
     def test_curl_github_detection_rejects_non_matching_paths_hosts_and_methods(self) -> None:
         """B3: Only exact supported endpoints on the configured GitHub API origin match."""

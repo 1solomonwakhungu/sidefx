@@ -158,7 +158,11 @@ def inject_marker_into_json_body(
     if existing is not None and not isinstance(existing, str):
         return raw_body, False
     parsed[field] = inject_marker_into_body(existing, marker)
-    return json.dumps(parsed, separators=(",", ":"), ensure_ascii=False), True
+    try:
+        encoded = json.dumps(parsed, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    except (ValueError, TypeError, OverflowError):
+        return raw_body, False
+    return encoded, True
 
 
 def _is_gh_write_subcommand(argv: Sequence[str]) -> str | None:

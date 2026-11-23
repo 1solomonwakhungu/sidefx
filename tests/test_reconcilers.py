@@ -354,6 +354,12 @@ class TestGitHubMarkerHelpers:
         assert ok_bad is False
         assert out_bad == raw_bad
 
+        # Overflow float (1e400 -> Infinity) must fail closed, never emit NaN/Infinity JSON
+        raw_inf = '{"title":"T","n":1e400}'
+        out_inf, ok_inf = inject_marker_into_json_body(raw_inf, "m9")
+        assert ok_inf is False
+        assert out_inf == raw_inf
+
 
 class TestGitHubReconciler:
     def test_recovers_open_and_closed_issues_and_prs_and_comments(
@@ -609,7 +615,7 @@ def _git(cwd: Path, *args: str) -> str:
 def _setup_git_repos(tmp_path: Path) -> tuple[Path, Path]:
     bare = tmp_path / "remote.git"
     bare.mkdir()
-    _git(bare, "init", "--bare")
+    _git(bare, "init", "--bare", "-b", "main")
 
     work = tmp_path / "work"
     work.mkdir()
@@ -660,7 +666,7 @@ class TestGitPushReconciler:
 
         # Concurrent push from another clone -> UNKNOWN
         other = tmp_path / "other"
-        _git(tmp_path, "clone", str(bare), str(other))
+        _git(tmp_path, "clone", "-b", "main", str(bare), str(other))
         _git(other, "config", "user.email", "other@example.com")
         _git(other, "config", "user.name", "Other User")
         (other / "README.md").write_text("v3-concurrent\n", encoding="utf-8")
@@ -688,7 +694,7 @@ class TestGitPushReconciler:
         work, bare = _setup_git_repos(tmp_path)
         upstream_bare = tmp_path / "upstream.git"
         upstream_bare.mkdir()
-        _git(upstream_bare, "init", "--bare")
+        _git(upstream_bare, "init", "--bare", "-b", "main")
         _git(work, "remote", "add", "upstream", str(upstream_bare))
         _git(work, "push", "upstream", "main")
 
@@ -732,7 +738,7 @@ class TestGitPushReconciler:
         # pushurl is respected when fetch URL and push URL differ!
         push_only_bare = tmp_path / "push_only.git"
         push_only_bare.mkdir()
-        _git(push_only_bare, "init", "--bare")
+        _git(push_only_bare, "init", "--bare", "-b", "main")
         _git(work, "remote", "set-url", "--push", "origin", str(push_only_bare))
         _git(work, "checkout", "main")
         (work / "README.md").write_text("pushurl-v2\n", encoding="utf-8")
@@ -755,6 +761,46 @@ class TestGitPushReconciler:
             ["git", "-c", "push.default=matching", "push", "origin"], cwd=work
         )
         assert spec_c is not None and spec_c.reconcilable is False
+
+    def test_explicit_refspec_remapping_mirror_and_combined_delete_flags(
+        self, tmp_path: Path
+    ) -> None:
+        """Round-2 B2 & nits: explicit refspec remapping, mirror remote, `-fd`, and ssh:// user."""
+        work, _ = _setup_git_repos(tmp_path)
+        _git(work, "checkout", "-b", "feature", "--track", "origin/main")
+
+        # push.default=upstream with branch.feature.merge=refs/heads/main -> non-reconcilable
+        _git(work, "config", "push.default", "upstream")
+        spec_up = inspect_git_push(["git", "push", "origin", "feature"], cwd=work)
+        assert spec_up is not None and spec_up.reconcilable is False
+
+        # Reset push.default; custom remote.origin.push refspec -> non-reconcilable
+        _git(work, "config", "--unset", "push.default")
+        _git(work, "config", "remote.origin.push", "refs/heads/*:refs/heads/review/*")
+        spec_map = inspect_git_push(["git", "push", "origin", "feature"], cwd=work)
+        assert spec_map is not None and spec_map.reconcilable is False
+        _git(work, "config", "--unset", "remote.origin.push")
+
+        # Combined `-fd` flag marks delete!
+        spec_fd = inspect_git_push(["git", "push", "-fd", "origin", "feature"], cwd=work)
+        assert spec_fd is not None and spec_fd.is_delete is True and spec_fd.is_force is True
+
+        # Mirror remote -> non-reconcilable
+        _git(work, "config", "remote.origin.mirror", "true")
+        spec_mir = inspect_git_push(["git", "push", "origin", "feature"], cwd=work)
+        assert spec_mir is not None and spec_mir.reconcilable is False
+
+        # ssh://git@host preserves username, while https://user:pass@host strips credentials
+        from sidefx.reconcilers.git_push import redact_remote_for_display
+
+        assert (
+            redact_remote_for_display("ssh://git@github.com/org/repo.git")
+            == "ssh://git@github.com/org/repo.git"
+        )
+        assert (
+            redact_remote_for_display("https://user:secret@github.com/org/repo.git?tok=1")
+            == "https://github.com/org/repo.git"
+        )
 
     def test_delete_and_multi_ref_and_dash_c_flag(self, tmp_path: Path) -> None:
         work, _ = _setup_git_repos(tmp_path)

@@ -36,6 +36,7 @@ from sidefx.reconcilers import (
     Reconciler,
     ReconcileResult,
     ReconcileState,
+    _record_age_seconds,
     default_reconcilers,
     format_summary_with_meta,
     inject_marker_into_gh_args,
@@ -44,8 +45,9 @@ from sidefx.reconcilers import (
     reconcile_action,
 )
 from sidefx.reconcilers.git_push import redact_remote_for_display
-from sidefx.reconcilers.github import parse_github_repo
+from sidefx.reconcilers.github import _is_loopback_host, parse_github_repo
 
+DEFAULT_MIN_RETRY_AGE_SECONDS = 5.0
 EXIT_PAYLOAD_MISMATCH = 2
 EXIT_OUTCOME_UNKNOWN = 75
 EXIT_TIMEOUT = 124
@@ -271,16 +273,22 @@ def _extract_gh_repo_and_number(
                 break
             p_idx += 1
 
-    if repo is None and explicit_target:
-        repo, repo_host = _parse_gh_repo_arg(explicit_target)
-        m_num = re.search(r"#(\d+)$", explicit_target.strip())
-        if issue_number is None and m_num:
-            issue_number = int(m_num.group(1))
-
     if repo is None:
         env_repo = os.environ.get("GH_REPO", "").strip()
         if env_repo:
             repo, repo_host = _parse_gh_repo_arg(env_repo)
+
+    if repo is None and explicit_target:
+        # `gh` never sees sidefx's `--target`, so a repo derived only from `--target`
+        # is NOT verified to be `gh`'s destination and must be capped at UNKNOWN on 0 matches!
+        target_repo, target_host = _parse_gh_repo_arg(explicit_target)
+        if target_repo is not None:
+            repo = target_repo
+            repo_host = target_host
+            repo_inferred = True
+        m_num = re.search(r"#(\d+)$", explicit_target.strip())
+        if issue_number is None and m_num:
+            issue_number = int(m_num.group(1))
 
     if repo is None:
         detected_repo, detected_host = _detect_git_origin_repo(cwd)
@@ -291,13 +299,20 @@ def _extract_gh_repo_and_number(
 
     gh_host_env = os.environ.get("GH_HOST", "").strip().lower()
     effective_host = repo_host or gh_host_env or None
-    custom_api_configured = bool(
-        (github_api_url and github_api_url.strip())
-        or os.environ.get(ENV_GITHUB_API_URL, "").strip()
-    )
-    host_unverified = (
-        effective_host is not None and effective_host != "github.com" and not custom_api_configured
-    )
+    configured_api = _resolve_configured_github_api_base(github_api_url)
+    api_parsed = urllib.parse.urlsplit(configured_api)
+    api_host = (api_parsed.hostname or "").lower()
+
+    if api_host == "api.github.com":
+        host_unverified = effective_host is not None and effective_host != "github.com"
+    elif _is_loopback_host(api_host):
+        host_unverified = effective_host is not None and effective_host not in (
+            "github.com",
+            api_host,
+        )
+    else:
+        # Non-default GHE/custom API host: require effective gh host to match the API host!
+        host_unverified = effective_host is None or effective_host != api_host
 
     return repo, issue_number, repo_inferred, host_unverified
 
@@ -834,6 +849,10 @@ def _run_subprocess(
                 out_b, err_b = b"", b""
             return None, out_b or b"", err_b or b"", "timeout", None
         except _SignalTermination as exc:
+            # Ignore a second SIGTERM/SIGHUP during cleanup so child-tree SIGKILL completes.
+            for sig, _ in installed_signals:
+                with contextlib.suppress(OSError, ValueError):
+                    signal.signal(sig, signal.SIG_IGN)
             _kill_process_tree(proc)
             try:
                 out_b, err_b = proc.communicate(timeout=1.0)
@@ -841,6 +860,9 @@ def _run_subprocess(
                 out_b, err_b = b"", b""
             return None, out_b or b"", err_b or b"", "signal", exc.signum
         except KeyboardInterrupt:
+            for sig, _ in installed_signals:
+                with contextlib.suppress(OSError, ValueError):
+                    signal.signal(sig, signal.SIG_IGN)
             _kill_process_tree(proc)
             try:
                 out_b, err_b = proc.communicate(timeout=1.0)
@@ -902,6 +924,7 @@ def wrap_command(
     target: str | None = None,
     tool_name: str | None = None,
     timeout_seconds: float = 30.0,
+    min_retry_age_seconds: float = DEFAULT_MIN_RETRY_AGE_SECONDS,
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
     reconcilers: Sequence[Reconciler] | None = None,
@@ -917,16 +940,20 @@ def wrap_command(
       - Never blindly re-executes a ``pending`` or ``unknown`` action:
         - Automatically reconciles (unless ``auto_reconcile=False``).
         - On ``FOUND``: marks ``reconciled`` and returns recovered ``result_ref`` (0 writes).
-        - On ``NOT_FOUND`` for an already-terminated ``unknown`` action: marks prior
-          attempt ``failed`` (attempt-fenced) and re-claims atomically to retry once.
-        - On ``PENDING`` action: NEVER auto-retries even on ``NOT_FOUND`` because a
-          concurrent worker may still be in flight!
+        - On ``NOT_FOUND`` for an already-terminated ``unknown`` action whose age is at
+          least ``min_retry_age_seconds``: marks prior attempt ``failed`` (attempt-fenced)
+          and re-claims atomically to retry once.
+        - On ``PENDING`` action (or ``unknown`` younger than ``min_retry_age_seconds``):
+          NEVER auto-retries on ``NOT_FOUND`` because a local worker or slow remote server
+          may still be committing!
         - On ``UNKNOWN``: blocks retry and returns ``EXIT_OUTCOME_UNKNOWN``.
     """
     if not cmd:
         raise ValueError("Wrapped command must not be empty")
     if isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be > 0")
+    if isinstance(min_retry_age_seconds, bool) or min_retry_age_seconds < 0:
+        raise ValueError("min_retry_age_seconds must be >= 0")
 
     effective_cwd = (cwd if cwd is not None else Path.cwd()).resolve()
     resolved_action_id = action_id.strip() if action_id else f"cli-{uuid.uuid4().hex[:16]}"
@@ -1016,10 +1043,17 @@ def wrap_command(
             )
         )
 
-        # CRITICAL CONCURRENCY SAFETY:
-        # Only transition NOT_FOUND -> failed when the prior attempt already terminated
-        # (`status == UNKNOWN`). If `status == PENDING`, a live worker may still be in flight!
-        allow_retry_on_not_found = record.status == ActionStatus.UNKNOWN
+        # CRITICAL CONCURRENCY & SLOW-REMOTE SAFETY:
+        # 1. Never transition NOT_FOUND -> failed when `status == PENDING` (live worker!).
+        # 2. For `status == UNKNOWN`, require the row to be at least `min_retry_age_seconds`
+        #    old so an in-flight slow remote request has time to settle before re-dispatch.
+        age_seconds = _record_age_seconds(record)
+        cooldown_active = (
+            record.status == ActionStatus.UNKNOWN
+            and min_retry_age_seconds > 0
+            and (age_seconds is None or age_seconds < min_retry_age_seconds)
+        )
+        allow_retry_on_not_found = record.status == ActionStatus.UNKNOWN and not cooldown_active
         outcome = reconcile_action(
             journal,
             record,
@@ -1101,11 +1135,17 @@ def wrap_command(
                     reconcile_result=outcome.result,
                 )
         else:
-            extra = (
-                " (action is still pending; reconcile explicitly before retrying)"
-                if record.status == ActionStatus.PENDING
-                else (f" ({outcome.result.details})" if outcome.result.details else "")
-            )
+            if record.status == ActionStatus.PENDING:
+                extra = " (action is still pending; reconcile explicitly before retrying)"
+            elif cooldown_active:
+                age_desc = f"{age_seconds:.1f}s" if age_seconds is not None else "unknown"
+                extra = (
+                    f" (recently marked unknown {age_desc} ago; wait for "
+                    f"{min_retry_age_seconds:g}s cooldown before retrying so in-flight "
+                    "remote writes can settle, or pass --min-retry-age 0)"
+                )
+            else:
+                extra = f" ({outcome.result.details})" if outcome.result.details else ""
             msg = (
                 f"OUTCOME UNKNOWN — reconcile before retrying "
                 f"(action_id={record.action_id}, marker={record.marker}){extra}"
@@ -1289,8 +1329,14 @@ def wrap_command(
             attempt=attempt,
             result_ref=result_ref,
         )
+        # If another worker reconciled or confirmed the exact same action concurrently,
+        # the side effect succeeded and is durably recorded — return 0 without error.
+        benign_conflict = conflict is not None and status in (
+            ActionStatus.CONFIRMED,
+            ActionStatus.RECONCILED,
+        )
         return WrapResult(
-            exit_code=0 if conflict is None else 1,
+            exit_code=0 if (conflict is None or benign_conflict) else 1,
             action_id=record.action_id,
             marker=record.marker,
             target=record.target,
@@ -1302,7 +1348,7 @@ def wrap_command(
             stderr=stderr,
             stdout_bytes=out_bytes,
             stderr_bytes=err_bytes,
-            error=conflict,
+            error=None if benign_conflict else conflict,
         )
 
     # Non-zero exit code: classify ambiguous crash/transport errors as `unknown`.
@@ -1375,6 +1421,16 @@ def _positive_float(raw: str) -> float:
     return value
 
 
+def _non_negative_float(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid number: {raw!r}") from exc
+    if value < 0 or value != value:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return value
+
+
 def _build_wrap_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sidefx wrap",
@@ -1413,6 +1469,16 @@ def _build_wrap_parser() -> argparse.ArgumentParser:
         type=_positive_float,
         default=None,
         help="Command execution timeout in seconds (default from config).",
+    )
+    parser.add_argument(
+        "--min-retry-age",
+        dest="min_retry_age_seconds",
+        type=_non_negative_float,
+        default=DEFAULT_MIN_RETRY_AGE_SECONDS,
+        help=(
+            "Minimum age in seconds since an unknown outcome before NOT_FOUND may trigger "
+            f"automatic retry (default: {DEFAULT_MIN_RETRY_AGE_SECONDS:g})."
+        ),
     )
     parser.add_argument(
         "--github-api-url",
@@ -1498,6 +1564,7 @@ def handle_wrap_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
             target=sub_args.target,
             tool_name=sub_args.tool_name,
             timeout_seconds=timeout_seconds,
+            min_retry_age_seconds=sub_args.min_retry_age_seconds,
             github_api_url=sub_args.github_api_url,
             auto_reconcile=not sub_args.no_reconcile,
         )
@@ -1516,7 +1583,7 @@ def handle_wrap_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
             f"sidefx: reconciled action {res.action_id} without re-executing",
             file=sys.stderr,
         )
-    elif res.error and res.exit_code != 0:
+    elif res.error and res.exit_code != 0 and res.error.strip() != res.stderr.strip():
         print(res.error, file=sys.stderr)
 
     return res.exit_code
