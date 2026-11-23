@@ -317,28 +317,3 @@ class TestCliStatus:
         rc = main(["--config", str(bad), "status"])
         assert rc == 1
         assert "Malformed JSON" in capsys.readouterr().err
-
-
-class TestCliSubcommandStubs:
-    @pytest.mark.parametrize(
-        "argv",
-        [
-            ["report"],
-            ["report", "--format", "json"],
-            ["report", "--session-id", "s1", "--markdown"],
-            ["reconcile"],
-            ["reconcile", "--all"],
-            ["reconcile", "--action-id", "a1", "--dry-run"],
-            ["wrap", "--", "echo", "hi"],
-            ["wrap", "--action-id", "a", "--target", "t", "--", "gh", "issue", "create"],
-            ["init", "--claude-code"],
-        ],
-    )
-    def test_stub_subcommands_accept_flags_and_return_exit_code_2(
-        self, argv: list[str], capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        rc = main(argv)
-        assert rc == 2
-        err = capsys.readouterr().err
-        assert "not yet implemented" in err
-        assert "unrecognized arguments" not in err
