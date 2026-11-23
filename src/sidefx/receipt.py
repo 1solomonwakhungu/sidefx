@@ -49,6 +49,7 @@ class ReceiptData:
     session_id: str | None
     actions: tuple[ActionRecord, ...]
     counts: dict[ActionStatus, int]
+    other_sessions_unresolved_count: int = 0
 
     @property
     def total(self) -> int:
@@ -84,6 +85,7 @@ class ReceiptData:
             "unresolved_count": (
                 self.counts[ActionStatus.UNKNOWN] + self.counts[ActionStatus.PENDING]
             ),
+            "other_sessions_unresolved_count": self.other_sessions_unresolved_count,
             "groups": {
                 "confirmed": [a.to_dict() for a in self.confirmed],
                 "reconciled": [a.to_dict() for a in self.reconciled],
@@ -107,6 +109,7 @@ def load_receipt_data(
             session_id=session_id,
             actions=(),
             counts={s: 0 for s in ActionStatus},
+            other_sessions_unresolved_count=0,
         )
 
     with Journal.open_readonly(db_path) as journal:
@@ -116,6 +119,13 @@ def load_receipt_data(
                 descending=False,
             )
         )
+        other_unresolved = 0
+        if session_id is not None:
+            all_unresolved = journal.list_actions(
+                status=(ActionStatus.PENDING, ActionStatus.UNKNOWN),
+                descending=False,
+            )
+            other_unresolved = sum(1 for a in all_unresolved if a.session_id != session_id)
     # Derive counts directly from the single snapshot of `actions` so counts and rows
     # are always 100% consistent even under concurrent writes!
     counts: dict[ActionStatus, int] = {s: 0 for s in ActionStatus}
@@ -128,6 +138,7 @@ def load_receipt_data(
         session_id=session_id,
         actions=actions,
         counts=counts,
+        other_sessions_unresolved_count=other_unresolved,
     )
 
 
@@ -167,6 +178,13 @@ def render_receipt_markdown(data: ReceiptData) -> str:
     if data.total == 0:
         lines.append("")
         lines.append("_No side effects recorded._")
+        if data.other_sessions_unresolved_count > 0:
+            lines.append("")
+            lines.append(
+                f"> **Warning:** {data.other_sessions_unresolved_count} unresolved "
+                "(`pending`/`unknown`) action(s) exist in other session(s). "
+                "Run `sidefx report --all` or `sidefx status --status pending --status unknown`."
+            )
         return "\n".join(lines)
 
     sections: tuple[tuple[str, tuple[ActionRecord, ...], bool], ...] = (
@@ -205,6 +223,14 @@ def render_receipt_markdown(data: ReceiptData) -> str:
                 line += f" (marker: {_md_code(rec.marker)})"
             lines.append(line)
 
+    if data.other_sessions_unresolved_count > 0:
+        lines.append("")
+        lines.append(
+            f"> **Warning:** {data.other_sessions_unresolved_count} unresolved "
+            "(`pending`/`unknown`) action(s) exist in other session(s). "
+            "Run `sidefx report --all` or `sidefx status --status pending --status unknown`."
+        )
+
     return "\n".join(lines)
 
 
@@ -238,6 +264,12 @@ def render_receipt_text(data: ReceiptData) -> str:
 
     if data.total == 0:
         lines.append("No side effects recorded.")
+        if data.other_sessions_unresolved_count > 0:
+            lines.append(
+                f"WARNING: {data.other_sessions_unresolved_count} unresolved "
+                "(pending/unknown) action(s) exist in other session(s). "
+                "Run `sidefx report --all` or `sidefx status --status pending --status unknown`."
+            )
         return "\n".join(lines)
 
     sections: tuple[tuple[str, tuple[ActionRecord, ...], bool], ...] = (
@@ -270,6 +302,14 @@ def render_receipt_text(data: ReceiptData) -> str:
             if is_unresolved:
                 base += f" [marker={sanitize_text(rec.marker)}]"
             lines.append(base)
+
+    if data.other_sessions_unresolved_count > 0:
+        lines.append("")
+        lines.append(
+            f"WARNING: {data.other_sessions_unresolved_count} unresolved "
+            "(pending/unknown) action(s) exist in other session(s). "
+            "Run `sidefx report --all` or `sidefx status --status pending --status unknown`."
+        )
 
     return "\n".join(lines)
 

@@ -415,14 +415,14 @@ class TestStableSessionPersistence:
         assert len(set(results)) == 1
         assert (db_path.parent / ".gitignore").is_file()
 
-        # Precedence checks
-        cfg = SidefxConfig(default_session_id="cfg-sess")
-        assert resolve_session_id(config=cfg, db_path=db_path) == ("cfg-sess", "config")
+        # Precedence checks: explicit > SIDEFX_SESSION_ID > config > CLAUDE_CODE_SESSION_ID > file
         monkeypatch.setenv(ENV_CLAUDE_CODE_SESSION_ID, "cc-sess")
-        assert resolve_session_id(config=cfg, db_path=db_path) == (
+        assert resolve_session_id(db_path=db_path) == (
             "cc-sess",
             f"env:{ENV_CLAUDE_CODE_SESSION_ID}",
         )
+        cfg = SidefxConfig(default_session_id="cfg-sess")
+        assert resolve_session_id(config=cfg, db_path=db_path) == ("cfg-sess", "config")
         monkeypatch.setenv(ENV_SESSION_ID, "sidefx-env-sess")
         assert resolve_session_id(config=cfg, db_path=db_path) == (
             "sidefx-env-sess",
@@ -556,6 +556,40 @@ class TestPreflightRequiredConstraint:
         assert not r_empty.allowed
         assert r_empty.violations[0].constraint == "required"
 
+        # Empty string and empty dict -> denied by required!
+        r_empty_str = evaluate_preflight("refund_payment", {"amount": "   "}, cfg)
+        assert not r_empty_str.allowed
+        assert r_empty_str.violations[0].constraint == "required"
+
+        r_empty_dict = evaluate_preflight("refund_payment", {"amount": {}}, cfg)
+        assert not r_empty_dict.allowed
+        assert r_empty_dict.violations[0].constraint == "required"
+
+        # Literal dotted keys MUST NOT bypass `required: true` on nested paths!
+        dotted_cfg = SidefxConfig(
+            preflight=PreflightConfig(
+                rules=(
+                    PreflightRule(
+                        tool="refund_payment",
+                        arg="payment.amount",
+                        required=True,
+                        max_value=50,
+                    ),
+                )
+            )
+        )
+        r_flat_only = evaluate_preflight("refund_payment", {"payment.amount": 1}, dotted_cfg)
+        assert not r_flat_only.allowed
+        assert any(v.constraint == "required" for v in r_flat_only.violations)
+
+        r_flat_empty_parent = evaluate_preflight(
+            "refund_payment", {"payment.amount": 1, "payment": {}}, dotted_cfg
+        )
+        assert not r_flat_empty_parent.allowed
+        assert any(v.constraint == "required" for v in r_flat_empty_parent.violations)
+
+        assert evaluate_preflight("refund_payment", {"payment": {"amount": 20}}, dotted_cfg).allowed
+
         # Valid value -> allowed!
         assert evaluate_preflight("refund_payment", {"amount": 25}, cfg).allowed
 
@@ -656,9 +690,83 @@ class TestClaudeCodeHookAndSessionScopedReport:
             is None
         )
 
-        # Malformed stdin -> fail-open silent!
+        # Malformed stdin & closed stdin -> fail-open silent!
         assert run_claude_code_stop_hook(stdin=io.StringIO("{not valid json")) is None
         assert run_claude_code_stop_hook(stdin=io.StringIO("[1, 2, 3]")) is None
+        closed_stream = io.StringIO("{}")
+        closed_stream.close()
+        assert run_claude_code_stop_hook(stdin=closed_stream) is None
+
+    def test_hook_matches_writer_session_surfaces_other_session_unresolved_and_never_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.delenv(ENV_SESSION_ID, raising=False)
+        monkeypatch.delenv(ENV_CLAUDE_CODE_SESSION_ID, raising=False)
+        db_path = tmp_path / ".sidefx" / "journal.db"
+
+        # 1. Writer uses SIDEFX_SESSION_ID=s-env; hook payload has different session_id="cc-other"
+        with Journal(db_path) as journal:
+            journal.begin_action(
+                action_id="env-act-1",
+                session_id="s-env",
+                actor="agent",
+                surface=Surface.MCP,
+                tool_name="create_issue",
+                target="org/repo",
+                payload={"x": 1},
+            )
+            journal.mark_confirmed("agent", "org/repo", "env-act-1", result_ref="https://gh/1")
+
+        monkeypatch.setenv(ENV_SESSION_ID, "s-env")
+        res_env = run_claude_code_stop_hook(
+            stdin=io.StringIO(json.dumps({"session_id": "cc-other", "cwd": str(tmp_path)})),
+        )
+        assert res_env is not None
+        assert "env-act-1" in res_env["systemMessage"]
+        monkeypatch.delenv(ENV_SESSION_ID)
+
+        # 2. Writer used file session (`current-session`); hook payload has cc-other -> finds it!
+        assert main(["session", "new", "--db", str(db_path), "--id", "s-env"]) == 0
+        _ = capsys.readouterr()
+        res_file = run_claude_code_stop_hook(
+            stdin=io.StringIO(json.dumps({"session_id": "cc-other", "cwd": str(tmp_path)})),
+        )
+        assert res_file is not None
+        assert "env-act-1" in res_file["systemMessage"]
+
+        # 3. After `/clear`: CLAUDE_CODE_SESSION_ID moved to `cc-new`, while old session `cc-old`
+        #    left an `unknown` action -> hook MUST surface it loudly AND report warns about it!
+        with Journal(db_path) as journal:
+            journal.begin_action(
+                action_id="orphan-unk",
+                session_id="cc-old",
+                actor="agent",
+                surface=Surface.MCP,
+                tool_name="post_webhook",
+                target="mcp:hooks",
+                payload={"x": 2},
+            )
+            journal.mark_unknown("agent", "mcp:hooks", "orphan-unk", error="timed out")
+
+        monkeypatch.setenv(ENV_CLAUDE_CODE_SESSION_ID, "cc-new")
+        res_clear = run_claude_code_stop_hook(
+            stdin=io.StringIO(json.dumps({"session_id": "cc-new", "cwd": str(tmp_path)})),
+        )
+        assert res_clear is not None
+        assert "WARNING:" in res_clear["systemMessage"]
+        assert "orphan-unk" in res_clear["systemMessage"]
+        assert "cc-old" in res_clear["systemMessage"]
+
+        assert main(["report", "--db", str(db_path), "--session-id", "cc-new", "--json"]) == 0
+        rep_json = json.loads(capsys.readouterr().out)
+        assert rep_json["other_sessions_unresolved_count"] == 1
+        assert main(["report", "--db", str(db_path), "--session-id", "cc-new"]) == 0
+        assert "other session" in capsys.readouterr().out
+
+        # 4. Bad CLI flags / unknown harness on `sidefx hook` MUST still exit 0 (never block Stop!)
+        assert main(["hook", "claude-code", "--totally-unknown-flag"]) == 0
+        assert main(["hook", "unknown-harness"]) == 0
+        _ = capsys.readouterr()
 
     def test_hook_emits_system_message_and_highlights_unresolved_loudly(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -679,6 +787,31 @@ class TestClaudeCodeHookAndSessionScopedReport:
             journal.mark_confirmed("agent", "origin:refs/heads/main", "ok-1", result_ref="ref@123")
 
             journal.begin_action(
+                action_id="other-ok",
+                session_id="cc-sess-other",
+                actor="agent",
+                surface=Surface.CLI,
+                tool_name="git_push",
+                target="origin:refs/heads/other",
+                payload={"x": 9},
+            )
+            journal.mark_confirmed(
+                "agent", "origin:refs/heads/other", "other-ok", result_ref="ref@999"
+            )
+
+        # Confirmed-only journal -> clean session-scoped systemMessage without WARNING
+        res_ok = run_claude_code_stop_hook(
+            stdin=io.StringIO(json.dumps({"session_id": "cc-sess-ok", "cwd": str(tmp_path)})),
+        )
+        assert res_ok is not None
+        assert "systemMessage" in res_ok
+        assert "ok-1" in res_ok["systemMessage"]
+        assert "other-ok" not in res_ok["systemMessage"]
+        assert "WARNING:" not in res_ok["systemMessage"]
+
+        # Add an unresolved action in cc-sess-bad
+        with Journal(db_path) as journal:
+            journal.begin_action(
                 action_id="unk-1",
                 session_id="cc-sess-bad",
                 actor="agent",
@@ -688,16 +821,6 @@ class TestClaudeCodeHookAndSessionScopedReport:
                 payload={"x": 2},
             )
             journal.mark_unknown("agent", "mcp:hooks", "unk-1", error="timed out")
-
-        # Confirmed-only session -> clean systemMessage without WARNING
-        res_ok = run_claude_code_stop_hook(
-            stdin=io.StringIO(json.dumps({"session_id": "cc-sess-ok", "cwd": str(tmp_path)})),
-        )
-        assert res_ok is not None
-        assert "systemMessage" in res_ok
-        assert "ok-1" in res_ok["systemMessage"]
-        assert "unk-1" not in res_ok["systemMessage"]
-        assert "WARNING:" not in res_ok["systemMessage"]
 
         # Unresolved session via CLI `sidefx hook claude-code` -> loud WARNING banner
         monkeypatch.setattr(
@@ -933,8 +1056,154 @@ class TestWedgedUpstreamTimeoutRecovery:
         inits = [e for e in events if e.get("event") == "initialize"]
         assert len(inits) == 2
 
-        parsed_no, _ = parse_mcp_proxy_args(["--no-restart-on-timeout", "--", "echo", "hi"])
-        assert parsed_no.restart_on_timeout is False
+        parsed_default, _ = parse_mcp_proxy_args(["--", "echo", "hi"])
+        assert parsed_default.restart_on_timeout is False
+        parsed_yes, _ = parse_mcp_proxy_args(["--restart-on-timeout", "--", "echo", "hi"])
+        assert parsed_yes.restart_on_timeout is True
+
+    def test_restart_with_shell_grandchild_and_orphaned_passthrough_does_not_deadlock(
+        self, tmp_path: Path
+    ) -> None:
+        server = tmp_path / "strict_single.py"
+        server.write_text(SINGLE_THREADED_WEDGING_SERVER, encoding="utf-8")
+        log_path = tmp_path / "grandchild.jsonl"
+        db_path = tmp_path / "journal.db"
+        env = {**os.environ, "WEDGE_LOG": str(log_path)}
+
+        # Run via `sh -c "...; true"` so the MCP server is a GRANDCHILD process holding stdout open!
+        shell_cmd = ["sh", "-c", f'"{sys.executable}" -u "{server}"; true']
+        with (
+            Journal(db_path) as journal,
+            _InteractiveProxy(
+                cmd=shell_cmd,
+                journal=journal,
+                session_id="gc-sess",
+                target="mcp:gc",
+                timeout_seconds=0.2,
+                restart_on_timeout=True,
+                upstream_env=env,
+            ) as h,
+        ):
+            h.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            assert h.recv()["id"] == 1
+            h.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+            # Wedge the grandchild server, then queue a passthrough read BEFORE timeout fires
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "create_ticket",
+                        "arguments": {"hang": True, "_sidefx_action_id": "gc-wedge"},
+                    },
+                }
+            )
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "get_ticket", "arguments": {"id": 7}},
+                }
+            )
+
+            # Collect timeout error for id=2
+            r_timeout = h.recv(timeout=2.0)
+            assert r_timeout["id"] == 2
+            assert r_timeout["error"]["code"] == ERR_OUTCOME_UNKNOWN
+
+            # Next call triggers restart: must kill grandchild tree without deadlocking,
+            # synthesize an error for orphaned passthrough id=3, and answer id=4 cleanly!
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {"name": "get_ticket", "arguments": {"id": 8}},
+                }
+            )
+            r_a = h.recv(timeout=5.0)
+            r_b = h.recv(timeout=5.0)
+            by_id = {r_a["id"]: r_a, r_b["id"]: r_b}
+            assert 3 in by_id and "error" in by_id[3]
+            assert 4 in by_id and "error" not in by_id[4]
+            assert "ticket:8" in by_id[4]["result"]["content"][0]["text"]
+
+    def test_slow_serial_server_reconciles_late_reply_by_default_without_kill(
+        self, tmp_path: Path
+    ) -> None:
+        slow_srv = tmp_path / "slow_serial.py"
+        slow_srv.write_text(
+            textwrap.dedent(
+                """\
+                import json, sys, time
+                for raw in sys.stdin:
+                    msg = json.loads(raw)
+                    m = msg.get("method")
+                    rid = msg.get("id")
+                    if m == "initialize":
+                        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {}}), flush=True)
+                    elif m == "tools/call":
+                        name = msg["params"]["name"]
+                        if name == "create_item":
+                            time.sleep(0.35)
+                            res = {"content": [{"type": "text", "text": "https://x/1"}],
+                                   "isError": False}
+                            print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": res}),
+                                  flush=True)
+                        else:
+                            res = {"content": [{"type": "text", "text": "read-ok"}],
+                                   "isError": False}
+                            print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": res}),
+                                  flush=True)
+                """
+            ),
+            encoding="utf-8",
+        )
+        db_path = tmp_path / "journal.db"
+        with (
+            Journal(db_path) as journal,
+            _InteractiveProxy(
+                cmd=[sys.executable, "-u", str(slow_srv)],
+                journal=journal,
+                session_id="slow-serial-sess",
+                target="mcp:slow",
+                timeout_seconds=0.15,
+                restart_on_timeout=False,  # default!
+            ) as h,
+        ):
+            h.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            h.recv()
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "create_item", "arguments": {"_sidefx_action_id": "s-1"}},
+                }
+            )
+            r_to = h.recv(timeout=2.0)
+            assert r_to["error"]["code"] == ERR_OUTCOME_UNKNOWN
+
+            # Send read immediately: server is NOT killed, finishes write, reconciles, answers read!
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "get_item", "arguments": {}},
+                }
+            )
+            r_read = h.recv(timeout=3.0)
+            assert r_read["id"] == 3
+            assert r_read["result"]["content"][0]["text"] == "read-ok"
+
+            rec = journal.get_action("agent", "mcp:slow", "s-1")
+            assert rec is not None
+            assert rec.status == ActionStatus.RECONCILED
+            assert rec.result_ref == "https://x/1"
 
 
 # ---------------------------------------------------------------------------
@@ -1021,7 +1290,35 @@ class TestWrapAutomaticDeterministicIds:
             assert r2.reconciled is True
             assert r2.executed is False
 
-            # 3. New commit on same branch -> NEW deterministic action ID and pushes cleanly!
+            # 3. Same SHA with different flags (`git push -u origin feat/auto`) replays cleanly
+            #    without a spurious PayloadMismatchError!
+            r_flags = wrap_command(
+                ["git", "push", "-u", "origin", "feat/auto"],
+                journal=journal,
+                cwd=work,
+                env=git_env,
+                timeout_seconds=5.0,
+            )
+            assert r_flags.exit_code == 0
+            assert r_flags.replayed is True
+            assert r_flags.executed is False
+
+            # 4. Delete remote branch, then re-push same SHA -> MUST execute real push (not skip!)
+            run_git("push", "origin", "--delete", "feat/auto", cwd=work)
+            r_repush = wrap_command(
+                ["git", "push", "origin", "feat/auto"],
+                journal=journal,
+                cwd=work,
+                env=git_env,
+                timeout_seconds=5.0,
+            )
+            assert r_repush.exit_code == 0
+            assert r_repush.executed is True
+            assert r_repush.replayed is False
+            ls_out = run_git("ls-remote", str(bare), "refs/heads/feat/auto", cwd=work)
+            assert "refs/heads/feat/auto" in ls_out
+
+            # 5. New commit on same branch -> NEW deterministic action ID and pushes cleanly!
             (work / "b.txt").write_text("v2\n", encoding="utf-8")
             run_git("add", "b.txt", cwd=work)
             run_git("commit", "-m", "feat 2", cwd=work)
@@ -1036,11 +1333,69 @@ class TestWrapAutomaticDeterministicIds:
             assert r3.executed is True
             assert r3.action_id != r1.action_id
 
-        # Exactly 2 pushes landed on feat/auto (feat 1 once + feat 2 once)
-        lines = [
-            ln for ln in push_log.read_text(encoding="utf-8").splitlines() if "feat/auto" in ln
+        # 3 pushes landed (feat 1, repush after delete, feat 2)
+        non_delete_lines = [
+            ln
+            for ln in push_log.read_text(encoding="utf-8").splitlines()
+            if "feat/auto" in ln and not ln.split()[1].startswith("00000000")
         ]
-        assert len(lines) == 2
+        assert len(non_delete_lines) == 3
+
+    def test_gh_auto_id_handles_fill_body_file_and_pr_branch_changes(self, tmp_path: Path) -> None:
+        from sidefx.wrapper import _derive_gh_auto_context
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        git_env = {
+            **os.environ,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+        }
+        subprocess.run(["git", "init", "-b", "feat-a"], cwd=str(repo), env=git_env, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=str(repo), env=git_env, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "t@e"], cwd=str(repo), env=git_env, check=True
+        )
+        subprocess.run(
+            ["git", "config", "commit.gpgsign", "false"], cwd=str(repo), env=git_env, check=True
+        )
+        (repo / "f.txt").write_text("a\n", encoding="utf-8")
+        subprocess.run(["git", "add", "f.txt"], cwd=str(repo), env=git_env, check=True)
+        subprocess.run(["git", "commit", "-m", "a"], cwd=str(repo), env=git_env, check=True)
+
+        # `--fill` and `--body-file -` fall back to random (None)
+        assert (
+            _derive_gh_auto_context(["gh", "pr", "create", "--fill"], session_id="s", cwd=repo)
+            is None
+        )
+        assert (
+            _derive_gh_auto_context(
+                ["gh", "pr", "comment", "7", "--body-file", "-"], session_id="s", cwd=repo
+            )
+            is None
+        )
+
+        # `--body-file` content changes produce a distinct action ID!
+        body_file = repo / "body.md"
+        body_file.write_text("version 1", encoding="utf-8")
+        ctx_b1 = _derive_gh_auto_context(
+            ["gh", "pr", "comment", "7", "--body-file", "body.md"], session_id="s", cwd=repo
+        )
+        body_file.write_text("version 2", encoding="utf-8")
+        ctx_b2 = _derive_gh_auto_context(
+            ["gh", "pr", "comment", "7", "--body-file", "body.md"], session_id="s", cwd=repo
+        )
+        assert ctx_b1 is not None and ctx_b2 is not None
+        assert ctx_b1[0] != ctx_b2[0]
+
+        # `gh pr create` without `--head` distinguishes branch `feat-a` from `feat-b`!
+        pr_cmd = ["gh", "pr", "create", "--title", "WIP", "--body", "hi"]
+        ctx_a = _derive_gh_auto_context(pr_cmd, session_id="s", cwd=repo)
+        subprocess.run(["git", "checkout", "-b", "feat-b"], cwd=str(repo), env=git_env, check=True)
+        ctx_b = _derive_gh_auto_context(pr_cmd, session_id="s", cwd=repo)
+        assert ctx_a is not None and ctx_b is not None
+        assert ctx_a[0] != ctx_b[0]
 
     def test_gh_issue_create_auto_id_reconciles_and_random_action_id_allows_duplicate(
         self, tmp_path: Path
@@ -1195,7 +1550,7 @@ class TestPluginPackagingAndDoctor:
             (REPO_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
         assert plugin_json["name"] == "sidefx"
-        assert plugin_json["hooks"] == "./hooks/hooks.json"
+        assert "hooks" not in plugin_json  # auto-loaded from hooks/hooks.json
         assert plugin_json["skills"] == "./skills/"
 
         marketplace = json.loads(
@@ -1206,12 +1561,14 @@ class TestPluginPackagingAndDoctor:
 
         hooks = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
         stop_cmd = hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
-        assert "bin/sidefx hook claude-code" in stop_cmd
+        assert stop_cmd == '"${CLAUDE_PLUGIN_ROOT}/bin/sidefx" hook claude-code'
 
         skill_md = (REPO_ROOT / "skills" / "sidefx" / "SKILL.md").read_text(encoding="utf-8")
         assert skill_md.startswith("---\nname: sidefx\n")
         assert "OUTCOME UNKNOWN" in skill_md
         assert "_sidefx_action_id" in skill_md
+
+        assert (REPO_ROOT / "src" / "sidefx" / "py.typed").is_file()
 
         launcher = REPO_ROOT / "bin" / "sidefx"
         assert launcher.is_file()
@@ -1225,6 +1582,31 @@ class TestPluginPackagingAndDoctor:
         )
         assert proc.returncode == 0
         assert "sidefx " in proc.stdout
+
+    def test_launcher_skips_old_python3_and_falls_through_to_path_sidefx(
+        self, tmp_path: Path
+    ) -> None:
+        fake_bin = tmp_path / "fake_bin"
+        fake_bin.mkdir()
+        # Fake python3 pretending to be Python 3.9 (exits 1 on version check)
+        for pyname in ("python3", "python3.14", "python3.13", "python3.12", "python3.11"):
+            fake_py = fake_bin / pyname
+            fake_py.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            fake_py.chmod(0o755)
+        fake_sidefx = fake_bin / "sidefx"
+        fake_sidefx.write_text('#!/bin/sh\necho "fallback-sidefx $@"\n', encoding="utf-8")
+        fake_sidefx.chmod(0o755)
+
+        proc = subprocess.run(
+            ["/bin/sh", str(REPO_ROOT / "bin" / "sidefx"), "--version"],
+            env={"PATH": f"{fake_bin}:/bin:/usr/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+        assert proc.returncode == 0
+        assert "fallback-sidefx --version" in proc.stdout
 
     def test_doctor_checks_healthy_legacy_and_broken_configs(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

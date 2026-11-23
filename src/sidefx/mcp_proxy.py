@@ -9,9 +9,11 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
@@ -683,6 +685,46 @@ def _coerce_reconcile_hook_result(raw: Any) -> ReconcileHookResult | None:
     )
 
 
+def _kill_upstream_tree(proc: subprocess.Popen[bytes], pgid: int | None) -> bool:
+    """Terminate an upstream process and its entire POSIX process group.
+
+    Returns ``True`` only when the process tree is confirmed dead (so callers
+    can safely release in-flight duplicate-dispatch guards).
+    """
+    if os.name == "posix" and pgid is not None:
+        with contextlib.suppress(OSError):
+            os.killpg(pgid, signal.SIGTERM)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=0.3)
+        with contextlib.suppress(OSError):
+            os.killpg(pgid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while True:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+
+    if proc.poll() is None:
+        with contextlib.suppress(OSError):
+            proc.terminate()
+        try:
+            proc.wait(timeout=0.3)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                proc.wait(timeout=1.0)
+    return proc.poll() is not None
+
+
 class MCPProxy:
     """Transparent stdio JSON-RPC 2.0 MCP proxy with write-ahead journaling."""
 
@@ -698,7 +740,7 @@ class MCPProxy:
         timeout_seconds: float | None = None,
         deterministic_ids: bool = False,
         inject_instructions: bool = True,
-        restart_on_timeout: bool = True,
+        restart_on_timeout: bool = False,
         reconciler_hook: ReconcilerHook | None = None,
         client_in: BinaryIO | None = None,
         client_out: BinaryIO | None = None,
@@ -752,6 +794,7 @@ class MCPProxy:
         self._pending_cond = threading.Condition(self._state_lock)
 
         self._pending_mutations: dict[str, _InFlightMutation] = {}
+        self._pending_passthrough: dict[tuple[type, Any], tuple[Any, int]] = {}
         self._timed_out_upstream_ids: OrderedDict[str, _TimedOutMutation] = OrderedDict()
         self._pending_init_ids: set[tuple[type, Any]] = set()
         self._internal_waiters: dict[str, tuple[threading.Event, list[dict[str, Any]]]] = {}
@@ -763,6 +806,7 @@ class MCPProxy:
         self._needs_health_check = False
         self._reader_fatal_error = False
         self._proc: subprocess.Popen[bytes] | None = None
+        self._proc_pgid: int | None = None
         self._reader_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._saw_initialize = False
@@ -1215,10 +1259,15 @@ class MCPProxy:
                 self._active_finalizers -= 1
                 self._pending_cond.notify_all()
 
-    def _dispatch_internal_waiter(self, msg_id: Any, msg: dict[str, Any]) -> bool:
+    def _is_internal_upstream_id(self, msg_id: Any) -> bool:
+        return isinstance(msg_id, str) and msg_id.startswith(f"__sidefx_{self._proxy_nonce}_")
+
+    def _dispatch_internal_waiter(self, msg_id: Any, msg: dict[str, Any], generation: int) -> bool:
         if not isinstance(msg_id, str):
             return False
         with self._state_lock:
+            if generation != self._upstream_generation:
+                return False
             waiter = self._internal_waiters.pop(msg_id, None)
         if waiter is None:
             return False
@@ -1254,6 +1303,17 @@ class MCPProxy:
         updated_msg["result"] = updated_result
         return updated_msg
 
+    def _fail_orphaned_passthrough(self, orphaned_ids: list[Any], *, reason: str) -> None:
+        for cid in orphaned_ids:
+            self._send_client_message(
+                _jsonrpc_error_response(
+                    cid,
+                    ERR_UPSTREAM_UNAVAILABLE,
+                    f"Upstream MCP server unavailable: {reason}",
+                    data={"kind": "upstream_unavailable"},
+                )
+            )
+
     def _fail_all_inflight_on_upstream_eof(self, generation: int) -> None:
         with self._pending_cond:
             is_current = generation == self._upstream_generation
@@ -1269,6 +1329,11 @@ class MCPProxy:
                     entry.settled = True
                     orphaned.append(entry)
                     self._pending_mutations.pop(uid, None)
+            orphaned_passthrough: list[Any] = []
+            for pkey, (cid, pgen) in list(self._pending_passthrough.items()):
+                if pgen == generation:
+                    orphaned_passthrough.append(cid)
+                    self._pending_passthrough.pop(pkey, None)
             if is_current:
                 self._timed_out_upstream_ids.clear()
             self._active_finalizers += 1
@@ -1299,6 +1364,8 @@ class MCPProxy:
                     status=ActionStatus.UNKNOWN,
                     detail=detail,
                 )
+            if orphaned_passthrough:
+                self._fail_orphaned_passthrough(orphaned_passthrough, reason=detail)
         finally:
             with self._pending_cond:
                 self._active_finalizers -= 1
@@ -1329,16 +1396,29 @@ class MCPProxy:
                 try:
                     if isinstance(msg, dict) and "method" not in msg and "id" in msg:
                         msg_id = msg["id"]
-                        if self._dispatch_internal_waiter(msg_id, msg):
+                        if self._dispatch_internal_waiter(msg_id, msg, generation):
                             continue
                         if isinstance(msg_id, str) and self._handle_upstream_response_for_mutation(
                             msg_id, msg
                         ):
                             continue
+                        if self._is_internal_upstream_id(msg_id):
+                            # Never leak unmatched proxy-internal JSON-RPC IDs to the client.
+                            self._log_err(
+                                f"dropped unmatched internal upstream response id={msg_id!r}"
+                            )
+                            continue
+                        with self._state_lock:
+                            if generation != self._upstream_generation:
+                                continue
+                            self._pending_passthrough.pop(_rpc_id_key(msg_id), None)
                         msg = self._maybe_inject_init_instructions(msg_id, msg)
 
                     # Passthrough response, notification, or server-initiated request.
                     if isinstance(msg, dict):
+                        with self._state_lock:
+                            if generation != self._upstream_generation:
+                                continue
                         self._send_client_message(msg)
                     else:
                         self._log_err("ignored non-object JSON message from upstream stdout")
@@ -1911,44 +1991,63 @@ class MCPProxy:
                 )
             return
 
+        tracked_key: tuple[type, Any] | None = None
         with self._state_lock:
             dead = self._upstream_closed
-        if (dead or not self._write_upstream_bytes(serialized)) and has_client_id:
-            self._send_client_message(
-                _jsonrpc_error_response(
-                    client_id,
-                    ERR_UPSTREAM_UNAVAILABLE,
-                    "Upstream MCP server is unavailable",
-                    data={"kind": "upstream_unavailable"},
+            if not dead and has_client_id and isinstance(msg.get("method"), str):
+                tracked_key = _rpc_id_key(client_id)
+                self._pending_passthrough[tracked_key] = (client_id, self._upstream_generation)
+        if dead or not self._write_upstream_bytes(serialized):
+            if tracked_key is not None:
+                with self._state_lock:
+                    self._pending_passthrough.pop(tracked_key, None)
+            if has_client_id:
+                self._send_client_message(
+                    _jsonrpc_error_response(
+                        client_id,
+                        ERR_UPSTREAM_UNAVAILABLE,
+                        "Upstream MCP server is unavailable",
+                        data={"kind": "upstream_unavailable"},
+                    )
                 )
-            )
 
     def _spawn_upstream(self) -> bool:
-        """Spawn the upstream MCP subprocess and start its reader/stderr threads."""
+        """Spawn the upstream MCP subprocess in its own process group and start reader threads."""
         stderr_pipe = subprocess.PIPE if self._err_stream is not None else None
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": stderr_pipe,
+            "env": self._upstream_env,
+        }
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
         try:
-            proc = subprocess.Popen(
-                self._upstream_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=stderr_pipe,
-                env=self._upstream_env,
-            )
+            proc = subprocess.Popen(self._upstream_cmd, **popen_kwargs)
         except OSError as exc:
             self._log_err(f"failed to launch upstream command {self._upstream_cmd[0]!r}: {exc}")
             with self._pending_cond:
                 self._upstream_closed = True
                 self._proc = None
+                self._proc_pgid = None
                 self._pending_cond.notify_all()
             return False
 
         assert proc.stdin is not None
         assert proc.stdout is not None
 
+        pgid: int | None = None
+        if os.name == "posix":
+            try:
+                pgid = os.getpgid(proc.pid)
+            except OSError:
+                pgid = proc.pid
+
         with self._pending_cond:
             self._upstream_generation += 1
             gen = self._upstream_generation
             self._proc = proc
+            self._proc_pgid = pgid
             self._upstream_closed = False
 
         reader_thread = threading.Thread(
@@ -2004,16 +2103,18 @@ class MCPProxy:
         return box[0] if box else None
 
     def _restart_upstream(self) -> None:
-        """Terminate a wedged upstream subprocess, spawn a fresh one, and replay handshake."""
+        """Terminate a wedged upstream process tree, spawn a fresh one, and replay handshake."""
         with self._pending_cond:
             old_proc = self._proc
+            old_pgid = self._proc_pgid
             old_gen = self._upstream_generation
             old_reader = self._reader_thread
             old_stderr = self._stderr_thread
+            old_timed_out_keys = list(self._timed_out_upstream_ids.keys())
             # Bump generation BEFORE killing old_proc so its reader's EOF handler ignores it.
             self._upstream_generation += 1
             self._proc = None
-            self._timed_out_upstream_ids.clear()
+            self._proc_pgid = None
             self._pending_init_ids.clear()
             for event, _box in self._internal_waiters.values():
                 event.set()
@@ -2024,6 +2125,11 @@ class MCPProxy:
                     entry.settled = True
                     orphaned.append(entry)
                     self._pending_mutations.pop(uid, None)
+            orphaned_passthrough: list[Any] = []
+            for pkey, (cid, pgen) in list(self._pending_passthrough.items()):
+                if pgen == old_gen:
+                    orphaned_passthrough.append(cid)
+                    self._pending_passthrough.pop(pkey, None)
             self._active_finalizers += 1
 
         try:
@@ -2052,49 +2158,89 @@ class MCPProxy:
                     status=ActionStatus.UNKNOWN,
                     detail=detail,
                 )
+            if orphaned_passthrough:
+                self._fail_orphaned_passthrough(orphaned_passthrough, reason=detail)
         finally:
             with self._pending_cond:
                 self._active_finalizers -= 1
                 self._pending_cond.notify_all()
 
+        tree_dead = True
         if old_proc is not None:
             with self._upstream_write_lock:
                 if old_proc.stdin is not None:
                     with contextlib.suppress(OSError):
                         old_proc.stdin.close()
-            if old_proc.poll() is None:
-                with contextlib.suppress(OSError):
-                    old_proc.terminate()
-                try:
-                    old_proc.wait(timeout=0.3)
-                except subprocess.TimeoutExpired:
-                    with contextlib.suppress(OSError):
-                        old_proc.kill()
-                    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
-                        old_proc.wait(timeout=1.0)
+            tree_dead = _kill_upstream_tree(old_proc, old_pgid)
             if old_reader is not None:
                 old_reader.join(timeout=0.5)
             if old_stderr is not None:
                 old_stderr.join(timeout=0.5)
-            if old_proc.stdout is not None:
+            # Never close a pipe while a reader thread is still blocked on readline/read.
+            if old_proc.stdout is not None and (old_reader is None or not old_reader.is_alive()):
                 with contextlib.suppress(OSError):
                     old_proc.stdout.close()
-            if old_proc.stderr is not None:
+            if old_proc.stderr is not None and (old_stderr is None or not old_stderr.is_alive()):
                 with contextlib.suppress(OSError):
                     old_proc.stderr.close()
+
+        # Release the in-flight timed-out duplicate guard ONLY once the old tree is confirmed dead.
+        if tree_dead:
+            with self._state_lock:
+                for uid in old_timed_out_keys:
+                    self._timed_out_upstream_ids.pop(uid, None)
+        else:
+            self._log_err(
+                "could not confirm previous upstream process tree exited; keeping duplicate guard"
+            )
 
         if not self._spawn_upstream():
             return
 
         # Transparently replay the MCP initialize + notifications/initialized handshake.
         if self._saw_initialize:
-            reinit_timeout = min(5.0, max(1.0, self._timeout_seconds))
+            reinit_timeout = max(5.0, min(30.0, self._timeout_seconds))
             reinit_resp = self._send_internal_request(
                 "initialize", self._cached_init_params, timeout=reinit_timeout
             )
-            if reinit_resp is None:
-                self._log_err("restarted upstream MCP server did not reply to initialize handshake")
-            elif self._saw_initialized_notif:
+            if reinit_resp is None or (
+                isinstance(reinit_resp, dict) and reinit_resp.get("error") is not None
+            ):
+                self._log_err(
+                    "restarted upstream MCP server failed initialize handshake; shutting it down"
+                )
+                with self._pending_cond:
+                    failed_proc = self._proc
+                    failed_pgid = self._proc_pgid
+                    failed_reader = self._reader_thread
+                    failed_stderr = self._stderr_thread
+                    self._upstream_generation += 1
+                    self._upstream_closed = True
+                    self._proc = None
+                    self._proc_pgid = None
+                    self._pending_cond.notify_all()
+                if failed_proc is not None:
+                    with self._upstream_write_lock:
+                        if failed_proc.stdin is not None:
+                            with contextlib.suppress(OSError):
+                                failed_proc.stdin.close()
+                    _kill_upstream_tree(failed_proc, failed_pgid)
+                    if failed_reader is not None:
+                        failed_reader.join(timeout=0.5)
+                    if failed_stderr is not None:
+                        failed_stderr.join(timeout=0.5)
+                    if failed_proc.stdout is not None and (
+                        failed_reader is None or not failed_reader.is_alive()
+                    ):
+                        with contextlib.suppress(OSError):
+                            failed_proc.stdout.close()
+                    if failed_proc.stderr is not None and (
+                        failed_stderr is None or not failed_stderr.is_alive()
+                    ):
+                        with contextlib.suppress(OSError):
+                            failed_proc.stderr.close()
+                return
+            if self._saw_initialized_notif:
                 notif = self._cached_initialized_msg or {
                     "jsonrpc": "2.0",
                     "method": "notifications/initialized",
@@ -2113,7 +2259,7 @@ class MCPProxy:
                 self._needs_health_check = False
                 return
 
-        probe_timeout = min(0.3, max(0.05, self._timeout_seconds))
+        probe_timeout = min(1.0, max(0.1, self._timeout_seconds))
         probe_resp = self._send_internal_request("ping", {}, timeout=probe_timeout)
         if probe_resp is not None:
             with self._state_lock:
@@ -2241,6 +2387,7 @@ class MCPProxy:
             ) or self._active_finalizers > 0:
                 self._pending_cond.wait(timeout=0.5)
             proc = self._proc
+            pgid = self._proc_pgid
             reader_thread = self._reader_thread
             stderr_thread = self._stderr_thread
 
@@ -2259,12 +2406,7 @@ class MCPProxy:
                 try:
                     proc.wait(timeout=_SHUTDOWN_GRACE_SECONDS)
                 except subprocess.TimeoutExpired:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=_SHUTDOWN_GRACE_SECONDS)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait()
+                    _kill_upstream_tree(proc, pgid)
 
             if reader_thread is not None:
                 reader_thread.join(timeout=_SHUTDOWN_GRACE_SECONDS)
@@ -2281,10 +2423,10 @@ class MCPProxy:
                 self._pending_cond.wait(timeout=0.5)
 
         if proc is not None:
-            if proc.stdout is not None:
+            if proc.stdout is not None and (reader_thread is None or not reader_thread.is_alive()):
                 with contextlib.suppress(OSError):
                     proc.stdout.close()
-            if proc.stderr is not None:
+            if proc.stderr is not None and (stderr_thread is None or not stderr_thread.is_alive()):
                 with contextlib.suppress(OSError):
                     proc.stderr.close()
 
@@ -2371,10 +2513,11 @@ def build_mcp_proxy_parser() -> argparse.ArgumentParser:
         "--restart-on-timeout",
         dest="restart_on_timeout",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
             "Restart a wedged upstream MCP server after a call times out and replay the "
-            "initialize handshake transparently (default: enabled)."
+            "initialize handshake transparently (opt-in; default: disabled so slow-but-healthy "
+            "serial servers can finish and reconcile late replies)."
         ),
     )
     return parser

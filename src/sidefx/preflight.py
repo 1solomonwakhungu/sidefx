@@ -243,6 +243,7 @@ class _ResolvedEntry:
     value: Any
     intermediate_type_error: str | None = None
     missing: bool = False
+    is_literal_dotted: bool = False
 
 
 def _resolve_arg_values(
@@ -265,8 +266,12 @@ def _resolve_arg_values(
         return results
 
     # Also check exact literal key containing dots in case an upstream uses flat dotted keys.
+    # Marked `is_literal_dotted=True` so constraints still validate it, while `required: true`
+    # still requires the actual nested path to be present.
     if arg_path in arguments:
-        results.append(_ResolvedEntry(path=arg_path, value=arguments[arg_path]))
+        results.append(
+            _ResolvedEntry(path=arg_path, value=arguments[arg_path], is_literal_dotted=True)
+        )
 
     segments = arg_path.split(".")
     if any(not seg for seg in segments):
@@ -302,7 +307,7 @@ def _resolve_arg_values(
             return
         seg = segments[idx]
         if seg not in current:
-            if in_collection and report_missing_in_collections:
+            if report_missing_in_collections and (in_collection or idx > 0):
                 missing_tail = ".".join(segments[idx:])
                 missing_path = f"{prefix}.{missing_tail}" if prefix else missing_tail
                 results.append(_ResolvedEntry(path=missing_path, value=None, missing=True))
@@ -886,22 +891,21 @@ def evaluate_preflight(
                     )
                 )
                 continue
-            if not resolved_entries:
-                if rule.required:
-                    violations.append(
-                        PreflightViolation(
-                            tool=tool_name,
-                            arg=rule.arg,
-                            constraint="required",
-                            value=None,
-                            rule_reason=rule.reason,
-                            message=_format_violation_message(
-                                f"Required argument {rule.arg!r} is missing",
-                                rule.reason,
-                            ),
-                        )
+            has_structural_entry = any(not e.is_literal_dotted for e in resolved_entries)
+            if rule.required and not has_structural_entry:
+                violations.append(
+                    PreflightViolation(
+                        tool=tool_name,
+                        arg=rule.arg,
+                        constraint="required",
+                        value=None,
+                        rule_reason=rule.reason,
+                        message=_format_violation_message(
+                            f"Required argument {rule.arg!r} is missing",
+                            rule.reason,
+                        ),
                     )
-                continue
+                )
             for entry in resolved_entries:
                 if entry.missing:
                     violations.append(
@@ -962,21 +966,39 @@ def evaluate_preflight(
                     )
                     continue
                 for scalar_path, scalar_val in scalar_items:
-                    if rule.required and scalar_val is None:
-                        violations.append(
-                            PreflightViolation(
-                                tool=tool_name,
-                                arg=scalar_path,
-                                constraint="required",
-                                value=None,
-                                rule_reason=rule.reason,
-                                message=_format_violation_message(
-                                    f"Required argument {scalar_path!r} must not be null",
-                                    rule.reason,
-                                ),
+                    if rule.required:
+                        if scalar_val is None:
+                            violations.append(
+                                PreflightViolation(
+                                    tool=tool_name,
+                                    arg=scalar_path,
+                                    constraint="required",
+                                    value=None,
+                                    rule_reason=rule.reason,
+                                    message=_format_violation_message(
+                                        f"Required argument {scalar_path!r} must not be null",
+                                        rule.reason,
+                                    ),
+                                )
                             )
-                        )
-                        continue
+                            continue
+                        if (isinstance(scalar_val, str) and not scalar_val.strip()) or (
+                            isinstance(scalar_val, Mapping) and len(scalar_val) == 0
+                        ):
+                            violations.append(
+                                PreflightViolation(
+                                    tool=tool_name,
+                                    arg=scalar_path,
+                                    constraint="required",
+                                    value=scalar_val,
+                                    rule_reason=rule.reason,
+                                    message=_format_violation_message(
+                                        f"Required argument {scalar_path!r} must not be empty",
+                                        rule.reason,
+                                    ),
+                                )
+                            )
+                            continue
                     _evaluate_rule_value(
                         tool_name=tool_name,
                         rule=rule,

@@ -78,12 +78,28 @@ def _write_temp_session_file(journal_dir: Path, session_id: str) -> Path:
         raise
 
 
+def _create_session_file_excl(target: Path, session_id: str) -> bool:
+    """Create ``target`` atomically with ``O_CREAT | O_EXCL``; return True if created."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(target, flags, 0o644)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(f"{session_id}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return True
+
+
 def ensure_persisted_session(db_path: Path, *, prefix: str = "sess") -> str:
     """Return `<journal_dir>/current-session`, creating it atomically if absent.
 
-    Uses atomic temp-file + hardlink (create-if-absent) so concurrent proxy/wrapper
-    startups in a fresh workspace converge on the exact same session ID and readers
-    never observe a partially written file.
+    Uses atomic temp-file + hardlink (create-if-absent) with ``O_CREAT | O_EXCL``
+    fallback so concurrent proxy/wrapper startups in a fresh workspace converge on
+    the exact same session ID and readers never observe a partially written file.
     """
     existing = read_current_session(db_path)
     if existing is not None:
@@ -106,12 +122,21 @@ def ensure_persisted_session(db_path: Path, *, prefix: str = "sess") -> str:
             winner = read_current_session(db_path)
             if winner is not None:
                 return winner
-            # Existing file was empty/corrupt — replace atomically with our valid candidate.
+            # Existing file is empty/corrupt: try atomic unlink + O_CREAT|O_EXCL retry.
+            with suppress(OSError):
+                target.unlink(missing_ok=True)
+            if _create_session_file_excl(target, candidate):
+                return candidate
+            winner = read_current_session(db_path)
+            if winner is not None:
+                return winner
             os.replace(tmp_path, target)
             tmp_path = None  # type: ignore[assignment]
             return candidate
         except OSError:
-            # Filesystem without hardlink support: fall back to atomic replace.
+            # Filesystem without hardlink support: use atomic O_CREAT|O_EXCL create-if-absent.
+            if _create_session_file_excl(target, candidate):
+                return candidate
             winner = read_current_session(db_path)
             if winner is not None:
                 return winner
@@ -175,8 +200,8 @@ def resolve_session_id(
     Precedence:
       1. Explicit argument (``cli``)
       2. ``SIDEFX_SESSION_ID`` environment variable (``env:SIDEFX_SESSION_ID``)
-      3. ``CLAUDE_CODE_SESSION_ID`` environment variable (``env:CLAUDE_CODE_SESSION_ID``)
-      4. ``config.default_session_id`` (``config``)
+      3. ``config.default_session_id`` (``config``)
+      4. ``CLAUDE_CODE_SESSION_ID`` environment variable (``env:CLAUDE_CODE_SESSION_ID``)
       5. Persisted ``<journal_dir>/current-session`` (``file``)
       6. Ephemeral random ID when ``create=True`` and ``db_path is None`` (``ephemeral``),
          otherwise ``(None, "none")``.
@@ -189,14 +214,14 @@ def resolve_session_id(
     if env_sidefx is not None:
         return env_sidefx, f"env:{ENV_SESSION_ID}"
 
-    env_claude = _validate_session_id(os.environ.get(ENV_CLAUDE_CODE_SESSION_ID))
-    if env_claude is not None:
-        return env_claude, f"env:{ENV_CLAUDE_CODE_SESSION_ID}"
-
     if config is not None:
         cfg_session = _validate_session_id(config.default_session_id)
         if cfg_session is not None:
             return cfg_session, "config"
+
+    env_claude = _validate_session_id(os.environ.get(ENV_CLAUDE_CODE_SESSION_ID))
+    if env_claude is not None:
+        return env_claude, f"env:{ENV_CLAUDE_CODE_SESSION_ID}"
 
     if db_path is not None:
         if create:

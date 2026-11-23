@@ -278,11 +278,26 @@ def _check_claude_code_hook(
     if settings_path_override is not None:
         candidates.append(Path(str(settings_path_override)).expanduser())
     else:
-        candidates.append(cwd / DEFAULT_CLAUDE_SETTINGS_PATH)
+        for rel in (
+            DEFAULT_CLAUDE_SETTINGS_PATH,
+            Path(".claude") / "settings.local.json",
+            Path("hooks") / "hooks.json",
+        ):
+            candidates.append(cwd / rel)
+        plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
+        if plugin_root:
+            plugin_hooks = Path(plugin_root) / "hooks" / "hooks.json"
+            if plugin_hooks not in candidates:
+                candidates.append(plugin_hooks)
         try:
-            home_settings = Path.home() / DEFAULT_CLAUDE_SETTINGS_PATH
-            if home_settings not in candidates:
-                candidates.append(home_settings)
+            home = Path.home()
+            for rel in (
+                DEFAULT_CLAUDE_SETTINGS_PATH,
+                Path(".claude") / "settings.local.json",
+            ):
+                home_settings = home / rel
+                if home_settings not in candidates:
+                    candidates.append(home_settings)
         except RuntimeError:
             pass
 
