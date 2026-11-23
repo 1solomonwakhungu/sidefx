@@ -9,9 +9,11 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
@@ -23,6 +25,7 @@ from typing import Any, BinaryIO
 from sidefx.config import MAX_TIMEOUT_SECONDS, SidefxConfig, load_config
 from sidefx.guidance import OUTCOME_UNKNOWN_BANNER as OUTCOME_UNKNOWN_BANNER
 from sidefx.guidance import (
+    mcp_initialize_instructions,
     outcome_unknown_data,
     outcome_unknown_message,
     payload_mismatch_message,
@@ -43,8 +46,9 @@ from sidefx.journal import (
     resolve_db_path,
 )
 from sidefx.preflight import ToolKind, evaluate_preflight
+from sidefx.session import ENV_SESSION_ID as ENV_SESSION_ID
+from sidefx.session import resolve_session_id
 
-ENV_SESSION_ID = "SIDEFX_SESSION_ID"
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024  # 16 MiB per newline-delimited JSON-RPC frame
 _MAX_TIMED_OUT_HISTORY = 10_000
 _MAX_CONFIRMED_CACHE_ENTRIES = 256
@@ -114,6 +118,7 @@ class _InFlightMutation:
     marker: str
     tool_name: str
     attempt: int
+    upstream_gen: int = 0
     timer: threading.Timer | None = None
     settled: bool = False
 
@@ -339,15 +344,304 @@ def _result_with_replay_notice(record: ActionRecord, cached_bytes: bytes | None)
     return result
 
 
+_PYTHON_EXE_RE = re.compile(r"^python(?:\d+(?:\.\d+)*)?(?:\.exe)?$", re.IGNORECASE)
+_TARGET_LABEL_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_GENERIC_SCRIPT_STEMS = frozenset({"__main__", "index", "main"})
+_GENERIC_PARENT_DIRS = frozenset({"", ".", "..", "src", "dist", "build", "bin", "lib", "out"})
+
+
+def _sanitize_target_label(raw: str) -> str:
+    cleaned = _TARGET_LABEL_UNSAFE_RE.sub("-", raw.strip()).strip("-.")
+    return cleaned[:48]
+
+
+def _extract_npm_package_label(token: str) -> str:
+    """Extract readable package name from npm specifiers like ``@scope/server-github@1.2``."""
+    spec = token.strip()
+    if spec.startswith("@") and "/" in spec:
+        # Scoped package: @scope/pkg or @scope/pkg@version
+        _, after_scope = spec.split("/", 1)
+        name = after_scope.split("@", 1)[0]
+    else:
+        name = spec.split("@", 1)[0]
+    return _sanitize_target_label(name)
+
+
+def _extract_uv_package_label(token: str) -> str:
+    """Extract readable package name from uv/uvx specifiers like ``pkg[extra]==1.0``."""
+    spec = token.strip()
+    if "://" in spec:
+        tail = spec.rstrip("/").rsplit("/", 1)[-1]
+        if tail.endswith(".git"):
+            tail = tail[:-4]
+        return _sanitize_target_label(tail)
+    name = re.split(r"[@\[=<>!~;]", spec, maxsplit=1)[0]
+    return _sanitize_target_label(name)
+
+
+def _extract_script_label(token: str) -> str:
+    """Extract a readable label from a script path like ``/path/to/my-mcp/index.js``."""
+    p = Path(token)
+    stem = p.stem
+    if stem.lower() in _GENERIC_SCRIPT_STEMS:
+        parent = p.parent.name
+        if parent and parent.lower() not in _GENERIC_PARENT_DIRS:
+            return _sanitize_target_label(parent)
+    return _sanitize_target_label(stem or p.name)
+
+
+def _extract_readable_target_label(upstream_cmd: Sequence[str], *, _depth: int = 0) -> str:
+    """Unwrap common MCP launcher commands into a readable target label."""
+    if not upstream_cmd or _depth > 3:
+        return "upstream"
+
+    base = Path(upstream_cmd[0]).name.strip() or "upstream"
+    lower_base = base.lower()
+    args = list(upstream_cmd[1:])
+
+    # 1. npx / pnpx / bunx / pnpm dlx / yarn dlx / npm exec
+    if lower_base in ("npx", "npx.cmd", "pnpx", "bunx"):
+        return _extract_npx_label(args) or _sanitize_target_label(base) or "upstream"
+    if lower_base in ("pnpm", "pnpm.cmd", "yarn", "yarn.cmd") and args and args[0] == "dlx":
+        return _extract_npx_label(args[1:]) or _sanitize_target_label(base) or "upstream"
+    if lower_base in ("npm", "npm.cmd") and args and args[0] == "exec":
+        return _extract_npx_label(args[1:]) or _sanitize_target_label(base) or "upstream"
+
+    # 2. uvx
+    if lower_base in ("uvx", "uvx.exe"):
+        label = _extract_uvx_label(args)
+        return label or _sanitize_target_label(base) or "upstream"
+
+    # 3. uv run <subcommand ...>
+    if lower_base in ("uv", "uv.exe"):
+        idx = 0
+        uv_global_val_flags = {"--directory", "--project", "-C", "--config-file", "--cache-dir"}
+        while idx < len(args) and args[idx].startswith("-"):
+            tok = args[idx]
+            idx += 2 if tok in uv_global_val_flags else 1
+        if idx < len(args) and args[idx] == "run":
+            run_args = args[idx + 1 :]
+            r_idx = 0
+            uv_run_val_flags = {
+                "--with",
+                "--with-editable",
+                "--with-requirements",
+                "--directory",
+                "--project",
+                "-C",
+                "--python",
+                "-p",
+                "--package",
+                "--extra",
+                "--group",
+                "--only-group",
+                "--env-file",
+                "--index-url",
+                "--extra-index-url",
+            }
+            while r_idx < len(run_args):
+                tok = run_args[r_idx]
+                if tok == "--":
+                    r_idx += 1
+                    break
+                if tok in uv_run_val_flags:
+                    r_idx += 2
+                    continue
+                if tok.startswith("-"):
+                    r_idx += 1
+                    continue
+                break
+            if r_idx < len(run_args):
+                return _extract_readable_target_label(run_args[r_idx:], _depth=_depth + 1)
+
+    # 4. python / python3 / python3.x
+    if _PYTHON_EXE_RE.match(lower_base):
+        idx = 0
+        py_val_flags = {"-X", "-W"}
+        while idx < len(args):
+            tok = args[idx]
+            if tok == "--":
+                idx += 1
+                break
+            if tok == "-m" and idx + 1 < len(args):
+                mod = args[idx + 1].strip()
+                if mod.endswith(".__main__"):
+                    mod = mod[: -len(".__main__")]
+                return _sanitize_target_label(mod) or _sanitize_target_label(base) or "upstream"
+            if tok == "-c":
+                return _sanitize_target_label(base) or "upstream"
+            if tok in py_val_flags:
+                idx += 2
+                continue
+            if tok.startswith("-"):
+                idx += 1
+                continue
+            return _extract_script_label(tok) or _sanitize_target_label(base) or "upstream"
+        return _sanitize_target_label(base) or "upstream"
+
+    # 5. node / bun / deno
+    if lower_base in ("node", "node.exe", "bun", "bun.exe", "deno", "deno.exe"):
+        idx = 0
+        if lower_base.startswith(("deno", "bun")) and idx < len(args) and args[idx] == "run":
+            idx += 1
+        js_val_flags = {
+            "-r",
+            "--require",
+            "--loader",
+            "--import",
+            "--env-file",
+            "--conditions",
+            "-C",
+            "-c",
+            "--config",
+            "--import-map",
+            "--lock",
+            "--cwd",
+        }
+        while idx < len(args):
+            tok = args[idx]
+            if tok == "--":
+                idx += 1
+                break
+            if tok in ("-e", "--eval", "-p", "--print"):
+                return _sanitize_target_label(base) or "upstream"
+            if tok in js_val_flags:
+                idx += 2
+                continue
+            if tok.startswith("-"):
+                idx += 1
+                continue
+            return _extract_script_label(tok) or _sanitize_target_label(base) or "upstream"
+        return _sanitize_target_label(base) or "upstream"
+
+    # 6. docker / podman run ... <image>
+    if lower_base in ("docker", "podman") and args and args[0] == "run":
+        idx = 1
+        docker_val_flags = {
+            "-e",
+            "--env",
+            "--env-file",
+            "-v",
+            "--volume",
+            "--mount",
+            "-p",
+            "--publish",
+            "--network",
+            "--name",
+            "-w",
+            "--workdir",
+            "-u",
+            "--user",
+            "--platform",
+            "--entrypoint",
+            "-l",
+            "--label",
+            "--pull",
+        }
+        while idx < len(args):
+            tok = args[idx]
+            if tok == "--":
+                idx += 1
+                break
+            if tok in docker_val_flags:
+                idx += 2
+                continue
+            if tok.startswith("-"):
+                idx += 1
+                continue
+            image_no_digest = tok.split("@", 1)[0]
+            tail = image_no_digest.rsplit("/", 1)[-1]
+            image_name = tail.split(":", 1)[0]
+            return _sanitize_target_label(image_name) or _sanitize_target_label(base) or "upstream"
+
+    return _sanitize_target_label(base) or "upstream"
+
+
+def _extract_npx_label(args: Sequence[str]) -> str:
+    val_flags = {"-p", "--package", "-c", "--call", "--prefix", "--cache"}
+    pkg_from_flag: str | None = None
+    idx = 0
+    while idx < len(args):
+        tok = args[idx]
+        if tok == "--":
+            idx += 1
+            if idx < len(args):
+                return _extract_npm_package_label(args[idx])
+            break
+        if tok in ("-p", "--package") and idx + 1 < len(args):
+            if pkg_from_flag is None:
+                pkg_from_flag = args[idx + 1]
+            idx += 2
+            continue
+        if tok.startswith("--package="):
+            if pkg_from_flag is None:
+                pkg_from_flag = tok.split("=", 1)[1]
+            idx += 1
+            continue
+        if tok in val_flags:
+            idx += 2
+            continue
+        if tok.startswith("-"):
+            idx += 1
+            continue
+        return _extract_npm_package_label(tok)
+    if pkg_from_flag:
+        return _extract_npm_package_label(pkg_from_flag)
+    return ""
+
+
+def _extract_uvx_label(args: Sequence[str]) -> str:
+    val_flags = {
+        "--from",
+        "--with",
+        "--with-editable",
+        "--with-requirements",
+        "--python",
+        "-p",
+        "--index-url",
+        "--extra-index-url",
+        "--directory",
+        "--project",
+        "-C",
+    }
+    from_pkg: str | None = None
+    idx = 0
+    while idx < len(args):
+        tok = args[idx]
+        if tok == "--":
+            idx += 1
+            if idx < len(args):
+                return _extract_uv_package_label(args[idx])
+            break
+        if tok == "--from" and idx + 1 < len(args):
+            from_pkg = args[idx + 1]
+            idx += 2
+            continue
+        if tok.startswith("--from="):
+            from_pkg = tok.split("=", 1)[1]
+            idx += 1
+            continue
+        if tok in val_flags:
+            idx += 2
+            continue
+        if tok.startswith("-"):
+            idx += 1
+            continue
+        return _extract_uv_package_label(tok)
+    if from_pkg:
+        return _extract_uv_package_label(from_pkg)
+    return ""
+
+
 def _default_target_from_cmd(upstream_cmd: Sequence[str]) -> str:
-    """Derive a deterministic target identifier from the full upstream command."""
+    """Derive a readable, deterministic target identifier from the full upstream command."""
     if not upstream_cmd:
         return "mcp:upstream"
-    base = Path(upstream_cmd[0]).name.strip() or "upstream"
+    label = _extract_readable_target_label(upstream_cmd)
     cmd_digest = hashlib.sha256(
         json.dumps(list(upstream_cmd), separators=(",", ":"), ensure_ascii=True).encode("ascii")
     ).hexdigest()[:8]
-    return f"mcp:{base}:{cmd_digest}"
+    return f"mcp:{label}:{cmd_digest}"
 
 
 def _derive_deterministic_action_id(
@@ -391,6 +685,48 @@ def _coerce_reconcile_hook_result(raw: Any) -> ReconcileHookResult | None:
     )
 
 
+def _kill_upstream_tree(proc: subprocess.Popen[bytes], pgid: int | None) -> bool:
+    """Terminate an upstream process and its entire POSIX process group.
+
+    Returns ``True`` only when the process tree is confirmed dead (so callers
+    can safely release in-flight duplicate-dispatch guards).
+    """
+    if os.name == "posix" and pgid is not None:
+        with contextlib.suppress(OSError):
+            os.killpg(pgid, signal.SIGTERM)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=0.3)
+        with contextlib.suppress(OSError):
+            os.killpg(pgid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while True:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                # macOS returns EPERM transiently while a process group still holds unreaped
+                # zombies before transitioning to ESRCH; keep polling until the deadline.
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+
+    if proc.poll() is None:
+        with contextlib.suppress(OSError):
+            proc.terminate()
+        try:
+            proc.wait(timeout=0.3)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                proc.wait(timeout=1.0)
+    return proc.poll() is not None
+
+
 class MCPProxy:
     """Transparent stdio JSON-RPC 2.0 MCP proxy with write-ahead journaling."""
 
@@ -405,6 +741,8 @@ class MCPProxy:
         target: str | None = None,
         timeout_seconds: float | None = None,
         deterministic_ids: bool = False,
+        inject_instructions: bool = True,
+        restart_on_timeout: bool = False,
         reconciler_hook: ReconcilerHook | None = None,
         client_in: BinaryIO | None = None,
         client_out: BinaryIO | None = None,
@@ -416,13 +754,17 @@ class MCPProxy:
         self._upstream_cmd = [str(part) for part in upstream_cmd]
         self._journal = journal
         self._config = config if config is not None else SidefxConfig()
-        # Precedence matches --db: explicit CLI/arg > SIDEFX_SESSION_ID env > config > random.
-        self._session_id = (
-            session_id
-            or os.environ.get(ENV_SESSION_ID, "").strip()
-            or self._config.default_session_id
-            or f"mcp-{uuid.uuid4().hex[:12]}"
+        # Precedence: explicit arg > SIDEFX_SESSION_ID > CLAUDE_CODE_SESSION_ID > config >
+        # persisted `<journal_dir>/current-session` (stable across restarts) > ephemeral.
+        resolved_session, _ = resolve_session_id(
+            explicit=session_id,
+            config=self._config,
+            db_path=self._journal.db_path,
+            create=True,
+            fallback_prefix="mcp",
         )
+        assert resolved_session is not None
+        self._session_id = resolved_session
         self._actor = actor or self._config.default_actor
         self._target = target or _default_target_from_cmd(self._upstream_cmd)
         timeout = (
@@ -437,6 +779,8 @@ class MCPProxy:
             raise ValueError(f"timeout_seconds must be <= {int(MAX_TIMEOUT_SECONDS)}")
         self._timeout_seconds = timeout_float
         self._deterministic_ids = bool(deterministic_ids)
+        self._inject_instructions = bool(inject_instructions)
+        self._restart_on_timeout = bool(restart_on_timeout)
         self._reconciler_hook = reconciler_hook
         self._client_in: BinaryIO = client_in if client_in is not None else sys.stdin.buffer
         self._client_out: BinaryIO = client_out if client_out is not None else sys.stdout.buffer
@@ -452,13 +796,25 @@ class MCPProxy:
         self._pending_cond = threading.Condition(self._state_lock)
 
         self._pending_mutations: dict[str, _InFlightMutation] = {}
+        self._pending_passthrough: dict[tuple[type, Any], tuple[Any, int]] = {}
         self._timed_out_upstream_ids: OrderedDict[str, _TimedOutMutation] = OrderedDict()
+        self._pending_init_ids: set[tuple[type, Any]] = set()
+        self._internal_waiters: dict[str, tuple[threading.Event, list[dict[str, Any]]]] = {}
         self._confirmed_cache: OrderedDict[tuple[str, str, str], bytes] = OrderedDict()
         self._confirmed_cache_bytes = 0
         self._active_finalizers = 0
+        self._upstream_generation = 0
         self._upstream_closed = False
+        self._needs_health_check = False
         self._reader_fatal_error = False
         self._proc: subprocess.Popen[bytes] | None = None
+        self._proc_pgid: int | None = None
+        self._reader_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
+        self._saw_initialize = False
+        self._cached_init_params: dict[str, Any] = {}
+        self._saw_initialized_notif = False
+        self._cached_initialized_msg: dict[str, Any] | None = None
 
     @property
     def session_id(self) -> str:
@@ -628,6 +984,8 @@ class MCPProxy:
             entry.settled = True
             self._pending_mutations.pop(upstream_id, None)
             self._record_timed_out_entry_locked(entry)
+            if self._restart_on_timeout:
+                self._needs_health_check = True
             self._active_finalizers += 1
 
         try:
@@ -903,16 +1261,83 @@ class MCPProxy:
                 self._active_finalizers -= 1
                 self._pending_cond.notify_all()
 
-    def _fail_all_inflight_on_upstream_eof(self) -> None:
+    def _is_internal_upstream_id(self, msg_id: Any) -> bool:
+        return isinstance(msg_id, str) and msg_id.startswith(f"__sidefx_{self._proxy_nonce}_")
+
+    def _dispatch_internal_waiter(self, msg_id: Any, msg: dict[str, Any], generation: int) -> bool:
+        if not isinstance(msg_id, str):
+            return False
+        with self._state_lock:
+            if generation != self._upstream_generation:
+                return False
+            waiter = self._internal_waiters.pop(msg_id, None)
+        if waiter is None:
+            return False
+        event, box = waiter
+        box.append(msg)
+        event.set()
+        return True
+
+    def _maybe_inject_init_instructions(self, msg_id: Any, msg: dict[str, Any]) -> dict[str, Any]:
+        key = _rpc_id_key(msg_id)
+        with self._state_lock:
+            if key not in self._pending_init_ids:
+                return msg
+            self._pending_init_ids.discard(key)
+
+        if not self._inject_instructions:
+            return msg
+        result = msg.get("result")
+        if not isinstance(result, dict):
+            return msg
+
+        existing = result.get("instructions")
+        if existing is not None and not isinstance(existing, str):
+            return msg
+
+        guidance = mcp_initialize_instructions(deterministic_ids=self._deterministic_ids)
+        updated_result = dict(result)
+        if isinstance(existing, str) and existing.strip():
+            updated_result["instructions"] = f"{existing.rstrip()}\n\n{guidance}"
+        else:
+            updated_result["instructions"] = guidance
+        updated_msg = dict(msg)
+        updated_msg["result"] = updated_result
+        return updated_msg
+
+    def _fail_orphaned_passthrough(self, orphaned_ids: list[Any], *, reason: str) -> None:
+        for cid in orphaned_ids:
+            self._send_client_message(
+                _jsonrpc_error_response(
+                    cid,
+                    ERR_UPSTREAM_UNAVAILABLE,
+                    f"Upstream MCP server unavailable: {reason}",
+                    data={"kind": "upstream_unavailable"},
+                )
+            )
+
+    def _fail_all_inflight_on_upstream_eof(self, generation: int) -> None:
         with self._pending_cond:
-            self._upstream_closed = True
+            is_current = generation == self._upstream_generation
+            if is_current:
+                self._upstream_closed = True
+                for event, _box in self._internal_waiters.values():
+                    event.set()
+                self._internal_waiters.clear()
+                self._pending_init_ids.clear()
             orphaned: list[_InFlightMutation] = []
-            for entry in self._pending_mutations.values():
-                if not entry.settled:
+            for uid, entry in list(self._pending_mutations.items()):
+                if entry.upstream_gen == generation and not entry.settled:
                     entry.settled = True
                     orphaned.append(entry)
-            self._pending_mutations.clear()
-            self._timed_out_upstream_ids.clear()
+                    self._pending_mutations.pop(uid, None)
+            orphaned_passthrough: list[Any] = []
+            for pkey, (cid, pgen) in list(self._pending_passthrough.items()):
+                if pgen == generation:
+                    orphaned_passthrough.append(cid)
+                    self._pending_passthrough.pop(pkey, None)
+            if is_current:
+                self._timed_out_upstream_ids.clear()
             self._active_finalizers += 1
 
         try:
@@ -941,12 +1366,14 @@ class MCPProxy:
                     status=ActionStatus.UNKNOWN,
                     detail=detail,
                 )
+            if orphaned_passthrough:
+                self._fail_orphaned_passthrough(orphaned_passthrough, reason=detail)
         finally:
             with self._pending_cond:
                 self._active_finalizers -= 1
                 self._pending_cond.notify_all()
 
-    def _upstream_reader_loop(self, upstream_stdout: BinaryIO) -> None:
+    def _upstream_reader_loop(self, upstream_stdout: BinaryIO, generation: int) -> None:
         try:
             while True:
                 raw_line, overflowed = self._read_framed_line(upstream_stdout)
@@ -964,16 +1391,36 @@ class MCPProxy:
                     self._log_err(f"ignored non-JSON line from upstream stdout: {exc}")
                     continue
 
+                with self._state_lock:
+                    if generation != self._upstream_generation:
+                        continue
+
                 try:
                     if isinstance(msg, dict) and "method" not in msg and "id" in msg:
                         msg_id = msg["id"]
+                        if self._dispatch_internal_waiter(msg_id, msg, generation):
+                            continue
                         if isinstance(msg_id, str) and self._handle_upstream_response_for_mutation(
                             msg_id, msg
                         ):
                             continue
+                        if self._is_internal_upstream_id(msg_id):
+                            # Never leak unmatched proxy-internal JSON-RPC IDs to the client.
+                            self._log_err(
+                                f"dropped unmatched internal upstream response id={msg_id!r}"
+                            )
+                            continue
+                        with self._state_lock:
+                            if generation != self._upstream_generation:
+                                continue
+                            self._pending_passthrough.pop(_rpc_id_key(msg_id), None)
+                        msg = self._maybe_inject_init_instructions(msg_id, msg)
 
                     # Passthrough response, notification, or server-initiated request.
                     if isinstance(msg, dict):
+                        with self._state_lock:
+                            if generation != self._upstream_generation:
+                                continue
                         self._send_client_message(msg)
                     else:
                         self._log_err("ignored non-object JSON message from upstream stdout")
@@ -981,13 +1428,17 @@ class MCPProxy:
                     self._log_err(f"error processing upstream message: {exc}")
         except Exception as exc:
             with self._state_lock:
-                self._reader_fatal_error = True
-            self._log_err(f"fatal error in upstream reader thread: {exc}")
-            if self._proc is not None and self._proc.poll() is None:
-                with contextlib.suppress(OSError):
-                    self._proc.terminate()
+                is_current = generation == self._upstream_generation
+                if is_current:
+                    self._reader_fatal_error = True
+                proc = self._proc if is_current else None
+            if is_current:
+                self._log_err(f"fatal error in upstream reader thread: {exc}")
+                if proc is not None and proc.poll() is None:
+                    with contextlib.suppress(OSError):
+                        proc.terminate()
         finally:
-            self._fail_all_inflight_on_upstream_eof()
+            self._fail_all_inflight_on_upstream_eof(generation)
 
     def _stderr_pump_loop(self, upstream_stderr: BinaryIO) -> None:
         write_failed = False
@@ -1151,6 +1602,7 @@ class MCPProxy:
         target_key = _rpc_id_key(params["requestId"])
         mapped_upstream_id: str | None = None
         with self._state_lock:
+            self._pending_passthrough.pop(target_key, None)
             for entry in self._pending_mutations.values():
                 if entry.has_client_id and _rpc_id_key(entry.client_id) == target_key:
                     mapped_upstream_id = entry.upstream_id
@@ -1368,6 +1820,7 @@ class MCPProxy:
                 upstream_dead = True
             else:
                 upstream_dead = False
+                entry.upstream_gen = self._upstream_generation
                 self._pending_mutations[upstream_id] = entry
 
         if upstream_dead:
@@ -1541,17 +1994,288 @@ class MCPProxy:
                 )
             return
 
+        tracked_key: tuple[type, Any] | None = None
         with self._state_lock:
             dead = self._upstream_closed
-        if (dead or not self._write_upstream_bytes(serialized)) and has_client_id:
-            self._send_client_message(
-                _jsonrpc_error_response(
-                    client_id,
-                    ERR_UPSTREAM_UNAVAILABLE,
-                    "Upstream MCP server is unavailable",
-                    data={"kind": "upstream_unavailable"},
+            if not dead and has_client_id and isinstance(msg.get("method"), str):
+                tracked_key = _rpc_id_key(client_id)
+                self._pending_passthrough[tracked_key] = (client_id, self._upstream_generation)
+        if dead or not self._write_upstream_bytes(serialized):
+            if tracked_key is not None:
+                with self._state_lock:
+                    self._pending_passthrough.pop(tracked_key, None)
+            if has_client_id:
+                self._send_client_message(
+                    _jsonrpc_error_response(
+                        client_id,
+                        ERR_UPSTREAM_UNAVAILABLE,
+                        "Upstream MCP server is unavailable",
+                        data={"kind": "upstream_unavailable"},
+                    )
                 )
+
+    def _spawn_upstream(self) -> bool:
+        """Spawn the upstream MCP subprocess in its own process group and start reader threads."""
+        stderr_pipe = subprocess.PIPE if self._err_stream is not None else None
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": stderr_pipe,
+            "env": self._upstream_env,
+        }
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+        try:
+            proc = subprocess.Popen(self._upstream_cmd, **popen_kwargs)
+        except OSError as exc:
+            self._log_err(f"failed to launch upstream command {self._upstream_cmd[0]!r}: {exc}")
+            with self._pending_cond:
+                self._upstream_closed = True
+                self._proc = None
+                self._proc_pgid = None
+                self._pending_cond.notify_all()
+            return False
+
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+
+        pgid: int | None = None
+        if os.name == "posix":
+            try:
+                pgid = os.getpgid(proc.pid)
+            except OSError:
+                pgid = proc.pid
+
+        with self._pending_cond:
+            self._upstream_generation += 1
+            gen = self._upstream_generation
+            self._proc = proc
+            self._proc_pgid = pgid
+            self._upstream_closed = False
+
+        reader_thread = threading.Thread(
+            target=self._upstream_reader_loop,
+            args=(proc.stdout, gen),
+            name=f"sidefx-mcp-upstream-reader-{gen}",
+            daemon=True,
+        )
+        reader_thread.start()
+
+        stderr_thread: threading.Thread | None = None
+        if proc.stderr is not None:
+            stderr_thread = threading.Thread(
+                target=self._stderr_pump_loop,
+                args=(proc.stderr,),
+                name=f"sidefx-mcp-upstream-stderr-{gen}",
+                daemon=True,
             )
+            stderr_thread.start()
+
+        with self._state_lock:
+            self._reader_thread = reader_thread
+            self._stderr_thread = stderr_thread
+        return True
+
+    def _send_internal_request(
+        self,
+        method: str,
+        params: dict[str, Any] | None,
+        *,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        """Send an internal JSON-RPC request to upstream and wait for its reply."""
+        internal_id = self._next_upstream_id()
+        event = threading.Event()
+        box: list[dict[str, Any]] = []
+        with self._state_lock:
+            if self._upstream_closed:
+                return None
+            self._internal_waiters[internal_id] = (event, box)
+
+        req: dict[str, Any] = {"jsonrpc": "2.0", "id": internal_id, "method": method}
+        if params is not None:
+            req["params"] = params
+        if not self._write_upstream_bytes(_serialize_message(req)):
+            with self._state_lock:
+                self._internal_waiters.pop(internal_id, None)
+            return None
+
+        event.wait(timeout=timeout)
+        with self._state_lock:
+            self._internal_waiters.pop(internal_id, None)
+        return box[0] if box else None
+
+    def _restart_upstream(self) -> None:
+        """Terminate a wedged upstream process tree, spawn a fresh one, and replay handshake."""
+        with self._pending_cond:
+            old_proc = self._proc
+            old_pgid = self._proc_pgid
+            old_gen = self._upstream_generation
+            old_reader = self._reader_thread
+            old_stderr = self._stderr_thread
+            old_timed_out_keys = list(self._timed_out_upstream_ids.keys())
+            # Bump generation BEFORE killing old_proc so its reader's EOF handler ignores it.
+            self._upstream_generation += 1
+            self._proc = None
+            self._proc_pgid = None
+            self._pending_init_ids.clear()
+            for event, _box in self._internal_waiters.values():
+                event.set()
+            self._internal_waiters.clear()
+            orphaned: list[_InFlightMutation] = []
+            for uid, entry in list(self._pending_mutations.items()):
+                if entry.upstream_gen == old_gen and not entry.settled:
+                    entry.settled = True
+                    orphaned.append(entry)
+                    self._pending_mutations.pop(uid, None)
+            orphaned_passthrough: list[Any] = []
+            for pkey, (cid, pgen) in list(self._pending_passthrough.items()):
+                if pgen == old_gen:
+                    orphaned_passthrough.append(cid)
+                    self._pending_passthrough.pop(pkey, None)
+            self._active_finalizers += 1
+
+        try:
+            detail = "upstream MCP server was restarted after becoming unresponsive"
+            for entry in orphaned:
+                if entry.timer is not None:
+                    entry.timer.cancel()
+                try:
+                    self._journal.mark_unknown(
+                        self._actor,
+                        self._target,
+                        entry.action_id,
+                        attempt=entry.attempt,
+                        error=detail,
+                    )
+                except (StaleAttemptError, InvalidStateTransitionError, JournalError) as exc:
+                    self._log_err(
+                        f"failed to mark restarted orphaned action {entry.action_id} unknown: {exc}"
+                    )
+                self._send_outcome_unknown(
+                    has_client_id=entry.has_client_id,
+                    client_id=entry.client_id,
+                    action_id=entry.action_id,
+                    marker=entry.marker,
+                    tool_name=entry.tool_name,
+                    status=ActionStatus.UNKNOWN,
+                    detail=detail,
+                )
+            if orphaned_passthrough:
+                self._fail_orphaned_passthrough(orphaned_passthrough, reason=detail)
+        finally:
+            with self._pending_cond:
+                self._active_finalizers -= 1
+                self._pending_cond.notify_all()
+
+        tree_dead = True
+        if old_proc is not None:
+            with self._upstream_write_lock:
+                if old_proc.stdin is not None:
+                    with contextlib.suppress(OSError):
+                        old_proc.stdin.close()
+            tree_dead = _kill_upstream_tree(old_proc, old_pgid)
+            if old_reader is not None:
+                old_reader.join(timeout=0.5)
+            if old_stderr is not None:
+                old_stderr.join(timeout=0.5)
+            # Never close a pipe while a reader thread is still blocked on readline/read.
+            if old_proc.stdout is not None and (old_reader is None or not old_reader.is_alive()):
+                with contextlib.suppress(OSError):
+                    old_proc.stdout.close()
+            if old_proc.stderr is not None and (old_stderr is None or not old_stderr.is_alive()):
+                with contextlib.suppress(OSError):
+                    old_proc.stderr.close()
+
+        # Release the in-flight timed-out duplicate guard ONLY once the old tree is confirmed dead.
+        if tree_dead:
+            with self._state_lock:
+                for uid in old_timed_out_keys:
+                    self._timed_out_upstream_ids.pop(uid, None)
+        else:
+            self._log_err(
+                "could not confirm previous upstream process tree exited; keeping duplicate guard"
+            )
+
+        if not self._spawn_upstream():
+            return
+
+        # Transparently replay the MCP initialize + notifications/initialized handshake.
+        if self._saw_initialize:
+            reinit_timeout = max(5.0, min(30.0, self._timeout_seconds))
+            reinit_resp = self._send_internal_request(
+                "initialize", self._cached_init_params, timeout=reinit_timeout
+            )
+            if reinit_resp is None or (
+                isinstance(reinit_resp, dict) and reinit_resp.get("error") is not None
+            ):
+                self._log_err(
+                    "restarted upstream MCP server failed initialize handshake; shutting it down"
+                )
+                with self._pending_cond:
+                    failed_proc = self._proc
+                    failed_pgid = self._proc_pgid
+                    failed_reader = self._reader_thread
+                    failed_stderr = self._stderr_thread
+                    self._upstream_generation += 1
+                    self._upstream_closed = True
+                    self._proc = None
+                    self._proc_pgid = None
+                    self._pending_cond.notify_all()
+                if failed_proc is not None:
+                    with self._upstream_write_lock:
+                        if failed_proc.stdin is not None:
+                            with contextlib.suppress(OSError):
+                                failed_proc.stdin.close()
+                    _kill_upstream_tree(failed_proc, failed_pgid)
+                    if failed_reader is not None:
+                        failed_reader.join(timeout=0.5)
+                    if failed_stderr is not None:
+                        failed_stderr.join(timeout=0.5)
+                    if failed_proc.stdout is not None and (
+                        failed_reader is None or not failed_reader.is_alive()
+                    ):
+                        with contextlib.suppress(OSError):
+                            failed_proc.stdout.close()
+                    if failed_proc.stderr is not None and (
+                        failed_stderr is None or not failed_stderr.is_alive()
+                    ):
+                        with contextlib.suppress(OSError):
+                            failed_proc.stderr.close()
+                return
+            if self._saw_initialized_notif:
+                notif = self._cached_initialized_msg or {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                }
+                self._write_upstream_bytes(_serialize_message(notif))
+
+    def _ensure_upstream_healthy(self) -> None:
+        """Probe upstream after a timeout and restart it if it is wedged."""
+        if not self._restart_on_timeout:
+            return
+        with self._state_lock:
+            if not self._needs_health_check or self._upstream_closed:
+                return
+            if not self._timed_out_upstream_ids:
+                # Late reply already arrived, proving upstream is responsive.
+                self._needs_health_check = False
+                return
+
+        probe_timeout = min(1.0, max(0.1, self._timeout_seconds))
+        probe_resp = self._send_internal_request("ping", {}, timeout=probe_timeout)
+        if probe_resp is not None:
+            with self._state_lock:
+                self._needs_health_check = False
+            return
+
+        self._log_err(
+            "upstream MCP server is unresponsive after timeout; restarting to prevent poisoning "
+            "subsequent calls"
+        )
+        self._restart_upstream()
+        with self._state_lock:
+            self._needs_health_check = False
 
     def _handle_client_line(self, raw_line: bytes, overflowed: bool) -> None:
         if overflowed:
@@ -1593,11 +2317,24 @@ class MCPProxy:
         method = msg.get("method")
 
         try:
+            if method != "notifications/cancelled":
+                self._ensure_upstream_healthy()
+
             if method == "tools/call":
                 self._handle_tools_call(msg, has_client_id=has_client_id, client_id=client_id)
                 return
 
-            if method == "notifications/cancelled":
+            if method == "initialize":
+                raw_params = msg.get("params")
+                self._saw_initialize = True
+                self._cached_init_params = dict(raw_params) if isinstance(raw_params, dict) else {}
+                if has_client_id:
+                    with self._state_lock:
+                        self._pending_init_ids.add(_rpc_id_key(client_id))
+            elif method == "notifications/initialized":
+                self._saw_initialized_notif = True
+                self._cached_initialized_msg = dict(msg)
+            elif method == "notifications/cancelled":
                 msg = self._translate_cancelled_notification(msg)
 
             # Pass through protocol methods, notifications, and client replies to server requests.
@@ -1629,40 +2366,8 @@ class MCPProxy:
 
     def run(self) -> int:
         """Spawn the upstream MCP server and proxy stdio JSON-RPC messages until EOF."""
-        stderr_pipe = subprocess.PIPE if self._err_stream is not None else None
-        try:
-            proc = subprocess.Popen(
-                self._upstream_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=stderr_pipe,
-                env=self._upstream_env,
-            )
-        except OSError as exc:
-            self._log_err(f"failed to launch upstream command {self._upstream_cmd[0]!r}: {exc}")
+        if not self._spawn_upstream():
             return 1
-
-        self._proc = proc
-        assert proc.stdin is not None
-        assert proc.stdout is not None
-
-        reader_thread = threading.Thread(
-            target=self._upstream_reader_loop,
-            args=(proc.stdout,),
-            name="sidefx-mcp-upstream-reader",
-            daemon=True,
-        )
-        reader_thread.start()
-
-        stderr_thread: threading.Thread | None = None
-        if proc.stderr is not None:
-            stderr_thread = threading.Thread(
-                target=self._stderr_pump_loop,
-                args=(proc.stderr,),
-                name="sidefx-mcp-upstream-stderr",
-                daemon=True,
-            )
-            stderr_thread.start()
 
         try:
             while True:
@@ -1671,17 +2376,12 @@ class MCPProxy:
                     break
                 self._handle_client_line(raw_line, overflowed)
         finally:
-            self._shutdown(proc, reader_thread, stderr_thread)
+            self._shutdown()
 
         with self._state_lock:
             return 1 if self._reader_fatal_error else 0
 
-    def _shutdown(
-        self,
-        proc: subprocess.Popen[bytes],
-        reader_thread: threading.Thread,
-        stderr_thread: threading.Thread | None,
-    ) -> None:
+    def _shutdown(self) -> None:
         # Wait for in-flight intercepted mutations AND active timer/response finalizers
         # to finish writing SQLite and client responses before closing upstream stdin.
         with self._pending_cond:
@@ -1689,30 +2389,32 @@ class MCPProxy:
                 self._pending_mutations and not self._upstream_closed
             ) or self._active_finalizers > 0:
                 self._pending_cond.wait(timeout=0.5)
+            proc = self._proc
+            pgid = self._proc_pgid
+            reader_thread = self._reader_thread
+            stderr_thread = self._stderr_thread
 
-        # Signal clean EOF to upstream stdin.
-        with self._upstream_write_lock:
-            if proc.stdin is not None:
-                with contextlib.suppress(OSError):
-                    proc.stdin.close()
+        if proc is not None:
+            # Signal clean EOF to upstream stdin.
+            with self._upstream_write_lock:
+                if proc.stdin is not None:
+                    with contextlib.suppress(OSError):
+                        proc.stdin.close()
 
-        # Allow upstream to finish sending any queued passthrough responses and exit cleanly.
-        reader_thread.join(timeout=_SHUTDOWN_GRACE_SECONDS)
+            # Allow upstream to finish sending any queued passthrough responses and exit cleanly.
+            if reader_thread is not None:
+                reader_thread.join(timeout=_SHUTDOWN_GRACE_SECONDS)
 
-        if proc.poll() is None:
-            try:
-                proc.wait(timeout=_SHUTDOWN_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                proc.terminate()
+            if proc.poll() is None:
                 try:
                     proc.wait(timeout=_SHUTDOWN_GRACE_SECONDS)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                    _kill_upstream_tree(proc, pgid)
 
-        reader_thread.join(timeout=_SHUTDOWN_GRACE_SECONDS)
-        if stderr_thread is not None:
-            stderr_thread.join(timeout=1.0)
+            if reader_thread is not None:
+                reader_thread.join(timeout=_SHUTDOWN_GRACE_SECONDS)
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=1.0)
 
         # Cancel any leftover timers and wait for any racing finalizer before returning.
         with self._pending_cond:
@@ -1723,12 +2425,13 @@ class MCPProxy:
             while self._active_finalizers > 0:
                 self._pending_cond.wait(timeout=0.5)
 
-        if proc.stdout is not None:
-            with contextlib.suppress(OSError):
-                proc.stdout.close()
-        if proc.stderr is not None:
-            with contextlib.suppress(OSError):
-                proc.stderr.close()
+        if proc is not None:
+            if proc.stdout is not None and (reader_thread is None or not reader_thread.is_alive()):
+                with contextlib.suppress(OSError):
+                    proc.stdout.close()
+            if proc.stderr is not None and (stderr_thread is None or not stderr_thread.is_alive()):
+                with contextlib.suppress(OSError):
+                    proc.stderr.close()
 
 
 def _positive_finite_float(raw: str) -> float:
@@ -1799,6 +2502,27 @@ def build_mcp_proxy_parser() -> argparse.ArgumentParser:
             "(session_id, tool_name, arguments) when no explicit key is supplied."
         ),
     )
+    parser.add_argument(
+        "--no-inject-instructions",
+        dest="inject_instructions",
+        action="store_false",
+        default=True,
+        help=(
+            "Pass through upstream MCP initialize result.instructions verbatim without "
+            "appending sidefx protocol guidance."
+        ),
+    )
+    parser.add_argument(
+        "--restart-on-timeout",
+        dest="restart_on_timeout",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Restart a wedged upstream MCP server after a call times out and replay the "
+            "initialize handshake transparently (opt-in; default: disabled so slow-but-healthy "
+            "serial servers can finish and reconcile late replies)."
+        ),
+    )
     return parser
 
 
@@ -1840,5 +2564,7 @@ def handle_mcp_proxy_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
             target=parsed.target,
             timeout_seconds=parsed.timeout,
             deterministic_ids=parsed.deterministic_ids,
+            inject_instructions=parsed.inject_instructions,
+            restart_on_timeout=parsed.restart_on_timeout,
         )
         return proxy.run()

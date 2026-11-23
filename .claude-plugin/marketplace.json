@@ -1,0 +1,25 @@
+{
+  "name": "sidefx",
+  "owner": {
+    "name": "Solomon Wakhungu",
+    "url": "https://github.com/1solomonwakhungu"
+  },
+  "metadata": {
+    "description": "Outbound effects journal, transparent stdio MCP proxy, CLI mutation wrapper, crash reconciler, and ground-truth session receipts for AI agents.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "sidefx",
+      "source": "./",
+      "description": "Write-ahead effects journal, MCP proxy, CLI mutation wrapper, crash reconciler, and Stop-hook session receipts for Claude Code.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Solomon Wakhungu"
+      },
+      "homepage": "https://github.com/1solomonwakhungu/sidefx",
+      "repository": "https://github.com/1solomonwakhungu/sidefx",
+      "license": "MIT"
+    }
+  ]
+}

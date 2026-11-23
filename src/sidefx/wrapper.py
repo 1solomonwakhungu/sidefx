@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -34,6 +35,7 @@ from sidefx.journal import (
 from sidefx.reconcilers import (
     DEFAULT_GITHUB_API_URL,
     ENV_GITHUB_API_URL,
+    GitPushSpec,
     Reconciler,
     ReconcileResult,
     ReconcileState,
@@ -46,8 +48,9 @@ from sidefx.reconcilers import (
     inspect_git_push,
     reconcile_action,
 )
-from sidefx.reconcilers.git_push import redact_remote_for_display
+from sidefx.reconcilers.git_push import _resolve_push_endpoint, redact_remote_for_display
 from sidefx.reconcilers.github import _is_loopback_host, parse_github_repo
+from sidefx.session import resolve_session_id
 
 DEFAULT_MIN_RETRY_AGE_SECONDS = 5.0
 EXIT_PAYLOAD_MISMATCH = 2
@@ -485,6 +488,306 @@ def _inspect_curl_command(
     return url, meta, exec_argv, is_gh_post
 
 
+_GH_DETERMINISTIC_SUBCOMMANDS = frozenset(
+    {
+        ("issue", "create"),
+        ("pr", "create"),
+        ("issue", "comment"),
+        ("pr", "comment"),
+    }
+)
+_GH_NORMALIZABLE_EQ_FLAGS = frozenset(
+    {"--repo", "--title", "--body", "--body-file", "--base", "--head"}
+)
+_GH_DYNAMIC_RANDOM_FLAGS = frozenset(
+    {"-f", "--fill", "--fill-first", "--fill-verbose", "-w", "--web", "-e", "--editor"}
+)
+_MAX_GH_BODY_FILE_BYTES = 4 * 1024 * 1024  # 4 MiB cap when hashing --body-file
+
+
+_GH_VALUE_FLAGS = frozenset(
+    {
+        "-R",
+        "--repo",
+        "-t",
+        "--title",
+        "-b",
+        "--body",
+        "-F",
+        "--body-file",
+        "-a",
+        "--assignee",
+        "-l",
+        "--label",
+        "-m",
+        "--milestone",
+        "-p",
+        "--project",
+        "-B",
+        "--base",
+        "-H",
+        "--head",
+        "-r",
+        "--reviewer",
+        "-T",
+        "--template",
+    }
+)
+
+
+def _normalize_gh_argv(cmd: Sequence[str]) -> list[str]:
+    """Normalize a ``gh issue|pr create|comment`` argv for deterministic action ID derivation."""
+    normalized: list[str] = ["gh", cmd[1].lower(), cmd[2].lower()]
+    idx = 3
+    after_double_dash = False
+    while idx < len(cmd):
+        tok = cmd[idx]
+        if after_double_dash:
+            normalized.append(tok)
+            idx += 1
+            continue
+        if tok == "--":
+            after_double_dash = True
+            normalized.append(tok)
+            idx += 1
+            continue
+        if tok in ("-R", "--repo") and idx + 1 < len(cmd):
+            normalized.extend(["-R", cmd[idx + 1]])
+            idx += 2
+            continue
+        if tok in ("-F", "--body-file") and idx + 1 < len(cmd):
+            normalized.extend(["-F", cmd[idx + 1]])
+            idx += 2
+            continue
+        if tok in ("-H", "--head") and idx + 1 < len(cmd):
+            normalized.extend(["-H", cmd[idx + 1]])
+            idx += 2
+            continue
+        if tok in _GH_VALUE_FLAGS and idx + 1 < len(cmd):
+            # Preserve the flag value verbatim so values like `-Fx` are never rewritten as flags.
+            normalized.extend([tok, cmd[idx + 1]])
+            idx += 2
+            continue
+        if tok.startswith("-R="):
+            normalized.extend(["-R", tok.split("=", 1)[1]])
+            idx += 1
+            continue
+        if tok.startswith("-R") and len(tok) > 2:
+            normalized.extend(["-R", tok[2:]])
+            idx += 1
+            continue
+        if tok.startswith("--repo="):
+            normalized.extend(["-R", tok.split("=", 1)[1]])
+            idx += 1
+            continue
+        if tok.startswith("-F") and len(tok) > 2:
+            normalized.extend(["-F", tok[2:].lstrip("=")])
+            idx += 1
+            continue
+        if tok.startswith("--body-file="):
+            normalized.extend(["-F", tok.split("=", 1)[1]])
+            idx += 1
+            continue
+        if tok.startswith("-H") and len(tok) > 2:
+            normalized.extend(["-H", tok[2:].lstrip("=")])
+            idx += 1
+            continue
+        if tok.startswith("--head="):
+            normalized.extend(["-H", tok.split("=", 1)[1]])
+            idx += 1
+            continue
+        if "=" in tok:
+            flag, val = tok.split("=", 1)
+            if flag in _GH_NORMALIZABLE_EQ_FLAGS:
+                normalized.extend([flag, val])
+                idx += 1
+                continue
+        normalized.append(tok)
+        idx += 1
+    return normalized
+
+
+def _resolve_git_head_identity(cwd: Path) -> tuple[str | None, str | None]:
+    """Return ``(branch_or_none, head_sha_or_none)`` for ``cwd``."""
+    branch: str | None = None
+    head_sha: str | None = None
+    try:
+        b_proc = subprocess.run(
+            ["git", "symbolic-ref", "-q", "--short", "HEAD"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        if b_proc.returncode == 0 and b_proc.stdout.strip():
+            branch = b_proc.stdout.strip()
+        s_proc = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        if s_proc.returncode == 0 and s_proc.stdout.strip():
+            head_sha = s_proc.stdout.strip().lower()
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    return branch, head_sha
+
+
+def _derive_gh_auto_context(
+    cmd: Sequence[str],
+    *,
+    session_id: str,
+    cwd: Path,
+) -> tuple[str, dict[str, Any]] | None:
+    """Derive ``(action_id, extra_payload_fields)`` for safe ``gh`` writes, or ``None``.
+
+    Falls back to ``None`` (caller generates a random ID) when content is dynamic or
+    unhashable (``--fill``/``-f``, ``--web``, ``--editor``, ``--body-file -`` stdin,
+    unreadable ``--body-file``, or ``gh pr create`` without ``--head`` outside a valid git HEAD).
+    """
+    if len(cmd) < 3:
+        return None
+    exe = os.path.basename(cmd[0]).lower()
+    if exe not in ("gh", "gh.exe"):
+        return None
+    sub1, sub2 = cmd[1].lower(), cmd[2].lower()
+    if (sub1, sub2) not in _GH_DETERMINISTIC_SUBCOMMANDS:
+        return None
+
+    norm = _normalize_gh_argv(cmd)
+    has_head_flag = False
+    has_positional_selector = False
+    body_file_digests: list[str] = []
+
+    idx = 3
+    while idx < len(norm):
+        tok = norm[idx]
+        if tok == "--":
+            if idx + 1 < len(norm):
+                has_positional_selector = True
+            break
+        if tok in _GH_DYNAMIC_RANDOM_FLAGS:
+            return None
+        if (
+            tok.startswith("-")
+            and not tok.startswith("--")
+            and len(tok) > 2
+            and not tok.startswith(("-R", "-F", "-H", "-t", "-b", "-B"))
+            and (set(tok[1:]) & {"f", "w", "e"})
+        ):
+            return None
+        if tok == "-H" and idx + 1 < len(norm):
+            has_head_flag = True
+            idx += 2
+            continue
+        if tok == "-F" and idx + 1 < len(norm):
+            body_path_raw = norm[idx + 1]
+            if body_path_raw == "-":
+                return None
+            body_path = Path(body_path_raw).expanduser()
+            if not body_path.is_absolute():
+                body_path = cwd / body_path
+            try:
+                if not body_path.is_file() or body_path.stat().st_size > _MAX_GH_BODY_FILE_BYTES:
+                    return None
+                content_digest = hashlib.sha256(body_path.read_bytes()).hexdigest()
+            except OSError:
+                return None
+            body_file_digests.append(content_digest)
+            idx += 2
+            continue
+        if tok in _GH_VALUE_FLAGS:
+            idx += 2
+            continue
+        if tok.startswith("-"):
+            idx += 1
+            continue
+        has_positional_selector = True
+        idx += 1
+
+    extra: dict[str, Any] = {}
+    if body_file_digests:
+        extra["body_file_sha256"] = body_file_digests
+
+    needs_branch_context = (sub1 == "pr" and sub2 == "create" and not has_head_flag) or (
+        sub1 == "pr" and sub2 == "comment" and not has_positional_selector
+    )
+    if needs_branch_context:
+        branch, head_sha = _resolve_git_head_identity(cwd)
+        if not branch and not head_sha:
+            return None
+        extra["pr_head_branch"] = branch
+        extra["pr_head_sha"] = head_sha
+
+    encoded = json.dumps(
+        ["sidefx-cli-gh-v2", session_id, norm, extra],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return f"gh-{sub1}-{sub2}-{hashlib.sha256(encoded).hexdigest()[:16]}", extra
+
+
+def _git_push_has_set_upstream(cmd: Sequence[str]) -> bool:
+    """Return True if ``git push`` arguments include ``-u`` / ``--set-upstream``."""
+    try:
+        push_idx = list(cmd).index("push")
+    except ValueError:
+        return False
+    for tok in cmd[push_idx + 1 :]:
+        if tok == "--":
+            break
+        if tok in ("-u", "--set-upstream"):
+            return True
+        if (
+            tok.startswith("-")
+            and not tok.startswith("--")
+            and not tok.startswith("-o")
+            and "u" in tok[1:]
+        ):
+            return True
+    return False
+
+
+def _resolved_git_push_endpoint(push_spec: GitPushSpec) -> str | None:
+    if not push_spec.remote:
+        return None
+    repo_cwd = Path(push_spec.cwd) if push_spec.cwd else Path.cwd()
+    endpoint = _resolve_push_endpoint(push_spec.remote, cwd=repo_cwd)
+    return redact_remote_for_display(endpoint)
+
+
+def _derive_git_push_action_id(
+    push_spec: GitPushSpec,
+    *,
+    session_id: str,
+    disambiguator: str | None = None,
+) -> str | None:
+    endpoint = _resolved_git_push_endpoint(push_spec)
+    if endpoint and push_spec.remote_ref and push_spec.expected_sha:
+        parts: list[Any] = [
+            "sidefx-cli-git-push-v2",
+            endpoint,
+            push_spec.remote_ref,
+            push_spec.expected_sha.lower(),
+        ]
+        if disambiguator is not None:
+            parts.append(disambiguator)
+        encoded = json.dumps(parts, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        return f"git-push-{hashlib.sha256(encoded).hexdigest()[:16]}"
+    if push_spec.is_delete and endpoint and push_spec.remote_ref:
+        parts = ["sidefx-cli-git-push-delete-v2", session_id, endpoint, push_spec.remote_ref]
+        if disambiguator is not None:
+            parts.append(disambiguator)
+        encoded = json.dumps(parts, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        return f"git-push-del-{hashlib.sha256(encoded).hexdigest()[:16]}"
+    return None
+
+
 def _build_command_plan(
     cmd: Sequence[str],
     *,
@@ -496,6 +799,10 @@ def _build_command_plan(
     github_api_url: str | None = None,
     probe_git_remote: bool = True,
     probe_timeout_seconds: float = 15.0,
+    pre_inspected_push: GitPushSpec | None = None,
+    use_normalized_gh_payload: bool = False,
+    gh_extra_payload: dict[str, Any] | None = None,
+    use_normalized_git_push_payload: bool = False,
 ) -> _CommandPlan:
     if not cmd:
         raise ValueError("Wrapped command must not be empty")
@@ -553,11 +860,13 @@ def _build_command_plan(
                 meta["repo"] = repo
             if issue_number is not None:
                 meta["issue_number"] = issue_number
-            payload = {
-                "argv": orig_argv,
+            payload: dict[str, Any] = {
+                "argv": _normalize_gh_argv(orig_argv) if use_normalized_gh_payload else orig_argv,
                 "target": target,
                 "tool_name": tool_name,
             }
+            if use_normalized_gh_payload and gh_extra_payload:
+                payload.update(gh_extra_payload)
             return _CommandPlan(
                 tool_name=tool_name,
                 target=target,
@@ -597,11 +906,15 @@ def _build_command_plan(
         )
 
     # 2. `git push`
-    push_spec = inspect_git_push(
-        cmd,
-        cwd=cwd,
-        probe_remote=probe_git_remote,
-        timeout_seconds=probe_timeout_seconds,
+    push_spec = (
+        pre_inspected_push
+        if pre_inspected_push is not None
+        else inspect_git_push(
+            cmd,
+            cwd=cwd,
+            probe_remote=probe_git_remote,
+            timeout_seconds=probe_timeout_seconds,
+        )
     )
     if push_spec is not None:
         tool_name = explicit_tool.strip() if explicit_tool else "git_push"
@@ -616,15 +929,25 @@ def _build_command_plan(
             if explicit_target and explicit_target.strip()
             else default_target
         )
-        payload: dict[str, Any] = {
-            "argv": orig_argv,
-            "target": target,
-            "tool_name": tool_name,
-            "remote": safe_remote,
-            "remote_ref": push_spec.remote_ref,
-            "expected_sha": push_spec.expected_sha,
-            "is_delete": push_spec.is_delete,
-        }
+        if use_normalized_git_push_payload:
+            payload = {
+                "endpoint": _resolved_git_push_endpoint(push_spec),
+                "target": target,
+                "tool_name": tool_name,
+                "remote_ref": push_spec.remote_ref,
+                "expected_sha": push_spec.expected_sha,
+                "is_delete": push_spec.is_delete,
+            }
+        else:
+            payload = {
+                "argv": orig_argv,
+                "target": target,
+                "tool_name": tool_name,
+                "remote": safe_remote,
+                "remote_ref": push_spec.remote_ref,
+                "expected_sha": push_spec.expected_sha,
+                "is_delete": push_spec.is_delete,
+            }
         return _CommandPlan(
             tool_name=tool_name,
             target=target,
@@ -921,6 +1244,7 @@ def wrap_command(
     *,
     journal: Journal,
     action_id: str | None = None,
+    random_action_id: bool = False,
     session_id: str = "default",
     actor: str = "agent",
     target: str | None = None,
@@ -956,11 +1280,40 @@ def wrap_command(
         raise ValueError("timeout_seconds must be > 0")
     if isinstance(min_retry_age_seconds, bool) or min_retry_age_seconds < 0:
         raise ValueError("min_retry_age_seconds must be >= 0")
+    if action_id is not None and random_action_id:
+        raise ValueError("Cannot specify both action_id and random_action_id")
 
     effective_cwd = (cwd if cwd is not None else Path.cwd()).resolve()
-    resolved_action_id = action_id.strip() if action_id else f"cli-{uuid.uuid4().hex[:16]}"
-    if not resolved_action_id:
-        raise ValueError("action_id must not be empty")
+    probe_timeout = min(timeout_seconds, 15.0)
+    pre_push_spec: GitPushSpec | None = None
+
+    auto_gh_id = False
+    gh_extra_payload: dict[str, Any] | None = None
+    auto_git_push_id = False
+    if action_id is not None:
+        resolved_action_id = action_id.strip()
+        if not resolved_action_id:
+            raise ValueError("action_id must not be empty")
+    elif random_action_id:
+        resolved_action_id = f"cli-{uuid.uuid4().hex[:16]}"
+    else:
+        gh_auto = _derive_gh_auto_context(cmd, session_id=session_id, cwd=effective_cwd)
+        derived_id: str | None = None
+        if gh_auto is not None:
+            derived_id, gh_extra_payload = gh_auto
+            auto_gh_id = True
+        else:
+            pre_push_spec = inspect_git_push(
+                cmd,
+                cwd=effective_cwd,
+                probe_remote=True,
+                timeout_seconds=probe_timeout,
+            )
+            if pre_push_spec is not None:
+                derived_id = _derive_git_push_action_id(pre_push_spec, session_id=session_id)
+                if derived_id is not None:
+                    auto_git_push_id = True
+        resolved_action_id = derived_id or f"cli-{uuid.uuid4().hex[:16]}"
 
     plan = _build_command_plan(
         cmd,
@@ -971,7 +1324,11 @@ def wrap_command(
         cwd=effective_cwd,
         github_api_url=github_api_url,
         probe_git_remote=True,
-        probe_timeout_seconds=min(timeout_seconds, 15.0),
+        probe_timeout_seconds=probe_timeout,
+        pre_inspected_push=pre_push_spec,
+        use_normalized_gh_payload=auto_gh_id,
+        gh_extra_payload=gh_extra_payload,
+        use_normalized_git_push_payload=auto_git_push_id,
     )
 
     summary_str = format_summary_with_meta(plan.display_summary, plan.meta)
@@ -1000,6 +1357,83 @@ def wrap_command(
             executed=False,
             error=payload_mismatch_message(exc, id_source="--action-id", payload_noun="command"),
         )
+
+    # For auto-derived `git push` IDs on REPLAY:
+    #   1. If `before_known` is False (pre-push `ls-remote` probe failed/timed out), refuse
+    #      to blindly replay exit 0 because the remote ref may have moved or been deleted!
+    #   2. If the remote ref has moved/been deleted OR `-u`/`--set-upstream` was requested
+    #      (which has a local git-config side effect even when remote is up to date), execute
+    #      under a disambiguated ID instead of silently skipping.
+    if (
+        begin_res.decision == BeginDecision.REPLAY
+        and auto_git_push_id
+        and pre_push_spec is not None
+    ):
+        if not pre_push_spec.before_known:
+            rec_unverified = begin_res.record
+            msg = (
+                f"OUTCOME UNKNOWN — reconcile before retrying "
+                f"(action_id={rec_unverified.action_id}, marker={rec_unverified.marker}): "
+                "could not verify remote ref via git ls-remote before replaying prior push"
+            )
+            return WrapResult(
+                exit_code=EXIT_OUTCOME_UNKNOWN,
+                action_id=rec_unverified.action_id,
+                marker=rec_unverified.marker,
+                target=rec_unverified.target,
+                tool_name=rec_unverified.tool_name,
+                status=rec_unverified.status,
+                executed=False,
+                error=msg,
+            )
+
+        wants_set_upstream = _git_push_has_set_upstream(cmd)
+        remote_needs_push = (
+            pre_push_spec.before_sha is not None
+            if pre_push_spec.is_delete
+            else pre_push_spec.before_sha != pre_push_spec.expected_sha
+        )
+        if remote_needs_push or wants_set_upstream:
+            disambig = (
+                f"set-upstream:{pre_push_spec.before_sha or 'absent'}"
+                if wants_set_upstream and not remote_needs_push
+                else f"from:{pre_push_spec.before_sha or 'absent'}"
+            )
+            alt_id = _derive_git_push_action_id(
+                pre_push_spec, session_id=session_id, disambiguator=disambig
+            )
+            if alt_id is None:
+                alt_id = f"git-push-{uuid.uuid4().hex[:16]}"
+            alt_marker = derive_marker(actor, plan.target, alt_id)
+            alt_begin = journal.begin_action(
+                action_id=alt_id,
+                session_id=session_id,
+                actor=actor,
+                surface=Surface.CLI,
+                tool_name=plan.tool_name,
+                target=plan.target,
+                payload=plan.payload,
+                marker=alt_marker,
+                summary=summary_str,
+            )
+            if alt_begin.decision == BeginDecision.REPLAY:
+                # Remote moved/deleted a second time or `-u` repeated -> allocate fresh ID.
+                alt_id = f"git-push-{uuid.uuid4().hex[:16]}"
+                alt_marker = derive_marker(actor, plan.target, alt_id)
+                alt_begin = journal.begin_action(
+                    action_id=alt_id,
+                    session_id=session_id,
+                    actor=actor,
+                    surface=Surface.CLI,
+                    tool_name=plan.tool_name,
+                    target=plan.target,
+                    payload=plan.payload,
+                    marker=alt_marker,
+                    summary=summary_str,
+                )
+            resolved_action_id = alt_id
+            expected_marker = alt_marker
+            begin_res = alt_begin
 
     record = begin_res.record
 
@@ -1441,11 +1875,21 @@ def _build_wrap_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", dest="db_path", default=None, help="Path to SQLite journal DB.")
     parser.add_argument("--config", dest="config_path", default=None, help="Path to .sidefx.json.")
     parser.add_argument("--session-id", dest="session_id", default=None, help="Session identifier.")
-    parser.add_argument(
+    id_group = parser.add_mutually_exclusive_group()
+    id_group.add_argument(
         "--action-id",
         dest="action_id",
         default=None,
-        help="Deterministic idempotency action ID (auto-generated if omitted).",
+        help=(
+            "Explicit idempotency action ID (auto-derived deterministically for git push "
+            "and gh issue/pr create/comment when omitted)."
+        ),
+    )
+    id_group.add_argument(
+        "--random-action-id",
+        dest="random_action_id",
+        action="store_true",
+        help="Force a fresh random action ID (for intentional duplicate writes).",
     )
     parser.add_argument(
         "--target",
@@ -1560,13 +2004,14 @@ def handle_wrap_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
     effective_config = load_config(sub_args.config_path) if sub_args.config_path else config
     db_raw = sub_args.db_path or getattr(args, "db_path", None)
     db_path = resolve_db_path(db_raw, config=effective_config)
-    session_id = (
-        sub_args.session_id
-        or getattr(args, "session_id", None)
-        or effective_config.default_session_id
-        or os.environ.get("SIDEFX_SESSION_ID", "").strip()
-        or "default"
+    resolved_session, _ = resolve_session_id(
+        explicit=sub_args.session_id or getattr(args, "session_id", None),
+        config=effective_config,
+        db_path=db_path,
+        create=True,
+        fallback_prefix="sess",
     )
+    session_id = resolved_session or "default"
     actor = sub_args.actor or effective_config.default_actor
     timeout_seconds = (
         sub_args.timeout_seconds
@@ -1579,6 +2024,7 @@ def handle_wrap_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
             cmd_tokens,
             journal=journal,
             action_id=sub_args.action_id,
+            random_action_id=sub_args.random_action_id,
             session_id=session_id,
             actor=actor,
             target=sub_args.target,

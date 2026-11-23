@@ -1,0 +1,15 @@
+{
+  "description": "Report ground-truth sidefx session receipts when mutating side effects occurred.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/sidefx\" hook claude-code"
+          }
+        ]
+      }
+    ]
+  }
+}

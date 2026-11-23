@@ -17,9 +17,10 @@ from typing import Any
 from sidefx.config import CONFIG_FILENAME, ConfigError, SidefxConfig, load_config
 from sidefx.journal import ActionRecord, ActionStatus, Journal, resolve_db_path
 from sidefx.reconcilers.base import parse_summary_meta, sanitize_text
+from sidefx.session import resolve_session_id
 
 DEFAULT_CLAUDE_SETTINGS_PATH = Path(".claude") / "settings.json"
-DEFAULT_STOP_HOOK_COMMAND = "sidefx report --format markdown"
+DEFAULT_STOP_HOOK_COMMAND = "sidefx hook claude-code"
 
 
 def _md_code(text: str) -> str:
@@ -48,6 +49,7 @@ class ReceiptData:
     session_id: str | None
     actions: tuple[ActionRecord, ...]
     counts: dict[ActionStatus, int]
+    other_sessions_unresolved_count: int = 0
 
     @property
     def total(self) -> int:
@@ -83,6 +85,7 @@ class ReceiptData:
             "unresolved_count": (
                 self.counts[ActionStatus.UNKNOWN] + self.counts[ActionStatus.PENDING]
             ),
+            "other_sessions_unresolved_count": self.other_sessions_unresolved_count,
             "groups": {
                 "confirmed": [a.to_dict() for a in self.confirmed],
                 "reconciled": [a.to_dict() for a in self.reconciled],
@@ -106,6 +109,7 @@ def load_receipt_data(
             session_id=session_id,
             actions=(),
             counts={s: 0 for s in ActionStatus},
+            other_sessions_unresolved_count=0,
         )
 
     with Journal.open_readonly(db_path) as journal:
@@ -115,6 +119,13 @@ def load_receipt_data(
                 descending=False,
             )
         )
+        other_unresolved = 0
+        if session_id is not None:
+            all_unresolved = journal.list_actions(
+                status=(ActionStatus.PENDING, ActionStatus.UNKNOWN),
+                descending=False,
+            )
+            other_unresolved = sum(1 for a in all_unresolved if a.session_id != session_id)
     # Derive counts directly from the single snapshot of `actions` so counts and rows
     # are always 100% consistent even under concurrent writes!
     counts: dict[ActionStatus, int] = {s: 0 for s in ActionStatus}
@@ -127,6 +138,7 @@ def load_receipt_data(
         session_id=session_id,
         actions=actions,
         counts=counts,
+        other_sessions_unresolved_count=other_unresolved,
     )
 
 
@@ -166,6 +178,13 @@ def render_receipt_markdown(data: ReceiptData) -> str:
     if data.total == 0:
         lines.append("")
         lines.append("_No side effects recorded._")
+        if data.other_sessions_unresolved_count > 0:
+            lines.append("")
+            lines.append(
+                f"> **Warning:** {data.other_sessions_unresolved_count} unresolved "
+                "(`pending`/`unknown`) action(s) exist in other session(s). "
+                "Run `sidefx report --all` or `sidefx status --status pending --status unknown`."
+            )
         return "\n".join(lines)
 
     sections: tuple[tuple[str, tuple[ActionRecord, ...], bool], ...] = (
@@ -204,6 +223,14 @@ def render_receipt_markdown(data: ReceiptData) -> str:
                 line += f" (marker: {_md_code(rec.marker)})"
             lines.append(line)
 
+    if data.other_sessions_unresolved_count > 0:
+        lines.append("")
+        lines.append(
+            f"> **Warning:** {data.other_sessions_unresolved_count} unresolved "
+            "(`pending`/`unknown`) action(s) exist in other session(s). "
+            "Run `sidefx report --all` or `sidefx status --status pending --status unknown`."
+        )
+
     return "\n".join(lines)
 
 
@@ -237,6 +264,12 @@ def render_receipt_text(data: ReceiptData) -> str:
 
     if data.total == 0:
         lines.append("No side effects recorded.")
+        if data.other_sessions_unresolved_count > 0:
+            lines.append(
+                f"WARNING: {data.other_sessions_unresolved_count} unresolved "
+                "(pending/unknown) action(s) exist in other session(s). "
+                "Run `sidefx report --all` or `sidefx status --status pending --status unknown`."
+            )
         return "\n".join(lines)
 
     sections: tuple[tuple[str, tuple[ActionRecord, ...], bool], ...] = (
@@ -270,6 +303,14 @@ def render_receipt_text(data: ReceiptData) -> str:
                 base += f" [marker={sanitize_text(rec.marker)}]"
             lines.append(base)
 
+    if data.other_sessions_unresolved_count > 0:
+        lines.append("")
+        lines.append(
+            f"WARNING: {data.other_sessions_unresolved_count} unresolved "
+            "(pending/unknown) action(s) exist in other session(s). "
+            "Run `sidefx report --all` or `sidefx status --status pending --status unknown`."
+        )
+
     return "\n".join(lines)
 
 
@@ -300,7 +341,13 @@ def _build_report_parser() -> argparse.ArgumentParser:
         "--session-id",
         dest="session_id",
         default=None,
-        help="Filter receipt to a single session ID.",
+        help="Filter receipt to a single session ID (defaults to active session when present).",
+    )
+    parser.add_argument(
+        "--all",
+        dest="all_sessions",
+        action="store_true",
+        help="Include actions from all sessions in the journal (overrides active-session scoping).",
     )
     parser.add_argument(
         "--format",
@@ -354,8 +401,17 @@ def handle_report_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
 
     effective_config = load_config(sub_args.config_path) if sub_args.config_path else config
     db_raw = sub_args.db_path or getattr(args, "db_path", None)
-    session_id = sub_args.session_id or getattr(args, "session_id", None)
     db_path = resolve_db_path(db_raw, config=effective_config)
+    if sub_args.all_sessions:
+        session_id: str | None = None
+    else:
+        explicit_session = sub_args.session_id or getattr(args, "session_id", None)
+        session_id, _ = resolve_session_id(
+            explicit=explicit_session,
+            config=effective_config,
+            db_path=db_path,
+            create=False,
+        )
 
     data = load_receipt_data(db_path, session_id=session_id)
     print(render_receipt(data, fmt=fmt))
@@ -509,7 +565,7 @@ def handle_init_claude_code_cli(args: argparse.Namespace, config: SidefxConfig) 
         )
         return 2
 
-    cmd_parts = ["sidefx", "report", "--format", "markdown"]
+    cmd_parts = ["sidefx", "hook", "claude-code"]
     db_raw = getattr(args, "db_path", None)
     if db_raw:
         abs_db = str(Path(str(db_raw)).expanduser().resolve())

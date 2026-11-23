@@ -10,9 +10,10 @@ When an AI agent mutates external state (`gh issue create`, `git push`, MCP `too
 `sidefx` places a durable SQLite write-ahead journal (`WAL` + `synchronous=FULL`) in front of mutating MCP and CLI calls:
 
 - **Write-ahead intent log:** Atomically claims `(actor, target, action_id)` as `pending` *before* dispatching any external write. Rejects modified payloads under a reused `action_id` and blocks blind retries with `OUTCOME UNKNOWN — reconcile before retrying`.
+- **Automatic MCP protocol guidance & timeout recovery:** Appends concise `sidefx` protocol instructions to MCP `initialize` responses automatically, persists a stable workspace session across proxy restarts, and restarts wedged single-threaded MCP servers after timeout without poisoning later unrelated calls.
 - **Read-only crash reconciliation:** Recovers lost URLs/refs after response-loss crashes or timeouts (GitHub Issues/PRs/Comments via embedded `<!-- sidefx:id=<marker> -->` comment markers, and `git push` via read-only `git ls-remote`) instead of double-posting.
-- **Deterministic preflight guardrails:** Enforces `.sidefx.json` numeric caps (`min`/`max`), string allowlists/denylists, and domain allowlists/denylists before any upstream tool is called.
-- **Ground-truth receipts:** Renders compact Markdown, plain-text, or JSON receipts strictly from SQLite rows via `sidefx report` (and integrates directly with Claude Code's `Stop` hook).
+- **Deterministic preflight guardrails:** Enforces `.sidefx.json` required arguments (`required: true`), numeric caps (`min`/`max`), string allowlists/denylists, and domain allowlists/denylists before any upstream tool is called.
+- **Ground-truth receipts:** Renders compact Markdown, plain-text, or JSON receipts strictly from SQLite rows via `sidefx report` and integrates cleanly with Claude Code's `Stop` hook (`sidefx hook claude-code` — silent when 0 side effects occurred, loud warning on unresolved actions).
 
 **Zero LLM calls. Zero third-party runtime dependencies. Pure Python standard library (`>=3.11`).**
 
@@ -31,15 +32,15 @@ cd your-repo && sidefx init                                      # 2. write .sid
 { "command": "sidefx", "args": ["mcp-proxy", "--deterministic-ids", "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "."] }
 ```
 
-4. Wrap mutating shell commands with a stable action ID:
+4. Wrap mutating shell commands (`git push` and `gh issue/pr create/comment` derive deterministic action IDs automatically):
 
 ```bash
-sidefx wrap --action-id push-feat-retries -- git push origin feat/retries
+sidefx wrap -- git push origin feat/retries
 ```
 
-5. Check what happened with `sidefx status` or `sidefx report`.
+5. Check what happened with `sidefx status` or `sidefx report`, and verify your setup with `sidefx doctor`.
 
-The journal lives in `.sidefx/journal.db` next to `.sidefx.json`. `sidefx` writes a `.gitignore` into that directory when it creates it, so `git add -A` never picks the journal up.
+The journal lives in `.sidefx/journal.db` next to `.sidefx.json`, and the active session ID is persisted in `.sidefx/current-session`. `sidefx` writes a `.gitignore` into that directory when it creates it, so `git add -A` never picks the journal up.
 
 ---
 
@@ -70,6 +71,23 @@ uv sync --dev
 uv run sidefx --version
 ```
 
+### Claude Code Plugin
+
+This repository ships as a Claude Code plugin (`.claude-plugin/plugin.json`, `hooks/hooks.json`, `skills/sidefx/SKILL.md`, and zero-dependency `bin/sidefx` launcher):
+
+```bash
+# Add marketplace & install in Claude Code
+/plugin marketplace add 1solomonwakhungu/sidefx
+/plugin install sidefx@sidefx
+```
+
+Verify your environment, `.sidefx.json`, journal directory, and Claude Code Stop hook anytime with:
+
+```bash
+sidefx doctor
+sidefx doctor --json
+```
+
 ---
 
 ## Drop-In MCP Proxy Setup
@@ -80,10 +98,13 @@ Read-only tools (`get_*`, `list_*`, `read_*`, `search_*`, etc.) and protocol met
 
 Clients can pass an explicit `_sidefx_action_id` (stripped before forwarding to the upstream server) or `idempotency_key`, or enable `--deterministic-ids` for session-scoped deduplication.
 
-How action IDs behave:
+How action IDs, sessions, and proxy recovery behave:
 
-- **`--deterministic-ids`** derives the ID from `(session, tool, arguments)`, so a repeated identical call in the same proxy session is answered from the journal and never re-sent. The repeated result ends with a `[sidefx] Duplicate call not re-sent` notice so the agent knows no second write happened. To repeat a call on purpose, the agent adds a unique `_sidefx_action_id` argument.
-- **The session is one proxy process** unless you pin it with `--session-id` or `SIDEFX_SESSION_ID`. Pin it if you want deduplication to survive a proxy or agent restart.
+- **Automatic protocol instructions:** `sidefx mcp-proxy` intercepts the upstream MCP `initialize` response and appends concise protocol guidance to `result.instructions` (covering `_sidefx_action_id`, duplicate-call notices, and `OUTCOME UNKNOWN` recovery), preserving any existing server instructions. Pass `--no-inject-instructions` to disable this.
+- **`--deterministic-ids`** derives the ID from `(session, tool, arguments)`, so a repeated identical call in the same session is answered from the journal and never re-sent. The repeated result ends with a `[sidefx] Duplicate call not re-sent` notice so the agent knows no second write happened. To repeat a call on purpose, the agent adds a unique `_sidefx_action_id` argument.
+- **Stable sessions across restarts:** Unless `--session-id`, `SIDEFX_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`, or `default_session_id` is set, `sidefx` persists a workspace-scoped session ID in `<journal_dir>/current-session` so deduplication survives proxy restarts. Inspect or rotate it with `sidefx session current` and `sidefx session new`.
+- **Readable default `--target` names:** When `--target` is omitted, wrapper launchers like `npx`, `uvx`, `uv run`, `node`, `python3`, and `docker run` are unwrapped into readable targets (for example, `npx -y @modelcontextprotocol/server-github` becomes `mcp:server-github:<hash>`). You can still pass `--target mcp:github` explicitly for a short fixed name.
+- **Wedged server recovery (`--restart-on-timeout`):** Opt in with `--restart-on-timeout` for single-threaded upstream MCP servers that can wedge permanently past `--timeout`. When enabled, `sidefx` marks the timed-out action `unknown`, probes the server on the next request, terminates the full process group if unresponsive, synthesizes clean errors for any orphaned in-flight requests, and replays the cached `initialize` + `notifications/initialized` handshake transparently so subsequent unrelated calls succeed. (Disabled by default so slow-but-healthy serial servers can finish and reconcile late replies.)
 - **Without `--deterministic-ids` and without an explicit ID**, every call gets a random ID: it is journaled and shows up in receipts, but a retry is not recognized as a duplicate.
 
 ### Claude Code (`.mcp.json` or `~/.claude.json`)
@@ -95,6 +116,8 @@ How action IDs behave:
       "command": "sidefx",
       "args": [
         "mcp-proxy",
+        "--target",
+        "mcp:github",
         "--deterministic-ids",
         "--timeout",
         "30",
@@ -145,6 +168,8 @@ How action IDs behave:
 command = "sidefx"
 args = [
   "mcp-proxy",
+  "--target",
+  "mcp:github",
   "--deterministic-ids",
   "--timeout",
   "30",
@@ -165,30 +190,33 @@ args = [
 
 ## CLI Mutation Wrapper (`sidefx wrap`)
 
-Wrap mutating shell commands (`gh`, `git push`, `curl`, deploy scripts) with `--action-id`, `--target`, and `--timeout`:
+Wrap mutating shell commands (`gh`, `git push`, `curl`, deploy scripts). When `--action-id` is omitted, `sidefx wrap` automatically derives deterministic action IDs for:
+
+- `git push`: derived from `(remote, ref, local_sha)`, so retrying after a timeout reconciles cleanly while pushing a new commit automatically gets a fresh ID.
+- `gh issue create`, `gh pr create`, `gh issue comment`, `gh pr comment`: derived from `(session_id, normalized_argv)`, so retrying the same command reconciles without double-posting.
+
+Pass `--action-id <id>` to pin a custom ID, or `--random-action-id` when you intentionally want a duplicate write.
 
 ### GitHub issues / PRs / comments (`gh`)
 
 ```bash
 sidefx wrap \
-  --action-id issue-fix-retry-loop \
   --timeout 15 \
   -- gh issue create -R acme/app --title "Fix retry loop" --body "Repro steps..."
 ```
 
-- Automatically injects a compact marker `<!-- sidefx:id=<marker> -->` into the outgoing body.
+- Automatically derives a deterministic session-scoped action ID and injects a compact marker `<!-- sidefx:id=<marker> -->` into the outgoing body.
 - If `gh` times out or crashes after the HTTP POST already landed, retrying the same command reconciles via the GitHub REST API (checking both `open` and `closed` items) and returns the exact created URL with **zero duplicate issues**.
 
 ### Git push (`git push`)
 
 ```bash
 sidefx wrap \
-  --action-id push-feat-retries \
   --timeout 20 \
   -- git push origin feat/retries
 ```
 
-- Records the local target commit SHA and pre-push remote ref SHA before pushing.
+- Automatically derives a deterministic action ID from `(remote, ref, local_sha)` and records the local target commit SHA and pre-push remote ref SHA before pushing.
 - On timeout, retrying reconciles via read-only `git ls-remote` and recovers the exact remote ref (`origin refs/heads/feat/retries@<sha12>`) without pushing twice.
 
 ### Webhooks & REST POSTs (`curl`)
@@ -239,9 +267,10 @@ Configure tool classification and deterministic preflight rules in `.sidefx.json
       {
         "tool": "refund_payment",
         "arg": "amount",
+        "required": true,
         "min": 0.01,
         "max": 50,
-        "reason": "Refunds above $50 require human approval"
+        "reason": "Refunds require an amount <= $50 (higher refunds require human approval)"
       },
       {
         "tool": "push_*",
@@ -270,7 +299,8 @@ Configure tool classification and deterministic preflight rules in `.sidefx.json
 Supported rule fields:
 - `tool`: exact tool name, glob pattern (e.g. `push_*`), or `"*"` (default).
 - `arg`: argument key or dotted nested path (e.g. `recipient.email`).
-- Constraints (at least one required): `min`, `max`, `allow`, `deny`, `allow_domains`, `deny_domains`.
+- `required`: boolean (`true` denies the call if `arg` is missing, `null`, or an empty list, preventing omitted-argument bypasses on `min`/`max`/`allow`/`deny` rules).
+- Constraints (at least one of `required: true`, `min`, `max`, `allow`, `deny`, `allow_domains`, `deny_domains` is required).
 - `reason`: optional human-readable explanation returned in the JSON-RPC `-32001` denial error.
 
 ---
@@ -412,7 +442,7 @@ Sample output:
 
 ### Claude Code `Stop` Hook Integration
 
-Print the ready-to-paste Claude Code `Stop` hook snippet (by default it reports all sessions in the journal; pass `--session-id <id>` and/or `--db <path>` to scope the generated hook command):
+Print the ready-to-paste Claude Code `Stop` hook snippet (uses `sidefx hook claude-code`, which reads Claude Code's `Stop` stdin JSON `session_id` and `cwd`, stays completely silent when 0 side effects occurred, and emits structured `{"systemMessage": ...}` JSON only when side effects were recorded—highlighting any `pending`/`unknown` actions loudly):
 
 ```bash
 sidefx init --claude-code
@@ -426,7 +456,7 @@ sidefx init --claude-code
         "hooks": [
           {
             "type": "command",
-            "command": "sidefx report --format markdown"
+            "command": "sidefx hook claude-code"
           }
         ]
       }
@@ -442,6 +472,8 @@ sidefx init --claude-code --write
 # or target a custom settings file:
 sidefx init --claude-code --settings ~/.claude/settings.json
 ```
+
+`sidefx report` scopes automatically to the active session when `<journal_dir>/current-session` (or `SIDEFX_SESSION_ID` / `CLAUDE_CODE_SESSION_ID`) is present; pass `--all` to include every session in the journal or `--session-id <id>` for a specific session.
 
 ---
 

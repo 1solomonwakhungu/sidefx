@@ -165,3 +165,26 @@ def replay_notice(*, tool_name: str, action_id: str, status: str) -> str:
         "To run it again on purpose, repeat the call with a unique `_sidefx_action_id` "
         "string argument."
     )
+
+
+def mcp_initialize_instructions(*, deterministic_ids: bool = False) -> str:
+    """Concise protocol guidance injected into MCP ``initialize`` ``result.instructions``."""
+    dedupe_note = (
+        "Deterministic session deduplication is ON: identical mutating calls are answered from "
+        "the journal and include a `[sidefx] Duplicate call not re-sent` notice instead of "
+        "writing twice. Pass a unique `_sidefx_action_id` string argument (stripped before "
+        "reaching the server) to pin a retry key or to intentionally repeat an identical call."
+        if deterministic_ids
+        else "Pass an optional `_sidefx_action_id` string argument on mutating tool calls "
+        "(stripped before reaching the server) for explicit idempotency across retries or "
+        "intentional repeats. If a repeated call returns a `[sidefx] Duplicate call not re-sent` "
+        "notice, the original result was replayed from the journal without writing again."
+    )
+    return (
+        "[sidefx] Mutating tool calls on this MCP server are protected by sidefx's write-ahead "
+        f"journal. {dedupe_note} "
+        "On `OUTCOME UNKNOWN` (-32002), the write may have landed—do NOT re-send or reword the "
+        "call; check remote state read-only and run `sidefx reconcile` (or "
+        "`sidefx resolve --action-id <id> --landed` / `--not-landed`) before repeating the "
+        "original call unchanged."
+    )

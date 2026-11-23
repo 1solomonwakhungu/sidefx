@@ -1,0 +1,47 @@
+#!/usr/bin/env sh
+set -eu
+
+SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "$SELF_DIR/.." && pwd)"
+
+# 1. Running from a plugin checkout/install with src/sidefx: require Python >= 3.11.
+if [ -d "$REPO_ROOT/src/sidefx" ]; then
+  for py in python3 python3.14 python3.13 python3.12 python3.11; do
+    if command -v "$py" >/dev/null 2>&1; then
+      if "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+        export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+        exec "$py" -m sidefx "$@"
+      fi
+    fi
+  done
+fi
+
+# 2. Look for an installed `sidefx` executable on PATH other than this launcher script.
+SELF_PATH="$SELF_DIR/$(basename -- "$0")"
+OLD_IFS="$IFS"
+IFS=":"
+for dir in $PATH; do
+  [ -n "$dir" ] || dir="."
+  cand="$dir/sidefx"
+  if [ -x "$cand" ] && [ ! -d "$cand" ]; then
+    cand_dir="$(CDPATH= cd -- "$(dirname -- "$cand")" 2>/dev/null && pwd || true)"
+    if [ -n "$cand_dir" ] && [ "$cand_dir/$(basename -- "$cand")" != "$SELF_PATH" ]; then
+      IFS="$OLD_IFS"
+      exec "$cand" "$@"
+    fi
+  fi
+done
+IFS="$OLD_IFS"
+
+# 3. If uv is installed and we are inside the repo checkout, let uv manage Python >= 3.11.
+if [ -f "$REPO_ROOT/pyproject.toml" ] && command -v uv >/dev/null 2>&1; then
+  exec uv run --quiet --project "$REPO_ROOT" sidefx "$@"
+fi
+
+# 4. Fallback to uvx pinned to the upstream git release tag if available.
+if command -v uvx >/dev/null 2>&1; then
+  exec uvx --from "git+https://github.com/1solomonwakhungu/sidefx@v0.1.0" sidefx "$@"
+fi
+
+echo "sidefx: could not locate Python >= 3.11, sidefx on PATH, or uv" >&2
+exit 127
