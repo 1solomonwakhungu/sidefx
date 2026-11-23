@@ -200,6 +200,13 @@ def build_parser() -> argparse.ArgumentParser:
         module_name="sidefx.mcp_proxy",
         func_name="handle_mcp_proxy_cli",
     )
+    _register_passthrough_subcommand(
+        subparsers,
+        name="eval",
+        help_text="Run the automated chaos fault-injection evaluation suite.",
+        module_name="sidefx.chaos",
+        func_name="handle_eval_cli",
+    )
 
     return parser
 
@@ -398,10 +405,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif extras:
         parser.error(f"unrecognized arguments: {' '.join(extras)}")
 
-    skip_config_load = (
-        args.command == "init"
-        and not getattr(args, "claude_code", False)
-        and args.config_path is None
+    skip_config_load = args.config_path is None and (
+        (args.command == "init" and not getattr(args, "claude_code", False))
+        or args.command == "eval"
     )
     if skip_config_load:
         config = SidefxConfig()
