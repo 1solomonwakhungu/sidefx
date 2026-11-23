@@ -24,12 +24,18 @@ from sidefx.config import (
 
 _GLOB_CHARS = frozenset("*?[")
 _DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-_HEX_LITERAL_RE = re.compile(r"^0x[0-9a-f]+$")
+_HEX_LITERAL_RE = re.compile(r"^0x[0-9a-f]*$")
 _CONTROL_OR_WHITESPACE_RE = re.compile(r"[\x00-\x1f\x7f\s]")
 _DISALLOWED_EMAIL_CHARS = frozenset(",;\\()\"'")
+_DISALLOWED_EMAIL_LOCAL_CHARS = frozenset("/?#:")
 _NAMESPACE_SEPARATORS = ("__", ".", ":", "/")
-_COMPOUND_MUTATE_PREFIXES = ("read_write_", "search_replace_")
+_COMPOUND_CONNECTORS = ("and_", "or_", "then_")
+_COMPOUND_DIRECT_MUTATE_VERBS = ("write", "replace", "modify")
+_EXTRA_COMPOUND_MUTATE_VERBS = frozenset(
+    {"replace", "modify", "edit", "upsert", "insert", "drop", "destroy", "publish"}
+)
 _PATH_TRAVERSAL_RE = re.compile(r"(?:^|[/\\])\.\.(?:$|[/\\])")
+_LEADING_SLASHES_RE = re.compile(r"^/+")
 
 
 class ToolKind(StrEnum):
@@ -125,14 +131,14 @@ def _unqualified_tool_suffix(tool_name: str) -> str | None:
     return suffix if suffix else None
 
 
+def _matches_verb_token(text: str, verbs: frozenset[str]) -> bool:
+    return any(text == verb or text.startswith(f"{verb}_") for verb in verbs)
+
+
 def _classify_by_prefixes(
     lower_name: str,
     tools_cfg: ToolClassificationConfig,
 ) -> ToolKind | None:
-    # Check compound read+mutate prefixes first (e.g. `read_write_file`, `search_replace_file`).
-    if any(lower_name.startswith(comp) for comp in _COMPOUND_MUTATE_PREFIXES):
-        return ToolKind.MUTATE
-
     mutate_prefixes_lower = tuple(p.lower() for p in tools_cfg.mutate_prefixes if p)
     read_prefixes_lower = tuple(p.lower() for p in tools_cfg.read_prefixes if p)
 
@@ -146,11 +152,17 @@ def _classify_by_prefixes(
     if best_mutate_len > 0 or best_read_len > 0:
         if best_mutate_len >= best_read_len:
             return ToolKind.MUTATE
-        # Guard against compound names like `fetch_and_send_email` or `get_and_delete_all`.
+        # Guard against compound names like `fetch_and_send_email`, `get_or_create_user`,
+        # `find_and_replace`, `fetch_then_delete`, `read_modify_write`, `read_write_file`.
         rest = lower_name[best_read_len:]
-        if rest.startswith("and_"):
-            after_and = rest[4:]
-            if any(after_and.startswith(mp) for mp in mutate_prefixes_lower):
+        mutate_verbs = (
+            frozenset(p.rstrip("_") for p in mutate_prefixes_lower if p.rstrip("_"))
+            | _EXTRA_COMPOUND_MUTATE_VERBS
+        )
+        if _matches_verb_token(rest, frozenset(_COMPOUND_DIRECT_MUTATE_VERBS)):
+            return ToolKind.MUTATE
+        for conn in _COMPOUND_CONNECTORS:
+            if rest.startswith(conn) and _matches_verb_token(rest[len(conn) :], mutate_verbs):
                 return ToolKind.MUTATE
         return ToolKind.READ
 
@@ -198,17 +210,16 @@ def classify_tool(
     if any(fnmatch.fnmatchcase(tool_name, pat) for pat in glob_read):
         return ToolKind.READ
 
-    # 3. Prefix rules on full name, then on namespace-stripped suffix (e.g. `mcp__gh__delete_repo`).
+    # 3. Prefix rules on both full name and namespace suffix (e.g. `search_api.delete_index`);
+    #    mutate wins across both so a read-prefixed namespace cannot mask a mutating action.
     lower_name = tool_name.lower()
-    prefix_kind = _classify_by_prefixes(lower_name, tools_cfg)
-    if prefix_kind is not None:
-        return prefix_kind
-
+    full_kind = _classify_by_prefixes(lower_name, tools_cfg)
     suffix = _unqualified_tool_suffix(tool_name)
-    if suffix is not None:
-        suffix_kind = _classify_by_prefixes(suffix.lower(), tools_cfg)
-        if suffix_kind is not None:
-            return suffix_kind
+    suffix_kind = _classify_by_prefixes(suffix.lower(), tools_cfg) if suffix is not None else None
+    if full_kind == ToolKind.MUTATE or suffix_kind == ToolKind.MUTATE:
+        return ToolKind.MUTATE
+    if full_kind == ToolKind.READ or suffix_kind == ToolKind.READ:
+        return ToolKind.READ
 
     # 4. Unknown tool policy fallback.
     if tools_cfg.unknown_tool_policy == UnknownToolPolicy.READ:
@@ -372,6 +383,10 @@ def _extract_email_domain(trimmed: str) -> str | None:
         return None
     if local.startswith(".") or local.endswith(".") or ".." in local:
         return None
+    # Reject URL delimiters inside the email local part to prevent URL-vs-email bypasses
+    # like `https:/evil.com/@good.com`, `https:evil.com/@good.com`, or `evil.com/@good.com`.
+    if any(ch in _DISALLOWED_EMAIL_LOCAL_CHARS for ch in local):
+        return None
     # Reject port/path suffixes attached to email domain.
     if ":" in domain or "/" in domain or "?" in domain or "#" in domain:
         return None
@@ -425,22 +440,23 @@ def extract_candidate_domains(raw: str) -> tuple[str, ...] | None:
             return None
 
         candidates: list[str] = [url_host]
-        # If '@' appears outside authority (path/query/fragment), also evaluate email reading.
+        # If '@' appears outside authority (path/query/fragment), also check email-like domain
+        # readings (multi-label domain or IP) while allowing plain `@handle` path segments
+        # such as `https://medium.com/@user/post` or `https://registry.npmjs.org/@scope/pkg`.
         after_authority = f"{parsed.path}?{parsed.query}#{parsed.fragment}"
         if "@" in after_authority:
             for _display, parsed_addr in getaddresses([trimmed]):
                 if "@" in parsed_addr:
                     email_part = parsed_addr.rsplit("@", 1)[1]
-                    # Strip any trailing path/query/fragment from email candidate
                     email_host_raw = re.split(r"[/?#]", email_part, maxsplit=1)[0]
-                    email_host = _normalize_host(email_host_raw)
-                    if email_host is not None and email_host not in candidates:
-                        candidates.append(email_host)
+                    if "." in email_host_raw or ":" in email_host_raw:
+                        email_host = _normalize_host(email_host_raw)
+                        if email_host is not None and email_host not in candidates:
+                            candidates.append(email_host)
         return tuple(candidates)
 
-    # Reject scheme-less protocol-relative URLs without '@' (e.g. //cdn.example.com/x)
-    # and handle `//good.com/@evil.com` strictly via email extraction below.
-    if trimmed.startswith("//") and "@" not in trimmed:
+    # Reject all scheme-less protocol-relative URLs (e.g. //cdn.example.com or //evil.com/@good.com)
+    if trimmed.startswith("//"):
         return None
 
     # Case 2: Email address (plain local@domain or RFC 5322 "Display Name <local@domain>")
@@ -637,11 +653,14 @@ def _evaluate_rule_value(
             if rule.deny:
                 stripped = value.strip()
                 norm_posix = posixpath.normpath(stripped.replace("\\", "/"))
+                collapsed_posix = _LEADING_SLASHES_RE.sub("/", norm_posix)
                 deny_candidates = [value]
                 if stripped != value:
                     deny_candidates.append(stripped)
                 if "/" in stripped or "\\" in stripped:
                     deny_candidates.append(norm_posix)
+                    if collapsed_posix != norm_posix:
+                        deny_candidates.append(collapsed_posix)
                 if any(
                     _string_matches_pattern(cand, pat, case_insensitive=True)
                     for pat in rule.deny

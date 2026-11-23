@@ -143,11 +143,19 @@ class TestClassifyTool:
         [
             ("fetch_and_send_email", ToolKind.MUTATE),
             ("get_and_delete_all", ToolKind.MUTATE),
+            ("get_or_create_user", ToolKind.MUTATE),
+            ("find_and_replace", ToolKind.MUTATE),
+            ("search_and_replace", ToolKind.MUTATE),
+            ("fetch_then_delete", ToolKind.MUTATE),
+            ("read_modify_write", ToolKind.MUTATE),
             ("read_write_file", ToolKind.MUTATE),
             ("search_replace_file", ToolKind.MUTATE),
             ("github.delete_repo", ToolKind.MUTATE),
             ("mcp__gh__delete_repo", ToolKind.MUTATE),
             ("stripe:refund_payment", ToolKind.MUTATE),
+            ("search_api.delete_index", ToolKind.MUTATE),
+            ("fetch_server__delete_repo", ToolKind.MUTATE),
+            ("read_replica:delete_table", ToolKind.MUTATE),
             ("mcp__gh__get_issue", ToolKind.READ),
             ("github.list_repos", ToolKind.READ),
         ],
@@ -175,7 +183,8 @@ class TestExtractDomain:
             ("http://127.0.0.1:8000/api", "127.0.0.1"),
             ("http://[::1]:8000/api", "::1"),
             ("http://[::ffff:127.0.0.1]/api", "127.0.0.1"),
-            ("//good.com/@evil.com", "evil.com"),
+            ("https://medium.com/@user/post", "medium.com"),
+            ("https://registry.npmjs.org/@scope/pkg", "registry.npmjs.org"),
         ],
     )
     def test_valid_extractions(self, raw: str, expected: str) -> None:
@@ -187,8 +196,16 @@ class TestExtractDomain:
             "",
             "   ",
             "//cdn.example.com/asset.js",
+            "//good.com/@evil.com",
+            "//evil.com/@good.com",
+            "https:/evil.com/@good.com",
+            "https:evil.com/@good.com",
+            "evil.com/@good.com",
+            "evil.com?@good.com",
+            "evil.com#@good.com",
             "https://good.com/<a@evil.com>",
             "https://good.com/a@evil.com",
+            "http://0x/",
             "user@evil.com@good.com",
             "a@good.com, b@evil.com",
             "a@good.com; b@evil.com",
@@ -460,11 +477,42 @@ class TestEvaluatePreflightStringsAndDomains:
         )
         for ambiguous in (
             "//good.com/@evil.com",
+            "//evil.com/@good.com",
+            "https:/evil.com/@good.com",
+            "https:evil.com/@good.com",
+            "evil.com/@good.com",
+            "evil.com?@good.com",
+            "evil.com#@good.com",
             "https://good.com/<a@evil.com>",
             "https://good.com/a@evil.com",
         ):
             assert evaluate_preflight("send_email", {"to": ambiguous}, allow_cfg).allowed is False
             assert evaluate_preflight("send_email", {"to": ambiguous}, deny_cfg).allowed is False
+
+        # Ordinary @handle URLs must NOT be over-blocked under allow_domains
+        handle_cfg = SidefxConfig(
+            preflight=PreflightConfig(
+                rules=(
+                    PreflightRule(
+                        tool="fetch_url",
+                        arg="url",
+                        allow_domains=("medium.com", "registry.npmjs.org"),
+                    ),
+                )
+            )
+        )
+        assert (
+            evaluate_preflight(
+                "fetch_url", {"url": "https://medium.com/@user/post"}, handle_cfg
+            ).allowed
+            is True
+        )
+        assert (
+            evaluate_preflight(
+                "fetch_url", {"url": "https://registry.npmjs.org/@scope/pkg"}, handle_cfg
+            ).allowed
+            is True
+        )
 
         # N4: alternate IP encodings blocked against deny_domains
         ip_deny_cfg = SidefxConfig(
@@ -500,12 +548,14 @@ class TestEvaluatePreflightStringsAndDomains:
             assert res.allowed is False
             assert res.violations[0].constraint == "invalid_rule"
 
-        # N7: case-insensitive deny + path traversal blocked on path allowlists
+        # N7: case-insensitive deny + double-slash + path traversal blocked
         str_cfg = SidefxConfig(
             preflight=PreflightConfig(
                 rules=(
                     PreflightRule(tool="push_branch", arg="repo", deny=("myorg/prod",)),
-                    PreflightRule(tool="write_file", arg="path", allow=("/workspace/*",)),
+                    PreflightRule(
+                        tool="write_file", arg="path", allow=("/workspace/*",), deny=("/etc/*",)
+                    ),
                 )
             )
         )
@@ -514,6 +564,7 @@ class TestEvaluatePreflightStringsAndDomains:
             evaluate_preflight("write_file", {"path": "/workspace/../etc/passwd"}, str_cfg).allowed
             is False
         )
+        assert evaluate_preflight("write_file", {"path": "//etc/passwd"}, str_cfg).allowed is False
         assert (
             evaluate_preflight("write_file", {"path": "/workspace/app.py"}, str_cfg).allowed is True
         )

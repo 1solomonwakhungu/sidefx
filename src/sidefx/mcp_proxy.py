@@ -48,8 +48,14 @@ _MAX_SUMMARY_LENGTH = 1000
 _URL_RE = re.compile(r"https?://[^\s<>\"'\]\)]+")
 _RESULT_REF_KEYS = ("result_ref", "url", "html_url", "uri", "id")
 _AMBIGUOUS_ERROR_RE = re.compile(
-    r"\b(?:timed?\s*out|timeout|deadline\s+exceeded|econnreset|connection\s+reset|"
-    r"broken\s+pipe|eof\s+before|504\s+gateway)\b",
+    r"(?:"
+    r"timed?\s*out|timeout|etimedout|esockettimedout|"
+    r"deadline[\s_]*exceeded|"
+    r"econnreset|connection\s+reset|socket\s+hang\s+up|"
+    r"broken\s+pipe|epipe|eof\s+before|unexpected\s+eof|"
+    r"fetch\s+failed|network\s+error|econnaborted|"
+    r"502\s+bad\s+gateway|503\s+service\s+unavailable|504\s+gateway"
+    r")",
     re.IGNORECASE,
 )
 
@@ -1173,9 +1179,19 @@ class MCPProxy:
                 )
             return
 
-        # Read-only calls pass straight through without journaling after preflight passes.
+        # Read-only calls pass straight through without journaling after preflight passes
+        # (stripping any private `_sidefx_*` keys so strict upstream schemas accept them).
         if preflight_res.tool_kind == ToolKind.READ:
-            self._forward_passthrough(msg, has_client_id=has_client_id, client_id=client_id)
+            if len(forwarded_args) != len(tool_args):
+                read_msg = dict(msg)
+                read_params = dict(params)
+                read_params["arguments"] = forwarded_args
+                read_msg["params"] = read_params
+                self._forward_passthrough(
+                    read_msg, has_client_id=has_client_id, client_id=client_id
+                )
+            else:
+                self._forward_passthrough(msg, has_client_id=has_client_id, client_id=client_id)
             return
 
         # Extract explicit action ID from `_sidefx_action_id` or `idempotency_key`.

@@ -186,11 +186,17 @@ def handle_message(msg):
             return
 
         if arguments.get("timeout_tool_error"):
+            err_msg = (
+                arguments["timeout_tool_error"]
+                if isinstance(arguments["timeout_tool_error"], str)
+                else "upstream gateway timed out"
+            )
+            record_mutation(name, arguments)
             send({
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
-                    "content": [{"type": "text", "text": "upstream gateway timed out"}],
+                    "content": [{"type": "text", "text": err_msg}],
                     "isError": True,
                 },
             })
@@ -1398,7 +1404,7 @@ class TestMCPProxySafetyAndFaults:
             assert rec1 is not None
             assert rec1.status == ActionStatus.UNKNOWN
 
-            # N10: ambiguous timeout tool error -> marked UNKNOWN (prevents blind retry)
+            # N10: ambiguous timeout/socket errors -> marked UNKNOWN and retry is BLOCKED!
             h.send(
                 {
                     "jsonrpc": "2.0",
@@ -1407,8 +1413,8 @@ class TestMCPProxySafetyAndFaults:
                     "params": {
                         "name": "create_issue",
                         "arguments": {
-                            "timeout_tool_error": True,
-                            "_sidefx_action_id": "ambig-err-1",
+                            "timeout_tool_error": "connect ETIMEDOUT 10.0.0.1:443",
+                            "idempotency_key": "ambig-err-1",
                         },
                     },
                 }
@@ -1418,6 +1424,30 @@ class TestMCPProxySafetyAndFaults:
             rec2 = journal.get_action("agent", "mcp:mock", "ambig-err-1")
             assert rec2 is not None
             assert rec2.status == ActionStatus.UNKNOWN
+
+            # Retry with same idempotency_key MUST be blocked (0 duplicate upstream writes!)
+            h.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 22,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "create_issue",
+                        "arguments": {
+                            "timeout_tool_error": "connect ETIMEDOUT 10.0.0.1:443",
+                            "idempotency_key": "ambig-err-1",
+                        },
+                    },
+                }
+            )
+            r2_retry = h.recv()
+            assert r2_retry["error"]["code"] == ERR_OUTCOME_UNKNOWN
+            etimedout_writes = [
+                w
+                for w in _read_upstream_writes(log_path)
+                if w["arguments"].get("idempotency_key") == "ambig-err-1"
+            ]
+            assert len(etimedout_writes) == 1
 
             # N8: notifications/cancelled rewrites client requestId to upstream __sidefx_ ID
             h.send(
@@ -1598,6 +1628,43 @@ class TestMCPProxySafetyAndFaults:
                 session_id="cli-sess",
             )
             assert p_explicit.session_id == "cli-sess"
+
+    @pytest.mark.parametrize(
+        "err_text",
+        [
+            "connect ETIMEDOUT 10.0.0.1:443",
+            "ESOCKETTIMEDOUT",
+            "TimeoutError: operation exceeded limit",
+            "httpx.ReadTimeout",
+            "asyncio.TimeoutError",
+            "UND_ERR_HEADERS_TIMEOUT",
+            "socket hang up",
+            "fetch failed",
+            "502 Bad Gateway",
+            "write EPIPE",
+            "504 Gateway Timeout",
+            "ECONNRESET",
+        ],
+    )
+    def test_ambiguous_error_classifier_catches_real_timeout_spellings(self, err_text: str) -> None:
+        from sidefx.mcp_proxy import _is_ambiguous_error_text
+
+        assert _is_ambiguous_error_text(err_text) is True
+
+    @pytest.mark.parametrize(
+        "clean_err",
+        [
+            "invalid issue payload",
+            "upstream validation failed",
+            "401 Unauthorized",
+            "404 Not Found",
+            "Permission denied",
+        ],
+    )
+    def test_ambiguous_error_classifier_preserves_clean_rejections(self, clean_err: str) -> None:
+        from sidefx.mcp_proxy import _is_ambiguous_error_text
+
+        assert _is_ambiguous_error_text(clean_err) is False
 
 
 class TestMCPProxyCLI:
