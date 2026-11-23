@@ -18,18 +18,20 @@ from sidefx import __version__
 from sidefx.chaos import (
     ChaosSuiteReport,
     ScenarioResult,
+    _MCPInProcessClient,
     available_scenario_names,
     format_chaos_report,
     run_chaos_suite,
 )
+from sidefx.cli import main as cli_main
 from sidefx.config import load_config
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _sidefx_cmd(*args: str) -> list[str]:
-    """Invoke the installed `sidefx` console script in the active venv (or fallback to -m)."""
-    candidate = Path(sys.executable).resolve().parent / "sidefx"
+    """Invoke the installed `sidefx` console script in the active venv."""
+    candidate = Path(sys.executable).parent / "sidefx"
     if candidate.is_file() and os.access(candidate, os.X_OK):
         return [str(candidate), *args]
     which = shutil.which("sidefx")
@@ -39,14 +41,17 @@ def _sidefx_cmd(*args: str) -> list[str]:
 
 
 class TestChaosSuite:
-    def test_full_chaos_suite_zero_duplicates_and_100pct_receipt_accuracy(self) -> None:
-        tmp_root = Path(tempfile.gettempdir())
-        before_dirs = {p.name for p in tmp_root.glob("sidefx-chaos-*")}
+    def test_full_chaos_suite_zero_duplicates_and_100pct_receipt_accuracy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        isolated_tmp = tmp_path / "chaos_tmp"
+        isolated_tmp.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(isolated_tmp))
 
         report = run_chaos_suite()
 
-        after_dirs = {p.name for p in tmp_root.glob("sidefx-chaos-*")}
-        assert after_dirs == before_dirs, f"Leaked temp directories: {after_dirs - before_dirs}"
+        leaked = list(isolated_tmp.glob("sidefx-chaos-*"))
+        assert leaked == [], f"Leaked temp directories: {leaked}"
 
         assert report.passed is True, format_chaos_report(report, verbose=True)
         assert report.total_scenarios == 6
@@ -144,6 +149,82 @@ class TestChaosSuite:
         )
         assert bad_receipt_report.passed is False
         assert bad_receipt_report.receipt_accuracy_pct == 95.0
+
+    def test_crashed_scenario_is_captured_and_cli_exits_nonzero(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        def _boom() -> ScenarioResult:
+            raise RuntimeError("injected harness crash")
+
+        monkeypatch.setattr(
+            "sidefx.chaos.SCENARIO_REGISTRY",
+            (("exploding_scenario", _boom),),
+        )
+        report = run_chaos_suite()
+        assert report.passed is False
+        assert report.failed_scenarios == 1
+        assert "injected harness crash" in (report.scenarios[0].error or "")
+        rendered = format_chaos_report(report, verbose=False)
+        assert "Result: FAIL" in rendered
+        assert "incomplete" in rendered
+        assert "injected harness crash" in rendered
+
+        exit_code = cli_main(["eval"])
+        captured = capsys.readouterr()
+        assert exit_code == 1
+        assert "Result: FAIL" in captured.out
+
+    def test_mcp_in_process_client_does_not_hang_on_unresponsive_upstream(
+        self, tmp_path: Path
+    ) -> None:
+        silent_server = tmp_path / "silent_mcp.py"
+        silent_server.write_text(
+            "import sys\nfor _ in sys.stdin:\n    pass\n",
+            encoding="utf-8",
+        )
+        db_path = tmp_path / "hang.db"
+        ledger_path = tmp_path / "ledger.jsonl"
+        mode_file = tmp_path / "mode.txt"
+
+        with (
+            pytest.raises(TimeoutError),
+            _MCPInProcessClient(
+                db_path=db_path,
+                server_script=silent_server,
+                ledger_path=ledger_path,
+                mode_file=mode_file,
+                session_id="hang-test",
+                timeout_seconds=1.0,
+            ) as client,
+        ):
+            # Read-only request gets no reply from silent upstream -> must time out AND
+            # exit cleanly without deadlocking in __exit__.
+            client.request({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}}, timeout=0.3)
+
+    def test_hermetic_env_isolation_under_hostile_proxy_and_git_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Simulate developer machine with HTTP proxy, ambient GIT_DIR, and global core.hooksPath.
+        bad_gitconfig = tmp_path / "hostile.gitconfig"
+        empty_hooks = tmp_path / "empty_hooks"
+        empty_hooks.mkdir()
+        bad_gitconfig.write_text(
+            f"[core]\n\thooksPath = {empty_hooks}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+        monkeypatch.setenv("GIT_DIR", str(tmp_path / "nonexistent.git"))
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(bad_gitconfig))
+
+        report = run_chaos_suite(scenarios=["post_commit_response_loss"])
+        assert report.passed is True, format_chaos_report(report, verbose=True)
+        assert report.duplicate_remote_writes == 0
+        # Hostile caller env must be restored cleanly after run_chaos_suite exits.
+        assert os.environ.get("http_proxy") == "http://127.0.0.1:9"
+        assert os.environ.get("GIT_CONFIG_GLOBAL") == str(bad_gitconfig)
 
 
 class TestCLISmokeEndToEnd:

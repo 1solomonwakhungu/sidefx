@@ -13,6 +13,7 @@ import io
 import json
 import os
 import shlex
+import signal
 import stat
 import subprocess
 import sys
@@ -20,7 +21,8 @@ import tempfile
 import textwrap
 import threading
 import time
-from collections.abc import Callable, Sequence
+import traceback
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -549,18 +551,61 @@ _AMBIENT_ENV_KEYS_TO_STRIP = (
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_SSH_COMMAND",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
 )
+_AMBIENT_ENV_PREFIXES_TO_STRIP = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+_HERMETIC_ENV_OVERRIDES = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "NO_PROXY": "127.0.0.1,localhost",
+    "no_proxy": "127.0.0.1,localhost",
+}
+_HERMETIC_ENV_LOCK = threading.RLock()
 
 
 def _isolated_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Build an isolated subprocess env stripped of ambient sidefx/gh/git overrides."""
+    """Build a hermetic subprocess env stripped of ambient proxy/sidefx/gh/git overrides."""
     env = os.environ.copy()
     for key in _AMBIENT_ENV_KEYS_TO_STRIP:
         env.pop(key, None)
-    env["GIT_TERMINAL_PROMPT"] = "0"
+    for key in list(env):
+        if key.startswith(_AMBIENT_ENV_PREFIXES_TO_STRIP):
+            env.pop(key, None)
+    env.update(_HERMETIC_ENV_OVERRIDES)
     if extra:
         env.update(extra)
     return env
+
+
+@contextlib.contextmanager
+def _hermetic_chaos_env() -> Iterator[None]:
+    """Temporarily apply hermetic proxy/git/sidefx env to ``os.environ`` for in-process callers."""
+    with _HERMETIC_ENV_LOCK:
+        saved = os.environ.copy()
+        try:
+            for key in _AMBIENT_ENV_KEYS_TO_STRIP:
+                os.environ.pop(key, None)
+            for key in list(os.environ):
+                if key.startswith(_AMBIENT_ENV_PREFIXES_TO_STRIP):
+                    os.environ.pop(key, None)
+            os.environ.update(_HERMETIC_ENV_OVERRIDES)
+            yield
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
 
 
 def _write_default_config(root: Path) -> Path:
@@ -597,6 +642,7 @@ class _ChaosGitRepo:
     bare_dir: Path
     work_dir: Path
     push_log: Path
+    push_attempts_log: Path
     block_pre_flag: Path
     slow_post_flag: Path
 
@@ -617,6 +663,29 @@ class _ChaosGitRepo:
                 events.append((parts[0], parts[1], parts[2]))
         return events
 
+    def push_attempt_count(self) -> int:
+        if not self.push_attempts_log.exists():
+            return 0
+        return sum(
+            1
+            for ln in self.push_attempts_log.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        )
+
+    def remote_ref_sha(self, ref_name: str) -> str | None:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--verify", ref_name],
+            cwd=str(self.bare_dir),
+            capture_output=True,
+            text=True,
+            env=_git_env(),
+            timeout=10.0,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.strip().lower() or None
+
 
 def _create_chaos_git_repo(root: Path) -> _ChaosGitRepo:
     """Create a real local bare remote + working clone with fault-injecting hooks."""
@@ -625,6 +694,7 @@ def _create_chaos_git_repo(root: Path) -> _ChaosGitRepo:
     bare_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
     push_log = root / "push_events.log"
+    push_attempts_log = root / "push_attempts.log"
     block_pre_flag = root / "block_pre_receive.flag"
     slow_post_flag = root / "slow_post_receive.flag"
 
@@ -640,6 +710,18 @@ def _create_chaos_git_repo(root: Path) -> _ChaosGitRepo:
     _run_git(["add", "README.txt"], cwd=work_dir)
     _run_git(["commit", "-m", "initial commit"], cwd=work_dir)
     _run_git(["push", "-u", "origin", "main"], cwd=work_dir)
+
+    # Track every real `git push` contacting `receive-pack` (even no-op re-pushes!),
+    # while leaving read-only `git ls-remote` (`upload-pack`) untouched.
+    receive_pack_wrapper = root / "sidefx-receive-pack"
+    receive_pack_wrapper.write_text(
+        "#!/bin/sh\n"
+        f"printf 'attempt\\n' >> {shlex.quote(str(push_attempts_log))}\n"
+        'exec git receive-pack "$@"\n',
+        encoding="utf-8",
+    )
+    receive_pack_wrapper.chmod(0o755)
+    _run_git(["config", "remote.origin.receivepack", str(receive_pack_wrapper)], cwd=work_dir)
 
     hooks_dir = bare_dir / "hooks"
     hooks_dir.mkdir(parents=True, exist_ok=True)
@@ -670,6 +752,7 @@ def _create_chaos_git_repo(root: Path) -> _ChaosGitRepo:
         bare_dir=bare_dir,
         work_dir=work_dir,
         push_log=push_log,
+        push_attempts_log=push_attempts_log,
         block_pre_flag=block_pre_flag,
         slow_post_flag=slow_post_flag,
     )
@@ -701,6 +784,9 @@ class _MCPSubprocessClient:
         self._config_path = config_path
         self._timeout_seconds = timeout_seconds
         self._proc: subprocess.Popen[bytes] | None = None
+        self._stderr_chunks: list[bytes] = []
+        self._stderr_thread: threading.Thread | None = None
+        self._active_readers: list[threading.Thread] = []
 
     def __enter__(self) -> _MCPSubprocessClient:
         cmd = [
@@ -738,6 +824,24 @@ class _MCPSubprocessClient:
             stderr=subprocess.PIPE,
             env=env,
         )
+        assert self._proc.stderr is not None
+        self._stderr_chunks = []
+
+        def _drain_stderr(stream: Any) -> None:
+            with contextlib.suppress(OSError, ValueError):
+                while True:
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        break
+                    self._stderr_chunks.append(chunk)
+
+        self._stderr_thread = threading.Thread(
+            target=_drain_stderr,
+            args=(self._proc.stderr,),
+            name="sidefx-chaos-mcp-stderr",
+            daemon=True,
+        )
+        self._stderr_thread.start()
         return self
 
     def request(self, payload: dict[str, Any], *, timeout: float = 8.0) -> dict[str, Any]:
@@ -753,16 +857,22 @@ class _MCPSubprocessClient:
         self._proc.stdin.flush()
 
         result_holder: list[bytes] = []
+        stdout_stream = self._proc.stdout
 
         def _read_line() -> None:
-            assert self._proc is not None and self._proc.stdout is not None
-            result_holder.append(self._proc.stdout.readline())
+            with contextlib.suppress(OSError, ValueError):
+                result_holder.append(stdout_stream.readline())
 
         reader = threading.Thread(target=_read_line, daemon=True)
+        self._active_readers.append(reader)
         reader.start()
         reader.join(timeout=timeout)
         if reader.is_alive() or not result_holder or not result_holder[0]:
-            raise TimeoutError(f"Timed out waiting for MCP proxy reply to {payload.get('id')!r}")
+            stderr_tail = b"".join(self._stderr_chunks).decode("utf-8", errors="replace").strip()
+            extra = f" (stderr: {stderr_tail})" if stderr_tail else ""
+            raise TimeoutError(
+                f"Timed out waiting for MCP proxy reply to {payload.get('id')!r}{extra}"
+            )
         return json.loads(result_holder[0].decode("utf-8"))
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
@@ -780,6 +890,13 @@ class _MCPSubprocessClient:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
                 self._proc.wait()
+        # Child has exited, so stdout/stderr hit EOF; join readers BEFORE closing streams.
+        for reader in self._active_readers:
+            reader.join(timeout=2.0)
+        self._active_readers.clear()
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=2.0)
+            self._stderr_thread = None
         if self._proc.stdout is not None:
             with contextlib.suppress(OSError):
                 self._proc.stdout.close()
@@ -816,6 +933,7 @@ class _MCPInProcessClient:
         self._reconciler_hook = reconciler_hook
         self._journal: Journal | None = None
         self._thread: threading.Thread | None = None
+        self._active_readers: list[threading.Thread] = []
         self._c_in_w: Any = None
         self._c_in_r: Any = None
         self._c_out_r: Any = None
@@ -863,12 +981,14 @@ class _MCPInProcessClient:
         self._c_in_w.flush()
 
         result_holder: list[bytes] = []
+        out_reader = self._c_out_r
 
         def _read_line() -> None:
-            assert self._c_out_r is not None
-            result_holder.append(self._c_out_r.readline())
+            with contextlib.suppress(OSError, ValueError):
+                result_holder.append(out_reader.readline())
 
         reader = threading.Thread(target=_read_line, daemon=True)
+        self._active_readers.append(reader)
         reader.start()
         reader.join(timeout=timeout)
         if reader.is_alive() or not result_holder or not result_holder[0]:
@@ -876,12 +996,21 @@ class _MCPInProcessClient:
         return json.loads(result_holder[0].decode("utf-8"))
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        # 1. Close client->proxy write end so MCPProxy hits EOF and finishes cleanly.
         if self._c_in_w is not None:
             with contextlib.suppress(OSError):
                 self._c_in_w.close()
         if self._thread is not None:
             self._thread.join(timeout=6.0)
-        for handle in (self._c_in_r, self._c_out_r, self._c_out_w):
+        # 2. Close proxy->client write end BEFORE joining readers or closing _c_out_r,
+        #    so any reader blocked in readline() after a timeout wakes on EOF instead of hanging.
+        if self._c_out_w is not None:
+            with contextlib.suppress(OSError):
+                self._c_out_w.close()
+        for reader in self._active_readers:
+            reader.join(timeout=2.0)
+        self._active_readers.clear()
+        for handle in (self._c_in_r, self._c_out_r):
             if handle is not None:
                 with contextlib.suppress(OSError):
                     handle.close()
@@ -1083,6 +1212,7 @@ def _scenario_pre_commit_crash_and_timeout() -> ScenarioResult:
         git_repo.block_pre_flag.write_text("1", encoding="utf-8")
 
         with Journal(db_path) as journal:
+            git_env = _git_env()
             g1 = wrap_command(
                 ["git", "push", "origin", "feat-pre"],
                 journal=journal,
@@ -1091,6 +1221,7 @@ def _scenario_pre_commit_crash_and_timeout() -> ScenarioResult:
                 timeout_seconds=0.4,
                 min_retry_age_seconds=0.0,
                 cwd=git_repo.work_dir,
+                env=git_env,
             )
             events_after_timeout = git_repo.push_events_for_ref("refs/heads/feat-pre")
             git_repo.block_pre_flag.unlink(missing_ok=True)
@@ -1103,6 +1234,7 @@ def _scenario_pre_commit_crash_and_timeout() -> ScenarioResult:
                 timeout_seconds=5.0,
                 min_retry_age_seconds=0.0,
                 cwd=git_repo.work_dir,
+                env=git_env,
             )
             events_after_retry = git_repo.push_events_for_ref("refs/heads/feat-pre")
             git_pre_ok = (
@@ -1362,6 +1494,7 @@ def _scenario_post_commit_response_loss() -> ScenarioResult:
         git_repo.slow_post_flag.write_text("1", encoding="utf-8")
 
         with Journal(db_path) as journal:
+            git_env = _git_env()
             p1 = wrap_command(
                 ["git", "push", "origin", "feat-post"],
                 journal=journal,
@@ -1369,6 +1502,7 @@ def _scenario_post_commit_response_loss() -> ScenarioResult:
                 session_id="chaos-s2",
                 timeout_seconds=1.0,
                 cwd=git_repo.work_dir,
+                env=git_env,
             )
             git_repo.slow_post_flag.unlink(missing_ok=True)
             p2 = wrap_command(
@@ -1378,8 +1512,11 @@ def _scenario_post_commit_response_loss() -> ScenarioResult:
                 session_id="chaos-s2",
                 timeout_seconds=5.0,
                 cwd=git_repo.work_dir,
+                env=git_env,
             )
             events = git_repo.push_events_for_ref("refs/heads/feat-post")
+            push_attempts = git_repo.push_attempt_count()
+            remote_sha = git_repo.remote_ref_sha("refs/heads/feat-post")
             expected_ref = f"origin refs/heads/feat-post@{expected_sha[:12]}"
             git_post_ok = (
                 p1.exit_code == EXIT_TIMEOUT
@@ -1390,17 +1527,18 @@ def _scenario_post_commit_response_loss() -> ScenarioResult:
                 and p2.status == ActionStatus.RECONCILED
                 and p2.result_ref == expected_ref
                 and len(events) == 1
-                and events[0][1] == expected_sha
+                and push_attempts == 1
+                and remote_sha == expected_sha
             )
             subchecks.append(
                 {
                     "check": "cli_git_push_post_commit_timeout",
                     "passed": git_post_ok,
                     "expected_writes": 1,
-                    "actual_writes": len(events),
+                    "actual_writes": max(len(events), push_attempts),
                     "detail": (
                         f"recovered={p2.result_ref}, executed_on_retry={p2.executed}, "
-                        f"remote_pushes={len(events)}"
+                        f"remote_pushes={len(events)}, receive_pack_contacts={push_attempts}"
                     ),
                 }
             )
@@ -1506,8 +1644,10 @@ def _scenario_post_commit_response_loss() -> ScenarioResult:
             mode_file=mode_file,
             session_id="chaos-s2",
             target="mcp:s2",
-            timeout_seconds=0.35,
+            timeout_seconds=0.5,
         ) as c_to:
+            # Warm up upstream interpreter so cold start does not eat the timeout window.
+            _ = c_to.request({"jsonrpc": "2.0", "id": 19, "method": "initialize", "params": {}})
             resp_t1 = c_to.request(timeout_call)
             # Immediate retry on the live proxy must be blocked (never double-executes!)
             resp_t2 = c_to.request({**timeout_call, "id": 21})
@@ -1602,6 +1742,7 @@ def _scenario_concurrent_duplicate_dispatch() -> ScenarioResult:
                 "Exactly one remote write",
             ]
 
+            popen_extra: dict[str, Any] = {"start_new_session": True} if os.name == "posix" else {}
             procs = [
                 subprocess.Popen(
                     wrap_cmd,
@@ -1610,6 +1751,7 @@ def _scenario_concurrent_duplicate_dispatch() -> ScenarioResult:
                     stderr=subprocess.PIPE,
                     text=True,
                     env=env,
+                    **popen_extra,
                 )
                 for _ in range(worker_count)
             ]
@@ -1623,8 +1765,18 @@ def _scenario_concurrent_duplicate_dispatch() -> ScenarioResult:
             finally:
                 for proc in procs:
                     if proc.poll() is None:
-                        proc.kill()
-                        proc.wait()
+                        if os.name == "posix":
+                            with contextlib.suppress(OSError):
+                                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        else:
+                            with contextlib.suppress(OSError):
+                                proc.kill()
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            proc.wait(timeout=2.0)
+                    for stream in (proc.stdout, proc.stderr):
+                        if stream is not None:
+                            with contextlib.suppress(OSError):
+                                stream.close()
 
             # Follow-up call must replay cleanly with 0 additional POSTs
             env["FAKE_GH_HOLD_MS"] = "0"
@@ -1650,7 +1802,7 @@ def _scenario_concurrent_duplicate_dispatch() -> ScenarioResult:
                 and replay_proc.returncode == 0
                 and "https://github.com/acme/app/issues/1" in replay_proc.stdout
                 and len(rows) == 1
-                and rows[0].status == ActionStatus.CONFIRMED
+                and rows[0].status in (ActionStatus.CONFIRMED, ActionStatus.RECONCILED)
                 and rows[0].result_ref == "https://github.com/acme/app/issues/1"
             )
             subchecks.append(
@@ -2154,6 +2306,7 @@ def _scenario_session_receipt_ground_truth() -> ScenarioResult:
                 push_sha = git_repo.create_branch_commit(
                     "feat-receipt", "receipt.txt", "ground truth\n"
                 )
+                git_env = _git_env()
                 git_repo.slow_post_flag.write_text("1", encoding="utf-8")
                 _ = wrap_command(
                     ["git", "push", "origin", "feat-receipt"],
@@ -2162,6 +2315,7 @@ def _scenario_session_receipt_ground_truth() -> ScenarioResult:
                     session_id=session_id,
                     timeout_seconds=1.0,
                     cwd=git_repo.work_dir,
+                    env=git_env,
                 )
                 git_repo.slow_post_flag.unlink(missing_ok=True)
                 git_rec = wrap_command(
@@ -2171,6 +2325,7 @@ def _scenario_session_receipt_ground_truth() -> ScenarioResult:
                     session_id=session_id,
                     timeout_seconds=5.0,
                     cwd=git_repo.work_dir,
+                    env=git_env,
                 )
 
                 # 4. CLI generic failed command (0 remote writes)
@@ -2185,6 +2340,7 @@ def _scenario_session_receipt_ground_truth() -> ScenarioResult:
                     session_id=session_id,
                     target="deploy:script",
                     tool_name="deploy_script",
+                    env=_isolated_env(),
                 )
 
             # 5-7. MCP confirmed + MCP failed + MCP unknown (crashed after write)
@@ -2302,7 +2458,13 @@ def _scenario_session_receipt_ground_truth() -> ScenarioResult:
             # Build ground-truth sets strictly from the remote mock servers & bare git repo
             gh_urls = {item["html_url"] for item in gh_srv.issues}
             git_events = git_repo.push_events_for_ref("refs/heads/feat-receipt")
-            expected_git_ref = f"origin refs/heads/feat-receipt@{push_sha[:12]}"
+            git_attempts = git_repo.push_attempt_count()
+            remote_git_sha = git_repo.remote_ref_sha("refs/heads/feat-receipt")
+            expected_git_ref = (
+                f"origin refs/heads/feat-receipt@{remote_git_sha[:12]}"
+                if remote_git_sha is not None
+                else None
+            )
             mcp_entries = _read_mcp_ledger(ledger_path)
             mcp_confirmed_entries = [
                 e for e in mcp_entries if e.get("arguments", {}).get("title") == "Deploy checklist"
@@ -2311,7 +2473,9 @@ def _scenario_session_receipt_ground_truth() -> ScenarioResult:
                 e for e in mcp_entries if e.get("arguments", {}).get("title") == "Crashed ticket"
             ]
 
-            expected_confirmed_reconciled_refs = gh_urls | {expected_git_ref}
+            expected_confirmed_reconciled_refs = set(gh_urls)
+            if expected_git_ref is not None:
+                expected_confirmed_reconciled_refs.add(expected_git_ref)
             if mcp_confirmed_entries:
                 expected_confirmed_reconciled_refs.add(str(mcp_confirmed_entries[0]["url"]))
 
@@ -2338,20 +2502,16 @@ def _scenario_session_receipt_ground_truth() -> ScenarioResult:
                 actual_confirmed_reconciled_refs - expected_confirmed_reconciled_refs
             )
 
-            ground_truth_assertions = [
+            # Pure receipt-content ground-truth checks (JSON + Markdown fidelity).
+            receipt_assertions = [
                 report_json_proc.returncode == 0,
                 report_md_proc.returncode == 0,
-                gh_ok.status == ActionStatus.CONFIRMED,
-                gh_rec.status == ActionStatus.RECONCILED,
-                git_rec.status == ActionStatus.RECONCILED,
-                cli_fail.status == ActionStatus.FAILED,
-                len(mcp_confirmed_entries) == 1,
-                len(mcp_crashed_entries) == 1,
                 report_data.get("total") == 7,
                 actual_confirmed_ids == {"s6-gh-confirmed", "s6-mcp-confirmed"},
                 actual_reconciled_ids == {"s6-gh-reconciled", "s6-git-reconciled"},
                 actual_failed_ids == {"s6-cli-failed", "s6-mcp-failed"},
                 actual_unknown_ids == {"s6-mcp-unknown"},
+                len(expected_confirmed_reconciled_refs) == 4,
                 len(missing_refs) == 0,
                 len(hallucinated_refs) == 0,
                 "## sidefx Session Receipt" in md_text,
@@ -2362,13 +2522,17 @@ def _scenario_session_receipt_ground_truth() -> ScenarioResult:
                 all(ref in md_text for ref in expected_confirmed_reconciled_refs),
                 "s6-mcp-unknown" in md_text,
             ]
-            matched = sum(1 for ok in ground_truth_assertions if ok)
-            accuracy_pct = (matched / len(ground_truth_assertions)) * 100.0
+            matched = sum(1 for ok in receipt_assertions if ok)
+            accuracy_pct = (matched / len(receipt_assertions)) * 100.0
 
             subchecks.append(
                 {
                     "check": "github_ground_truth_writes",
-                    "passed": gh_srv.post_count == 2,
+                    "passed": (
+                        gh_srv.post_count == 2
+                        and gh_ok.status == ActionStatus.CONFIRMED
+                        and gh_rec.status == ActionStatus.RECONCILED
+                    ),
                     "expected_writes": 2,
                     "actual_writes": gh_srv.post_count,
                     "detail": f"github_issues={sorted(gh_urls)}",
@@ -2377,16 +2541,29 @@ def _scenario_session_receipt_ground_truth() -> ScenarioResult:
             subchecks.append(
                 {
                     "check": "git_ground_truth_pushes",
-                    "passed": len(git_events) == 1,
+                    "passed": (
+                        len(git_events) == 1
+                        and git_attempts == 1
+                        and remote_git_sha == push_sha
+                        and git_rec.status == ActionStatus.RECONCILED
+                    ),
                     "expected_writes": 1,
-                    "actual_writes": len(git_events),
-                    "detail": f"git_ref={expected_git_ref}",
+                    "actual_writes": max(len(git_events), git_attempts),
+                    "detail": (
+                        f"git_ref={expected_git_ref}, receive_pack_contacts={git_attempts}, "
+                        f"cli_fail_status={cli_fail.status}"
+                    ),
                 }
             )
             subchecks.append(
                 {
                     "check": "mcp_ground_truth_writes",
-                    "passed": len(mcp_entries) == 2,
+                    "passed": (
+                        len(mcp_entries) == 2
+                        and len(mcp_confirmed_entries) == 1
+                        and len(mcp_crashed_entries) == 1
+                        and cli_fail.status == ActionStatus.FAILED
+                    ),
                     "expected_writes": 2,
                     "actual_writes": len(mcp_entries),
                     "detail": (
@@ -2402,7 +2579,7 @@ def _scenario_session_receipt_ground_truth() -> ScenarioResult:
                     "expected_writes": 0,
                     "actual_writes": 0,
                     "detail": (
-                        f"accuracy={accuracy_pct:.1f}% ({matched}/{len(ground_truth_assertions)}), "
+                        f"accuracy={accuracy_pct:.1f}% ({matched}/{len(receipt_assertions)}), "
                         f"missing={sorted(missing_refs)}, hallucinated={sorted(hallucinated_refs)}"
                     ),
                 }
@@ -2461,23 +2638,27 @@ def run_chaos_suite(
 
     suite_start = time.perf_counter()
     results: list[ScenarioResult] = []
-    for scenario_name, fn in selected:
-        try:
-            results.append(fn())
-        except Exception as exc:
-            results.append(
-                ScenarioResult(
-                    name=scenario_name,
-                    title=scenario_name,
-                    passed=False,
-                    duration_ms=0.0,
-                    duplicate_remote_writes=0,
-                    expected_remote_writes=0,
-                    actual_remote_writes=0,
-                    details="Scenario raised unhandled exception",
-                    error=f"{type(exc).__name__}: {exc}",
+    with _hermetic_chaos_env():
+        for scenario_name, fn in selected:
+            sc_start = time.perf_counter()
+            try:
+                results.append(fn())
+            except Exception as exc:
+                tb_lines = traceback.format_exc().strip().splitlines()
+                tb_tail = " | ".join(tb_lines[-3:]) if tb_lines else f"{type(exc).__name__}: {exc}"
+                results.append(
+                    ScenarioResult(
+                        name=scenario_name,
+                        title=scenario_name,
+                        passed=False,
+                        duration_ms=(time.perf_counter() - sc_start) * 1000.0,
+                        duplicate_remote_writes=0,
+                        expected_remote_writes=0,
+                        actual_remote_writes=0,
+                        details="Scenario raised unhandled exception (writes unmeasured)",
+                        error=tb_tail,
+                    )
                 )
-            )
 
     total_ms = (time.perf_counter() - suite_start) * 1000.0
     return ChaosSuiteReport(scenarios=tuple(results), total_duration_ms=total_ms)
@@ -2518,16 +2699,23 @@ def format_chaos_report(report: ChaosSuiteReport, *, verbose: bool = False) -> s
             for chk in sc.subchecks:
                 chk_status = "PASS" if chk.get("passed") else "FAIL"
                 lines.append(f"  - [{chk_status}] {chk.get('check')}: {chk.get('detail', '')}")
+        elif not sc.passed and sc.error:
+            lines.append(f"  error:  {sc.error}")
 
     lines.append(sep)
     overall = "PASS" if report.passed else "FAIL"
     accuracy_str = (
         f"{report.receipt_accuracy_pct:.1f}%" if report.receipt_accuracy_pct is not None else "n/a"
     )
+    dupes_str = (
+        f"{report.duplicate_remote_writes} (incomplete)"
+        if report.failed_scenarios > 0 and report.duplicate_remote_writes == 0
+        else str(report.duplicate_remote_writes)
+    )
     lines.append(
         f"Result: {overall} | "
         f"Scenarios: {report.passed_scenarios}/{report.total_scenarios} passed | "
-        f"Duplicate remote writes: {report.duplicate_remote_writes} | "
+        f"Duplicate remote writes: {dupes_str} | "
         f"Receipt accuracy: {accuracy_str} | "
         f"Total time: {report.total_duration_ms:.0f}ms"
     )

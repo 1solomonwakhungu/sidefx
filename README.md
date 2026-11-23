@@ -68,9 +68,13 @@ Clients can pass an explicit `_sidefx_action_id` (stripped before forwarding to 
         "--timeout",
         "30",
         "--",
-        "npx",
-        "-y",
-        "@modelcontextprotocol/server-github"
+        "docker",
+        "run",
+        "-i",
+        "--rm",
+        "-e",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "ghcr.io/github/github-mcp-server"
       ],
       "env": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
@@ -85,17 +89,18 @@ Clients can pass an explicit `_sidefx_action_id` (stripped before forwarding to 
 ```json
 {
   "mcpServers": {
-    "linear": {
+    "filesystem": {
       "command": "sidefx",
       "args": [
         "mcp-proxy",
         "--target",
-        "mcp:linear",
+        "mcp:filesystem",
         "--deterministic-ids",
         "--",
         "npx",
         "-y",
-        "mcp-linear"
+        "@modelcontextprotocol/server-filesystem",
+        "."
       ]
     }
   }
@@ -113,9 +118,13 @@ args = [
   "--timeout",
   "30",
   "--",
-  "npx",
-  "-y",
-  "@modelcontextprotocol/server-github",
+  "docker",
+  "run",
+  "-i",
+  "--rm",
+  "-e",
+  "GITHUB_PERSONAL_ACCESS_TOKEN",
+  "ghcr.io/github/github-mcp-server",
 ]
 ```
 
@@ -250,10 +259,13 @@ sidefx status --status pending --status unknown --json
 ### Reconcile pending or unknown actions
 
 ```bash
-# Reconcile all unresolved actions in the current session
+# Reconcile all unresolved (pending/unknown) actions across all sessions
 sidefx reconcile
 
-# Dry-run without modifying SQLite
+# Scope reconciliation to a single session
+sidefx reconcile --session-id sess-2026-11-22
+
+# Dry-run across all sessions (overrides an inherited --session-id) without modifying SQLite
 sidefx reconcile --all --dry-run
 
 # Reconcile a single action ID
@@ -280,7 +292,7 @@ Sample output:
 ```markdown
 ## sidefx Session Receipt
 - **Session:** `sess-2026-11-22`
-- **Journal:** `.sidefx/journal.db`
+- **Journal:** `/path/to/repo/.sidefx/journal.db`
 - **Totals:** 4 total (1 confirmed, 1 reconciled, 1 failed, 1 unknown)
 
 ### Confirmed (1)
@@ -298,7 +310,7 @@ Sample output:
 
 ### Claude Code `Stop` Hook Integration
 
-Print the ready-to-paste Claude Code `Stop` hook snippet:
+Print the ready-to-paste Claude Code `Stop` hook snippet (by default it reports all sessions in the journal; pass `--session-id <id>` and/or `--db <path>` to scope the generated hook command):
 
 ```bash
 sidefx init --claude-code
@@ -341,6 +353,7 @@ Run it yourself:
 sidefx eval
 sidefx eval --verbose
 sidefx eval --json
+sidefx eval --scenario post_commit_response_loss --verbose
 # or directly from the repository:
 uv run python evals/chaos_suite.py
 ```
@@ -362,7 +375,7 @@ Latest benchmark results (`uv run sidefx eval`):
 
 ## Architecture & Guarantees
 
-- **Zero runtime dependencies:** Requires only Python `>=3.11` (`sqlite3`, `json`, `urllib`, `subprocess`, `hashlib`, `uuid`, `argparse`, `threading`, `http.server`). Fast startup, no native compilation, works cleanly across Python 3.11–3.15.
+- **Zero runtime dependencies:** Requires only Python `>=3.11` (`sqlite3`, `json`, `urllib`, `subprocess`, `hashlib`, `uuid`, `argparse`, `threading`, `http.server`). Fast startup, no native compilation, CI-tested on Python 3.11 and 3.13.
 - **Durable SQLite WAL journal (`src/sidefx/journal.py`):** Opens with `PRAGMA journal_mode=WAL`, `PRAGMA synchronous=FULL` (plus `PRAGMA fullfsync=ON` on macOS), `UNIQUE (actor, target, action_id)`, and attempt-fenced `BEGIN IMMEDIATE` state transitions.
 - **Read-only queries never mutate state:** `sidefx status`, `sidefx report`, and `sidefx reconcile --dry-run` open SQLite in strict read-only URI mode (`mode=ro`, `PRAGMA query_only=ON`).
 - **Sanitized receipts & terminal output:** ANSI escape sequences, control characters, and Markdown link/heading injection payloads in external tool outputs are stripped and safely code-fenced before rendering.
