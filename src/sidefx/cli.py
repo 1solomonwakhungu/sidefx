@@ -36,6 +36,19 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
+_INIT_NEXT_STEPS = """
+Next steps:
+  1. Put sidefx in front of an MCP server. In .mcp.json (Claude Code) or
+     .cursor/mcp.json (Cursor), prefix the server's own command:
+       "command": "sidefx",
+       "args": ["mcp-proxy", "--deterministic-ids", "--", "<server command>", "<its args>"]
+  2. Wrap mutating shell commands with a stable action ID:
+       sidefx wrap --action-id push-my-branch -- git push origin my-branch
+  3. Add guardrails under "preflight.rules" (caps, allowlists, denylists; see README).
+  4. See what happened:      sidefx status   |   sidefx report
+     Clear a blocked retry:  sidefx reconcile   |   sidefx resolve --help"""
+
+
 def _positive_int(raw: str) -> int:
     try:
         value = int(raw)
@@ -185,6 +198,13 @@ def build_parser() -> argparse.ArgumentParser:
         help_text="Reconcile pending or unknown actions against external systems.",
         module_name="sidefx.reconcilers",
         func_name="handle_reconcile_cli",
+    )
+    _register_passthrough_subcommand(
+        subparsers,
+        name="resolve",
+        help_text="Record a manually verified outcome for an action no reconciler can check.",
+        module_name="sidefx.resolve",
+        func_name="handle_resolve_cli",
     )
     _register_passthrough_subcommand(
         subparsers,
@@ -357,6 +377,7 @@ def _cmd_init(args: argparse.Namespace, config: SidefxConfig) -> int:
                 tmp_path.unlink(missing_ok=True)
 
     print(f"Created {dest}")
+    print(_INIT_NEXT_STEPS)
     return 0
 
 

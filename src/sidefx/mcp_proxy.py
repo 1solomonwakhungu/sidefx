@@ -21,6 +21,14 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from sidefx.config import MAX_TIMEOUT_SECONDS, SidefxConfig, load_config
+from sidefx.guidance import OUTCOME_UNKNOWN_BANNER as OUTCOME_UNKNOWN_BANNER
+from sidefx.guidance import (
+    outcome_unknown_data,
+    outcome_unknown_message,
+    payload_mismatch_message,
+    preflight_denied_message,
+    replay_notice,
+)
 from sidefx.journal import (
     ActionRecord,
     ActionStatus,
@@ -70,7 +78,6 @@ ERR_UPSTREAM_UNAVAILABLE = -32003
 ERR_PAYLOAD_MISMATCH = -32004
 ERR_JOURNAL_ERROR = -32005
 
-OUTCOME_UNKNOWN_BANNER = "OUTCOME UNKNOWN — reconcile before retrying"
 _MISSING: Any = object()
 
 
@@ -306,6 +313,30 @@ def _build_replay_result(record: ActionRecord) -> dict[str, Any]:
             "summary": record.summary,
         },
     }
+
+
+def _result_with_replay_notice(record: ActionRecord, cached_bytes: bytes | None) -> dict[str, Any]:
+    """Return the original (or synthesized) result with a duplicate-call notice appended."""
+    base: dict[str, Any] | None = None
+    if cached_bytes is not None:
+        try:
+            parsed = _loads_strict_json(cached_bytes.decode("ascii"))
+        except (ValueError, RecursionError):
+            parsed = None
+        if isinstance(parsed, dict):
+            base = parsed
+    result = dict(base) if base is not None else _build_replay_result(record)
+    notice = {
+        "type": "text",
+        "text": replay_notice(
+            tool_name=record.tool_name,
+            action_id=record.action_id,
+            status=record.status.value,
+        ),
+    }
+    content = result.get("content")
+    result["content"] = [*content, notice] if isinstance(content, list) else [notice]
+    return result
 
 
 def _default_target_from_cmd(upstream_cmd: Sequence[str]) -> str:
@@ -554,9 +585,13 @@ class MCPProxy:
     ) -> None:
         if not has_client_id:
             return
-        message = (
-            f"{OUTCOME_UNKNOWN_BANNER} "
-            f"(action_id={action_id}, marker={marker}, tool={tool_name}): {detail}"
+        db_path = self._journal_db_path()
+        message = outcome_unknown_message(
+            action_id=action_id,
+            marker=marker,
+            tool_name=tool_name,
+            detail=detail,
+            db_path=db_path,
         )
         self._send_client_message(
             _jsonrpc_error_response(
@@ -570,9 +605,20 @@ class MCPProxy:
                     "tool": tool_name,
                     "status": status.value,
                     "detail": detail,
+                    **outcome_unknown_data(action_id, db_path=db_path),
                 },
             )
         )
+
+    def _journal_db_path(self) -> Path | None:
+        """Absolute journal path, so recovery commands work from any working directory."""
+        raw = self._journal.db_path
+        if raw is None:
+            return None
+        try:
+            return raw.resolve()
+        except OSError:
+            return raw
 
     def _on_mutation_timeout(self, upstream_id: str) -> None:
         with self._pending_cond:
@@ -967,7 +1013,14 @@ class MCPProxy:
         client_id: Any,
         record: ActionRecord,
         explicit_result: dict[str, Any] | None = None,
+        announce: bool = False,
     ) -> None:
+        """Answer a duplicate call from the journal instead of dispatching it upstream.
+
+        ``announce`` appends a visible notice. It is set when sidefx derived the action ID
+        itself: the caller never asked for deduplication, so a silently repeated result
+        would read as a second successful write.
+        """
         if not has_client_id:
             return
         if explicit_result is not None:
@@ -976,6 +1029,13 @@ class MCPProxy:
         cached_bytes = self._get_cached_result_bytes(
             (record.actor, record.target, record.action_id)
         )
+        if announce:
+            self._send_client_message(
+                _jsonrpc_result_response(
+                    client_id, _result_with_replay_notice(record, cached_bytes)
+                )
+            )
+            return
         if cached_bytes is not None:
             self._write_client_bytes(_build_cached_response_frame(client_id, cached_bytes))
             return
@@ -1168,7 +1228,7 @@ class MCPProxy:
                     _jsonrpc_error_response(
                         client_id,
                         ERR_PREFLIGHT_DENIED,
-                        f"Preflight check denied tool {tool_name!r}: {summary}",
+                        preflight_denied_message(tool_name, summary),
                         data={
                             "kind": "preflight_denied",
                             "tool": tool_name,
@@ -1279,6 +1339,7 @@ class MCPProxy:
             payload_hash=payload_hash,
             has_client_id=has_client_id,
             client_id=client_id,
+            auto_derived_id=explicit_action_id is None,
         )
         if begin_res is None:
             return
@@ -1375,6 +1436,7 @@ class MCPProxy:
         payload_hash: str,
         has_client_id: bool,
         client_id: Any,
+        auto_derived_id: bool = False,
     ) -> Any:
         """Run `journal.begin_action`, handling replay, mismatch, and reconciler recovery."""
         for attempt_round in range(2):
@@ -1394,7 +1456,9 @@ class MCPProxy:
                         _jsonrpc_error_response(
                             client_id,
                             ERR_PAYLOAD_MISMATCH,
-                            str(exc),
+                            payload_mismatch_message(
+                                exc, id_source="`_sidefx_action_id` (or `idempotency_key`)"
+                            ),
                             data={
                                 "kind": "payload_mismatch",
                                 "action_id": action_id,
@@ -1424,6 +1488,7 @@ class MCPProxy:
                     has_client_id=has_client_id,
                     client_id=client_id,
                     record=begin_res.record,
+                    announce=auto_derived_id,
                 )
                 return None
 
