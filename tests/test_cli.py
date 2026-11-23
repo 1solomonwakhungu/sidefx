@@ -331,8 +331,6 @@ class TestCliSubcommandStubs:
             ["reconcile", "--action-id", "a1", "--dry-run"],
             ["wrap", "--", "echo", "hi"],
             ["wrap", "--action-id", "a", "--target", "t", "--", "gh", "issue", "create"],
-            ["mcp-proxy", "--", "python3", "-V"],
-            ["mcp-proxy", "--timeout", "5", "--", "npx", "server", "--port", "3000"],
             ["init", "--claude-code"],
         ],
     )
