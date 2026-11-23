@@ -73,7 +73,7 @@ class GitPushSpec:
             "before_known": self.before_known,
         }
         if self.remote is not None:
-            meta["remote"] = self.remote
+            meta["remote"] = redact_remote_for_display(self.remote)
         if self.remote_ref is not None:
             meta["remote_ref"] = self.remote_ref
         if self.expected_sha is not None:
@@ -368,7 +368,7 @@ def inspect_git_push(
     if is_multi_or_unsupported:
         return GitPushSpec(
             cwd=str(repo_cwd),
-            remote=remote,
+            remote=redact_remote_for_display(remote) if remote else None,
             remote_ref=None,
             expected_sha=None,
             before_sha=None,
@@ -382,7 +382,7 @@ def inspect_git_push(
     if len(refspecs) > 1:
         return GitPushSpec(
             cwd=str(repo_cwd),
-            remote=remote,
+            remote=redact_remote_for_display(remote) if remote else None,
             remote_ref=None,
             expected_sha=None,
             before_sha=None,
@@ -414,9 +414,10 @@ def inspect_git_push(
 
     # Mirror remotes push all refs regardless of refspecs -> non-reconcilable.
     if (_git_config_get(f"remote.{remote}.mirror", cwd=repo_cwd) or "").lower() == "true":
+        safe_remote = redact_remote_for_display(remote)
         return GitPushSpec(
             cwd=str(repo_cwd),
-            remote=redact_remote_for_display(remote),
+            remote=safe_remote,
             remote_ref=None,
             expected_sha=None,
             before_sha=None,
@@ -424,7 +425,7 @@ def inspect_git_push(
             is_delete=is_delete,
             is_force=is_force,
             reconcilable=False,
-            reason=f"Mirror remote {remote!r} cannot be safely reconciled",
+            reason=f"Mirror remote {safe_remote!r} cannot be safely reconciled",
         )
 
     remote_ref: str | None = None
@@ -434,7 +435,7 @@ def inspect_git_push(
         if is_delete:
             return GitPushSpec(
                 cwd=str(repo_cwd),
-                remote=remote,
+                remote=redact_remote_for_display(remote),
                 remote_ref=None,
                 expected_sha=None,
                 before_sha=None,
@@ -447,7 +448,7 @@ def inspect_git_push(
         if not current_branch:
             return GitPushSpec(
                 cwd=str(repo_cwd),
-                remote=remote,
+                remote=redact_remote_for_display(remote),
                 remote_ref=None,
                 expected_sha=None,
                 before_sha=None,
@@ -506,9 +507,10 @@ def inspect_git_push(
             if not is_triangular and branch_merge:
                 remote_ref = _normalize_remote_ref(branch_merge)
             else:
+                safe_remote = redact_remote_for_display(remote)
                 return GitPushSpec(
                     cwd=str(repo_cwd),
-                    remote=remote,
+                    remote=safe_remote,
                     remote_ref=None,
                     expected_sha=None,
                     before_sha=None,
@@ -518,14 +520,14 @@ def inspect_git_push(
                     reconcilable=False,
                     reason=(
                         f"Cannot resolve push.default={push_default} destination for remote "
-                        f"{remote!r}"
+                        f"{safe_remote!r}"
                     ),
                 )
         else:
             # `matching`, `nothing`, or unknown push.default
             return GitPushSpec(
                 cwd=str(repo_cwd),
-                remote=remote,
+                remote=redact_remote_for_display(remote),
                 remote_ref=None,
                 expected_sha=None,
                 before_sha=None,
@@ -542,7 +544,7 @@ def inspect_git_push(
         if "*" in raw_spec:
             return GitPushSpec(
                 cwd=str(repo_cwd),
-                remote=remote,
+                remote=redact_remote_for_display(remote),
                 remote_ref=None,
                 expected_sha=None,
                 before_sha=None,
@@ -563,7 +565,7 @@ def inspect_git_push(
                 if not dst_ref:
                     return GitPushSpec(
                         cwd=str(repo_cwd),
-                        remote=remote,
+                        remote=redact_remote_for_display(remote),
                         remote_ref=None,
                         expected_sha=None,
                         before_sha=None,
@@ -585,9 +587,10 @@ def inspect_git_push(
                 # Explicit colon-less refspecs can be remapped by `remote.<r>.push` or
                 # `push.default=upstream`/`tracking` — fail closed instead of guessing!
                 if _git_config_has(f"remote.{remote}.push", cwd=repo_cwd):
+                    safe_remote = redact_remote_for_display(remote)
                     return GitPushSpec(
                         cwd=str(repo_cwd),
-                        remote=redact_remote_for_display(remote),
+                        remote=safe_remote,
                         remote_ref=None,
                         expected_sha=None,
                         before_sha=None,
@@ -596,7 +599,7 @@ def inspect_git_push(
                         is_force=is_force,
                         reconcilable=False,
                         reason=(
-                            f"Custom remote.{remote}.push refspec configured; "
+                            f"Custom remote.{safe_remote}.push refspec configured; "
                             "cannot safely reconcile colon-less refspec"
                         ),
                     )
@@ -636,7 +639,7 @@ def inspect_git_push(
     if remote_ref is None or (not is_delete and expected_sha is None):
         return GitPushSpec(
             cwd=str(repo_cwd),
-            remote=remote,
+            remote=redact_remote_for_display(remote) if remote else None,
             remote_ref=remote_ref,
             expected_sha=expected_sha,
             before_sha=None,

@@ -8,6 +8,7 @@ single source for that wording so the proxy, the CLI wrapper, and the docs stay 
 
 from __future__ import annotations
 
+import re
 import shlex
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,18 @@ from sidefx.journal import PayloadMismatchError
 OUTCOME_UNKNOWN_BANNER = "OUTCOME UNKNOWN — reconcile before retrying"
 
 _HASH_PREVIEW_LENGTH = 12
+_MAX_DETAIL_CHARS = 300
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+_UNSAFE_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def _sanitize_detail(text: str) -> str:
+    cleaned = _ANSI_RE.sub("", text)
+    cleaned = _UNSAFE_CHARS_RE.sub(" ", cleaned)
+    cleaned = " ".join(cleaned.split())
+    if len(cleaned) > _MAX_DETAIL_CHARS:
+        cleaned = f"{cleaned[: _MAX_DETAIL_CHARS - 1]}…"
+    return cleaned
 
 
 def _db_flag(db_path: str | Path | None) -> str:
@@ -89,7 +102,11 @@ def outcome_unknown_message(
 ) -> str:
     """Single-line ``OUTCOME UNKNOWN`` message that carries its own recovery steps."""
     tool_part = f", tool={tool_name}" if tool_name else ""
-    head = f"{OUTCOME_UNKNOWN_BANNER} (action_id={action_id}, marker={marker}{tool_part}): {detail}"
+    safe_detail = _sanitize_detail(detail)
+    head = (
+        f"{OUTCOME_UNKNOWN_BANNER} (action_id={action_id}, marker={marker}{tool_part}): "
+        f"{safe_detail}"
+    )
     steps = outcome_unknown_next_steps(action_id, db_path=db_path)
     numbered = " ".join(f"{index}) {step}" for index, step in enumerate(steps, start=1))
     return _join_sentence(head, f"Next steps: {numbered}")
@@ -123,8 +140,8 @@ def outcome_unknown_cli_hint(
             f"  2. Record what you found: `{landed}` (add --ref <url-or-id>) or `{not_landed}`."
         )
         lines.append(
-            "  3. Re-run this exact command: it replays the recorded result, or executes "
-            "again if you recorded --not-landed."
+            "  3. If it landed, stop (do not re-run). If you recorded --not-landed, "
+            "re-run the exact original command."
         )
     return "\n".join(lines)
 

@@ -536,6 +536,8 @@ class Journal:
                     f"Failed to create journal directory {journal_dir}: {exc}"
                 ) from exc
             if created_dir:
+                with suppress(OSError):
+                    os.chmod(journal_dir, 0o700)
                 _write_journal_gitignore(journal_dir)
             target_str = str(self._db_path)
         else:
@@ -551,6 +553,10 @@ class Journal:
             )
         except sqlite3.Error as exc:
             raise JournalError(f"Failed to open journal database {target_str}: {exc}") from exc
+
+        if self._db_path is not None:
+            with suppress(OSError):
+                os.chmod(self._db_path, 0o600)
 
         conn.row_factory = sqlite3.Row
         try:
