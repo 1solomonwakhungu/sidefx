@@ -18,6 +18,31 @@ When an AI agent mutates external state (`gh issue create`, `git push`, MCP `too
 
 ---
 
+## Quick Start
+
+```bash
+uv tool install git+https://github.com/1solomonwakhungu/sidefx   # 1. install
+cd your-repo && sidefx init                                      # 2. write .sidefx.json
+```
+
+3. Put `sidefx mcp-proxy --deterministic-ids --` in front of any stdio MCP server command (full configs for Claude Code, Cursor, and Codex are [below](#drop-in-mcp-proxy-setup)):
+
+```json
+{ "command": "sidefx", "args": ["mcp-proxy", "--deterministic-ids", "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "."] }
+```
+
+4. Wrap mutating shell commands with a stable action ID:
+
+```bash
+sidefx wrap --action-id push-feat-retries -- git push origin feat/retries
+```
+
+5. Check what happened with `sidefx status` or `sidefx report`.
+
+The journal lives in `.sidefx/journal.db` next to `.sidefx.json`. `sidefx` writes a `.gitignore` into that directory when it creates it, so `git add -A` never picks the journal up.
+
+---
+
 ## Installation
 
 ### Run without installing (`uvx`)
@@ -54,6 +79,12 @@ Wrap any stdio MCP server with `sidefx mcp-proxy [options] -- <upstream_cmd ...>
 Read-only tools (`get_*`, `list_*`, `read_*`, `search_*`, etc.) and protocol methods (`initialize`, `tools/list`, `resources/list`) pass straight through. Mutating `tools/call` requests pass through preflight guardrails, write a durable `pending` journal row, and are protected against duplicate dispatch on timeout or crash.
 
 Clients can pass an explicit `_sidefx_action_id` (stripped before forwarding to the upstream server) or `idempotency_key`, or enable `--deterministic-ids` for session-scoped deduplication.
+
+How action IDs behave:
+
+- **`--deterministic-ids`** derives the ID from `(session, tool, arguments)`, so a repeated identical call in the same proxy session is answered from the journal and never re-sent. The repeated result ends with a `[sidefx] Duplicate call not re-sent` notice so the agent knows no second write happened. To repeat a call on purpose, the agent adds a unique `_sidefx_action_id` argument.
+- **The session is one proxy process** unless you pin it with `--session-id` or `SIDEFX_SESSION_ID`. Pin it if you want deduplication to survive a proxy or agent restart.
+- **Without `--deterministic-ids` and without an explicit ID**, every call gets a random ID: it is journaled and shows up in receipts, but a retry is not recognized as a duplicate.
 
 ### Claude Code (`.mcp.json` or `~/.claude.json`)
 
@@ -276,6 +307,77 @@ sidefx reconcile --stale-pending-after 60
 ```
 
 `sidefx reconcile` is fail-closed: it only transitions an action to `reconciled` on an exact external match (`found`), and only transitions to `failed` on an exhaustive, un-truncated `not_found`. Any HTTP error, auth error, or pagination truncation leaves the row `unknown`.
+
+### Resolve an action no reconciler can check (`sidefx resolve`)
+
+Built-in reconcilers cover `git push` and GitHub issues, PRs, and comments. For every other tool (an arbitrary MCP server, a deploy script, a webhook) `sidefx reconcile` reports `No reconciler available`, and the action stays `unknown`, which blocks that exact call. Check the external system yourself, then record what you found:
+
+```bash
+# The write exists: later retries replay this ref instead of writing again
+sidefx resolve --action-id mcp-webhook-7 --landed --ref https://hooks.example.com/d/81 --note "seen in list_deliveries"
+
+# The write does not exist: the same call is accepted and sent again
+sidefx resolve --action-id mcp-webhook-7 --not-landed
+```
+
+- `--landed` marks the action `reconciled`; `--not-landed` marks it `failed`, which re-opens the call.
+- The note is stored in the journal row, so receipts show the outcome was a manual attestation (`manually resolved as landed: seen in list_deliveries`).
+- A `pending` action is refused unless you pass `--force-pending`, because a worker may still be running it.
+- If the same action ID exists on several targets, pass `--target` (and `--actor`) to pick one.
+
+---
+
+## What the Agent Sees, and What It Should Do
+
+Every blocking error carries its own next steps in the error text, because most MCP clients show the model only the JSON-RPC `message`. The same fields are in `error.data` for programmatic clients.
+
+| Error | JSON-RPC code / `wrap` exit | Meaning | What to do |
+|---|---|---|---|
+| `OUTCOME UNKNOWN — reconcile before retrying` | `-32002` / exit `75` (`124` on the timeout itself) | A write was sent and the reply was lost. It may have landed. | Do not re-send or reword the call. Run the `sidefx reconcile` command from the message. If no reconciler covers the tool, verify with a read-only call and run `sidefx resolve --landed` or `--not-landed`, then repeat the original call unchanged. |
+| `Preflight check denied tool ...` | `-32001` | A `.sidefx.json` rule rejected an argument. Nothing was sent. | Do not retry unchanged. Change the argument to satisfy the rule, or ask the user. |
+| `Payload mismatch for action ...` | `-32004` / exit `2` | The action ID was already used for a different payload. Nothing was sent. | Use a new action ID for a new write, or repeat the original payload to get the original result. |
+| `[sidefx] Duplicate call not re-sent` (appended to a normal result) | none | With `--deterministic-ids`, an identical call already ran in this session. | Nothing, unless a second write was intended: then repeat with a unique `_sidefx_action_id`. |
+
+`OUTCOME UNKNOWN` `error.data` example:
+
+```json
+{
+  "kind": "outcome_unknown",
+  "action_id": "det-1aec4c3caa608cc3782451d3",
+  "tool": "create_ticket",
+  "status": "unknown",
+  "detail": "upstream MCP server timed out after 30s",
+  "journal": "/path/to/repo/.sidefx/journal.db",
+  "reconcile_command": "sidefx reconcile --db /path/to/repo/.sidefx/journal.db --action-id det-1aec4c3caa608cc3782451d3",
+  "resolve_commands": {
+    "landed": "sidefx resolve --db /path/to/repo/.sidefx/journal.db --action-id det-1aec4c3caa608cc3782451d3 --landed",
+    "not_landed": "sidefx resolve --db /path/to/repo/.sidefx/journal.db --action-id det-1aec4c3caa608cc3782451d3 --not-landed"
+  },
+  "next_steps": ["Do not re-send or reword this call: the earlier attempt may have landed.", "..."]
+}
+```
+
+### Paste into `AGENTS.md` / `CLAUDE.md`
+
+```markdown
+## sidefx (outbound write journal)
+
+Mutating MCP calls and `sidefx wrap` commands in this repo are journaled by sidefx.
+
+- `OUTCOME UNKNOWN`: the write may have landed. Never re-send or reword the call. Run the
+  `sidefx reconcile --action-id <id>` command from the error. If it says no reconciler is
+  available, check with a read-only call whether the write exists, then run
+  `sidefx resolve --action-id <id> --landed --ref <url>` or `--not-landed`, and repeat the
+  original call unchanged.
+- `Preflight check denied`: a policy rule in `.sidefx.json` blocked the call. Do not retry
+  unchanged; fix the argument or ask the user.
+- `Payload mismatch`: an action ID was reused for a different write. Use a new ID.
+- `[sidefx] Duplicate call not re-sent`: the identical call already ran this session. To run
+  it again on purpose, add a unique `_sidefx_action_id` string argument.
+- Wrap mutating shell commands: `sidefx wrap --action-id <stable-id> -- <command>`. Reuse the
+  same ID when retrying the same command; use a new ID for a new write.
+- Before summarizing work, run `sidefx report` and list side effects from it, not from memory.
+```
 
 ---
 
