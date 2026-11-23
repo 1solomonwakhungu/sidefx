@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sidefx"
+version = "0.1.0"
+description = "Outbound effects journal, transparent stdio MCP proxy, crash reconciler, and ground-truth session receipts for AI agents."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+sidefx = "sidefx.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sidefx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "W"]
