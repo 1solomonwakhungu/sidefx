@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,6 @@ from sidefx.reconcilers.base import format_summary_with_meta
 
 def _populate_sample_journal(db_path: Path) -> None:
     with Journal(db_path) as journal:
-        # Confirmed (sess-1)
         journal.begin_action(
             action_id="a-confirmed",
             session_id="sess-1",
@@ -42,7 +42,6 @@ def _populate_sample_journal(db_path: Path) -> None:
             result_ref="https://github.com/org/repo/issues/10",
         )
 
-        # Reconciled (sess-1)
         journal.begin_action(
             action_id="a-reconciled",
             session_id="sess-1",
@@ -61,7 +60,6 @@ def _populate_sample_journal(db_path: Path) -> None:
             result_ref="origin refs/heads/feat@1234567890ab",
         )
 
-        # Failed (sess-1)
         journal.begin_action(
             action_id="a-failed",
             session_id="sess-1",
@@ -72,10 +70,13 @@ def _populate_sample_journal(db_path: Path) -> None:
             payload={"k": 3},
         )
         journal.mark_failed(
-            "agent", "user@example.com", "a-failed", attempt=1, error="SMTP 550 rejected"
+            "agent",
+            "user@example.com",
+            "a-failed",
+            attempt=1,
+            error="SMTP 550 [click](https://evil.example)",
         )
 
-        # Unknown with ANSI/newline/bidi injection attempt (sess-1)
         journal.begin_action(
             action_id="a-unknown",
             session_id="sess-1",
@@ -90,10 +91,9 @@ def _populate_sample_journal(db_path: Path) -> None:
             "org/`repo`",
             "a-unknown",
             attempt=1,
-            error="timeout \x1b[31mred\x1b[0m\n## Forged Heading\u202e",
+            error="timeout \x1b[31mred\x1b[0m\n## Forged Heading\u202e\u2028\U000e0041",
         )
 
-        # Pending (sess-1)
         journal.begin_action(
             action_id="a-pending",
             session_id="sess-1",
@@ -107,7 +107,6 @@ def _populate_sample_journal(db_path: Path) -> None:
             ),
         )
 
-        # Different session (sess-2)
         journal.begin_action(
             action_id="a-other-session",
             session_id="sess-2",
@@ -151,31 +150,30 @@ class TestReceiptRenderingAndCli:
         db_path = tmp_path / "journal.db"
         _populate_sample_journal(db_path)
 
-        # Markdown filtered to sess-1
         rc_md = main(["--db", str(db_path), "report", "--session-id", "sess-1", "--markdown"])
         assert rc_md == 0
         md = capsys.readouterr().out
         assert "## sidefx Session Receipt" in md
         assert "5 total (1 confirmed, 1 reconciled, 1 failed, 2 unknown (1 pending))" in md
         assert "### Confirmed (1)" in md
-        assert "https://github.com/org/repo/issues/10" in md
+        assert "`https://github.com/org/repo/issues/10`" in md
         assert "### Reconciled (1)" in md
-        assert "origin refs/heads/feat@1234567890ab" in md
+        assert "`origin refs/heads/feat@1234567890ab`" in md
         assert "### Failed (1)" in md
-        assert "SMTP 550 rejected" in md
+        # Untrusted error text containing Markdown link syntax is enclosed in code span (N5!)
+        assert "`SMTP 550 [click](https://evil.example)`" in md
         assert "### Unknown / Unresolved (2)" in md
         assert "[unknown]" in md and "[pending]" in md
         assert "a-other-session" not in md
-        # Control chars, ANSI escapes, bidi overrides, and internal sidefx_meta stripped!
         assert "\x1b[" not in md
         assert "\u202e" not in md
+        assert "\u2028" not in md
+        assert "\U000e0041" not in md
         assert "\n## Forged Heading" not in md
         assert "sidefx_meta=" not in md
         assert "hide-me" not in md
-        # Backtick inside target is safely fenced
         assert "`` org/`repo` ``" in md
 
-        # Text format
         rc_txt = main(
             ["report", "--db", str(db_path), "--session-id", "sess-1", "--format", "text"]
         )
@@ -187,7 +185,6 @@ class TestReceiptRenderingAndCli:
         assert "\x1b[" not in txt
         assert "sidefx_meta=" not in txt
 
-        # JSON format (unfiltered -> all 6 actions)
         rc_json = main(["--db", str(db_path), "report", "--format", "json"])
         assert rc_json == 0
         payload = json.loads(capsys.readouterr().out)
@@ -233,27 +230,49 @@ class TestReceiptRenderingAndCli:
             os.chmod(ro_dir, 0o755)
             os.chmod(ro_db, 0o644)
 
-    def test_sanitize_text_strips_ansi_controls_and_bidi(self) -> None:
-        raw = "\x1b[32mok\x1b[0m\r\nline2\x00\u202ebidi"
-        assert sanitize_text(raw) == "ok  line2 bidi"
+    def test_sanitize_text_strips_ansi_controls_bidi_and_tag_chars(self) -> None:
+        raw = "\x1b[32mok\x1b[0m\r\nline2\x00\u202e\u200b\u2028\U000e0020bidi"
+        assert sanitize_text(raw) == "ok  line2  bidi"
 
 
 class TestClaudeCodeStopHookInit:
-    def test_init_claude_code_prints_valid_snippet(
-        self, capsys: pytest.CaptureFixture[str]
+    def test_init_claude_code_prints_valid_snippet_and_absolutizes_db(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        monkeypatch.chdir(tmp_path)
         rc = main(["init", "--claude-code"])
         assert rc == 0
         parsed = json.loads(capsys.readouterr().out)
         assert parsed == claude_code_stop_hook_snippet(DEFAULT_STOP_HOOK_COMMAND)
-        stop_hooks = parsed["hooks"]["Stop"]
-        assert stop_hooks[0]["hooks"][0]["command"] == "sidefx report --format markdown"
 
-    def test_merge_preserves_existing_settings_and_is_idempotent(
+        # Relative --db is absolutized in generated Stop hook command (N7!)
+        rc_db = main(["init", "--claude-code", "--db", "rel/journal.db"])
+        assert rc_db == 0
+        parsed_db = json.loads(capsys.readouterr().out)
+        cmd_str = parsed_db["hooks"]["Stop"][0]["hooks"][0]["command"]
+        assert str((tmp_path / "rel" / "journal.db").resolve()) in cmd_str
+
+    def test_init_claude_code_rejects_path_flag_to_protect_sidefx_config(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        settings_file = tmp_path / ".claude" / "settings.json"
-        settings_file.parent.mkdir(parents=True)
+        """B7: `--path` must NOT merge hooks into `.sidefx.json`."""
+        cfg = tmp_path / ".sidefx.json"
+        rc_init = main(["init", "--path", str(cfg)])
+        assert rc_init == 0
+        orig = cfg.read_text(encoding="utf-8")
+        _ = capsys.readouterr()
+
+        rc_bad = main(["init", "--claude-code", "--path", str(cfg)])
+        assert rc_bad == 2
+        assert "--settings" in capsys.readouterr().err
+        assert cfg.read_text(encoding="utf-8") == orig
+
+    def test_merge_via_settings_flag_preserves_existing_settings_symlink_and_mode(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """B7 & N7: `--settings` merges idempotently while preserving symlink target and mode."""
+        real_target = tmp_path / "dotfiles" / "claude-settings.json"
+        real_target.parent.mkdir(parents=True)
         existing = {
             "permissions": {"allow": ["Bash(git status)"]},
             "hooks": {
@@ -263,14 +282,20 @@ class TestClaudeCodeStopHookInit:
                 "Stop": [{"hooks": [{"type": "command", "command": "echo existing-stop"}]}],
             },
         }
-        settings_file.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        real_target.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        os.chmod(real_target, 0o640)
 
-        # First merge via CLI `--path` adds sidefx Stop hook without clobbering existing keys
-        rc1 = main(["init", "--claude-code", "--path", str(settings_file)])
+        settings_link = tmp_path / ".claude" / "settings.json"
+        settings_link.parent.mkdir(parents=True)
+        settings_link.symlink_to(real_target)
+
+        rc1 = main(["init", "--claude-code", "--settings", str(settings_link)])
         assert rc1 == 0
         assert "Merged" in capsys.readouterr().out
+        assert settings_link.is_symlink()
+        assert stat.S_IMODE(real_target.stat().st_mode) == 0o640
 
-        merged = json.loads(settings_file.read_text(encoding="utf-8"))
+        merged = json.loads(real_target.read_text(encoding="utf-8"))
         assert merged["permissions"] == existing["permissions"]
         assert merged["hooks"]["PreToolUse"] == existing["hooks"]["PreToolUse"]
         assert len(merged["hooks"]["Stop"]) == 2
@@ -279,12 +304,23 @@ class TestClaudeCodeStopHookInit:
             merged["hooks"]["Stop"][1]["hooks"][0]["command"] == "sidefx report --format markdown"
         )
 
-        # Second merge is idempotent (no duplicate!)
-        rc2 = main(["init", "--claude-code", "--path", str(settings_file)])
+        # Idempotent re-run
+        rc2 = main(["init", "--claude-code", "--settings", str(settings_link)])
         assert rc2 == 0
         assert "already present" in capsys.readouterr().out
-        merged_again = json.loads(settings_file.read_text(encoding="utf-8"))
-        assert len(merged_again["hooks"]["Stop"]) == 2
+        assert len(json.loads(real_target.read_text(encoding="utf-8"))["hooks"]["Stop"]) == 2
+
+    def test_write_flag_merges_into_default_claude_settings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        rc = main(["init", "--claude-code", "--write"])
+        assert rc == 0
+        assert "Merged" in capsys.readouterr().out
+        target = tmp_path / ".claude" / "settings.json"
+        assert target.is_file()
+        data = json.loads(target.read_text(encoding="utf-8"))
+        assert data["hooks"]["Stop"][0]["hooks"][0]["command"] == DEFAULT_STOP_HOOK_COMMAND
 
     def test_merge_refuses_corrupt_or_invalid_settings_without_clobbering(
         self, tmp_path: Path

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
 import textwrap
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,7 @@ from sidefx.wrapper import (
     EXIT_OUTCOME_UNKNOWN,
     EXIT_PAYLOAD_MISMATCH,
     EXIT_TIMEOUT,
+    _inspect_curl_command,
     wrap_command,
 )
 
@@ -35,6 +38,7 @@ class _WriteTrackingGitHubServer:
         self.issues: list[dict[str, Any]] = []
         self.post_count = 0
         self.fail_gets_status: int | None = None
+        self.fail_posts_status: int | None = None
 
     def start(self) -> tuple[ThreadingHTTPServer, str]:
         state = self
@@ -51,11 +55,25 @@ class _WriteTrackingGitHubServer:
                 parts = [p for p in parsed.path.split("/") if p]
                 owner, repo = parts[1], parts[2]
                 with state.lock:
+                    if state.fail_posts_status is not None:
+                        status_code = state.fail_posts_status
+                        self.send_response(status_code)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        err_obj = {
+                            "message": "Validation Failed",
+                            "documentation_url": (
+                                "https://docs.github.com/rest/issues/issues#create-an-issue"
+                            ),
+                        }
+                        self.wfile.write(json.dumps(err_obj).encode("utf-8"))
+                        return
                     state.post_count += 1
                     num = len(state.issues) + 1
                     item = {
                         "id": num * 100,
                         "number": num,
+                        "url": f"https://api.github.com/repos/{owner}/{repo}/issues/{num}",
                         "title": payload.get("title", ""),
                         "body": payload.get("body", ""),
                         "state": "open",
@@ -136,6 +154,9 @@ def gh_harness(tmp_path: Path) -> tuple[str, _WriteTrackingGitHubServer, Path]:
                 elif args[i] in ("--repo", "-R"):
                     repo = args[i + 1]
                     i += 2
+                elif args[i].startswith("-R"):
+                    repo = args[i][2:]
+                    i += 1
                 else:
                     i += 1
 
@@ -186,17 +207,7 @@ class TestWrapGitHubEndToEnd:
         env["FAKE_GH_API_URL"] = base_url
         env["FAKE_GH_MODE"] = "normal"
 
-        cmd = [
-            str(gh_script),
-            "issue",
-            "create",
-            "-R",
-            "org/repo",
-            "--title",
-            "Bug",
-            "--body",
-            "Hi",
-        ]
+        cmd = [str(gh_script), "issue", "create", "-Rorg/repo", "--title", "Bug", "--body", "Hi"]
 
         with Journal(db_path) as journal:
             res1 = wrap_command(
@@ -214,7 +225,6 @@ class TestWrapGitHubEndToEnd:
             assert tracker.post_count == 1
             assert f"<!-- sidefx:id={res1.marker} -->" in tracker.issues[0]["body"]
 
-            # Replay returns cached result with 0 re-executions
             res2 = wrap_command(
                 cmd,
                 journal=journal,
@@ -229,13 +239,11 @@ class TestWrapGitHubEndToEnd:
             assert res2.result_ref == res1.result_ref
             assert tracker.post_count == 1
 
-            # Mutated payload under same action_id -> rejected with 0 executions
             mutated = [
                 str(gh_script),
                 "issue",
                 "create",
-                "-R",
-                "org/repo",
+                "-Rorg/repo",
                 "--title",
                 "Different",
                 "--body",
@@ -290,7 +298,6 @@ class TestWrapGitHubEndToEnd:
             assert "OUTCOME UNKNOWN" in (res1.error or "")
             assert tracker.post_count == 1
 
-            # Retry with --no-reconcile blocks without executing
             res_blocked = wrap_command(
                 cmd,
                 journal=journal,
@@ -303,7 +310,6 @@ class TestWrapGitHubEndToEnd:
             assert res_blocked.executed is False
             assert tracker.post_count == 1
 
-            # Retry with auto-reconcile recovers exact URL with ZERO duplicate writes!
             env_normal = dict(env_timeout, FAKE_GH_MODE="normal")
             res2 = wrap_command(
                 cmd,
@@ -350,7 +356,6 @@ class TestWrapGitHubEndToEnd:
             assert res1.status == ActionStatus.UNKNOWN
             assert tracker.post_count == 1
 
-            # Retry reconciles instead of double-posting!
             env_ok = dict(env, FAKE_GH_MODE="normal")
             res2 = wrap_command(
                 cmd, journal=journal, action_id="gh-crash", env=env_ok, github_api_url=base_url
@@ -368,7 +373,17 @@ class TestWrapGitHubEndToEnd:
     ) -> None:
         base_url, tracker, gh_script = gh_harness
         db_path = tmp_path / "journal.db"
-        cmd = [str(gh_script), "issue", "create", "-R", "org/repo", "--title", "Pre", "--body", "Z"]
+        cmd = [
+            str(gh_script),
+            "issue",
+            "create",
+            "-R",
+            "org/repo",
+            "--title",
+            "Pre",
+            "--body",
+            "Z",
+        ]
 
         env_pre = os.environ.copy()
         env_pre["FAKE_GH_API_URL"] = base_url
@@ -387,7 +402,6 @@ class TestWrapGitHubEndToEnd:
             assert res1.status == ActionStatus.UNKNOWN
             assert tracker.post_count == 0
 
-            # Retry reconciles -> NOT_FOUND -> marks attempt 1 failed -> retries attempt 2!
             env_ok = dict(env_pre, FAKE_GH_MODE="normal")
             res2 = wrap_command(
                 cmd,
@@ -429,7 +443,6 @@ class TestWrapGitHubEndToEnd:
             assert res1.status == ActionStatus.UNKNOWN
             assert tracker.post_count == 1
 
-            # GitHub GET fails with 500 -> reconciler returns UNKNOWN -> retry BLOCKED!
             tracker.fail_gets_status = 500
             env_ok = dict(env_pre, FAKE_GH_MODE="normal")
             res2 = wrap_command(
@@ -468,7 +481,6 @@ class TestWrapGitHubEndToEnd:
         env["FAKE_GH_MODE"] = "normal"
 
         with Journal(db_path) as journal:
-            # Simulate Worker A having just claimed `pending` (in-flight, not posted yet)
             journal.begin_action(
                 action_id="in-flight",
                 session_id="s1",
@@ -478,7 +490,6 @@ class TestWrapGitHubEndToEnd:
                 target="org/repo",
                 payload={"argv": cmd, "target": "org/repo", "tool_name": "gh_issue_create"},
             )
-            # Worker B arrives while Worker A is still in flight
             res_b = wrap_command(
                 cmd,
                 journal=journal,
@@ -493,6 +504,25 @@ class TestWrapGitHubEndToEnd:
             assert tracker.post_count == 0
             rec = journal.get_action("agent", "org/repo", "in-flight")
             assert rec is not None and rec.status == ActionStatus.PENDING
+
+    def test_other_gh_subcommand_nonzero_exit_marks_unknown(
+        self, tmp_path: Path, gh_harness: tuple[str, _WriteTrackingGitHubServer, Path]
+    ) -> None:
+        """N12: `gh api` or `gh pr merge` exiting non-zero must mark unknown, not failed."""
+        base_url, _, gh_script = gh_harness
+        db_path = tmp_path / "journal.db"
+        env = os.environ.copy()
+        env["FAKE_GH_API_URL"] = base_url
+
+        with Journal(db_path) as journal:
+            res = wrap_command(
+                [str(gh_script), "pr", "merge", "42"],
+                journal=journal,
+                action_id="gh-merge-1",
+                env=env,
+            )
+            assert res.exit_code == 2
+            assert res.status == ActionStatus.UNKNOWN
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -523,7 +553,6 @@ class TestWrapGitPushEndToEnd:
 
         db_path = tmp_path / "journal.db"
         with Journal(db_path) as journal:
-            # 1. Normal wrapped git push
             res1 = wrap_command(
                 ["git", "push", "origin", "main"],
                 journal=journal,
@@ -534,15 +563,11 @@ class TestWrapGitPushEndToEnd:
             assert res1.status == ActionStatus.CONFIRMED
             assert res1.result_ref == f"origin refs/heads/main@{sha1[:12]}"
 
-            # 2. Second commit: simulate post-push timeout by manually pushing after unknown
             (work / "a.txt").write_text("2\n", encoding="utf-8")
             _git(work, "add", "a.txt")
             _git(work, "commit", "-m", "c2")
             sha2 = _git(work, "rev-parse", "HEAD")
 
-            # Use a fake `git` wrapper script? Even cleaner: wrap a real push that gets
-            # interrupted/timed out, OR simulate pre-push timeout and post-push timeout cleanly.
-            # Test A: push fails/times out BEFORE landing (simulated with bad env or pre-push hook)
             hook_dir = bare / "hooks"
             pre_recv = hook_dir / "pre-receive"
             pre_recv.write_text("#!/bin/sh\nsleep 5\nexit 1\n", encoding="utf-8")
@@ -558,7 +583,6 @@ class TestWrapGitPushEndToEnd:
             assert res_pre_timeout.exit_code == EXIT_TIMEOUT
             assert res_pre_timeout.status == ActionStatus.UNKNOWN
 
-            # Remove blocking hook and retry -> reconciler proves NOT_FOUND -> retries -> CONFIRMED!
             pre_recv.unlink()
             res_retry_ok = wrap_command(
                 ["git", "push", "origin", "main"],
@@ -571,7 +595,6 @@ class TestWrapGitPushEndToEnd:
             assert res_retry_ok.status == ActionStatus.CONFIRMED
             assert res_retry_ok.result_ref == f"origin refs/heads/main@{sha2[:12]}"
 
-            # 3. Third commit: post-receive hook hangs AFTER push already updated the bare repo!
             (work / "a.txt").write_text("3\n", encoding="utf-8")
             _git(work, "add", "a.txt")
             _git(work, "commit", "-m", "c3")
@@ -591,7 +614,6 @@ class TestWrapGitPushEndToEnd:
             assert res_post_timeout.exit_code == EXIT_TIMEOUT
             assert res_post_timeout.status == ActionStatus.UNKNOWN
 
-            # Remove hang hook; retry reconciles via git ls-remote -> FOUND -> RECONCILED!
             post_recv.unlink()
             res_reconciled = wrap_command(
                 ["git", "push", "origin", "main"],
@@ -605,7 +627,6 @@ class TestWrapGitPushEndToEnd:
             assert res_reconciled.status == ActionStatus.RECONCILED
             assert res_reconciled.result_ref == f"origin refs/heads/main@{sha3[:12]}"
 
-            # 4. Mutate HEAD under reused action_id -> PayloadMismatchError!
             (work / "a.txt").write_text("4\n", encoding="utf-8")
             _git(work, "add", "a.txt")
             _git(work, "commit", "-m", "c4")
@@ -625,7 +646,6 @@ class TestWrapCliAndEdgeCases:
     ) -> None:
         db_path = tmp_path / "journal.db"
 
-        # Inner command has `--timeout` and `--target` flags after `--`: must stay verbatim!
         rc = main(
             [
                 "--db",
@@ -646,10 +666,8 @@ class TestWrapCliAndEdgeCases:
             ]
         )
         assert rc == 0
-        out = capsys.readouterr().out
-        assert "--timeout 999 --target inner" in out
+        assert "--timeout 999 --target inner" in capsys.readouterr().out
 
-        # Missing executable marks failed and exits 127
         rc_nf = main(
             [
                 "--db",
@@ -667,46 +685,169 @@ class TestWrapCliAndEdgeCases:
             rec = j.get_action("agent", "definitely_nonexistent_sidefx_binary_xyz", "no-bin")
             assert rec is not None and rec.status == ActionStatus.FAILED
 
-    def test_timeout_kills_grandchild_process_group(self, tmp_path: Path) -> None:
+    def test_non_utf8_output_does_not_crash_wrap(self, tmp_path: Path) -> None:
+        """B6: Binary / non-UTF-8 stdout must confirm cleanly without UnicodeDecodeError."""
         db_path = tmp_path / "journal.db"
-        pid_file = tmp_path / "child.pid"
-        script = (
+        with Journal(db_path) as journal:
+            res = wrap_command(
+                [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'ok\\xff\\xfe\\n')"],
+                journal=journal,
+                action_id="bin-out",
+            )
+            assert res.exit_code == 0
+            assert res.status == ActionStatus.CONFIRMED
+            assert res.stdout_bytes == b"ok\xff\xfe\n"
+
+    def test_timeout_kills_sigterm_ignoring_grandchild_process_group(self, tmp_path: Path) -> None:
+        """N1: Even if parent exits on SIGTERM, SIGTERM-ignoring grandchild must be SIGKILLed."""
+        db_path = tmp_path / "journal.db"
+        marker_file = tmp_path / "grandchild_wrote.txt"
+        pid_file = tmp_path / "grandchild.pid"
+        grandchild_code = (
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(1.5); "
+            f"open({str(marker_file)!r}, 'w').write('leaked')"
+        )
+        parent_code = (
             "import subprocess, sys, time; "
-            "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+            f"p = subprocess.Popen([sys.executable, '-c', {grandchild_code!r}]); "
             f"open({str(pid_file)!r}, 'w').write(str(p.pid)); "
             "time.sleep(30)"
         )
         with Journal(db_path) as journal:
             res = wrap_command(
-                [sys.executable, "-c", script],
+                [sys.executable, "-c", parent_code],
                 journal=journal,
-                action_id="pg-kill",
+                action_id="pg-sigkill",
                 timeout_seconds=0.4,
             )
             assert res.exit_code == EXIT_TIMEOUT
             assert res.status == ActionStatus.UNKNOWN
 
+        time.sleep(0.2)
         if pid_file.exists():
             grandchild_pid = int(pid_file.read_text(encoding="utf-8").strip())
-            # Grandchild should have been killed along with process group
             with pytest.raises(ProcessLookupError):
                 os.kill(grandchild_pid, 0)
+        assert not marker_file.exists()
 
-    def test_curl_github_rest_post_injects_marker_and_recovers(
+    def test_sigterm_to_wrap_kills_child_and_marks_unknown(self, tmp_path: Path) -> None:
+        """B1: SIGTERM to `sidefx wrap` must kill child group and mark row `unknown`."""
+        db_path = tmp_path / "journal.db"
+        side_effect_file = tmp_path / "should_not_exist.txt"
+        started_file = tmp_path / "started.txt"
+        child_code = (
+            f"open({str(started_file)!r}, 'w').write('go'); "
+            "import time; time.sleep(3); "
+            f"open({str(side_effect_file)!r}, 'w').write('ran')"
+        )
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "sidefx",
+                "--db",
+                str(db_path),
+                "wrap",
+                "--action-id",
+                "term-1",
+                "--target",
+                "t",
+                "--",
+                sys.executable,
+                "-c",
+                child_code,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 5.0
+        while not started_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert started_file.exists()
+
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=5.0)
+        assert proc.returncode == 128 + signal.SIGTERM
+        assert not side_effect_file.exists()
+
+        with Journal.open_readonly(db_path) as j:
+            rec = j.get_action("agent", "t", "term-1")
+            assert rec is not None and rec.status == ActionStatus.UNKNOWN
+
+    def test_concurrent_external_transition_does_not_crash_wrap_or_drop_stdout(
+        self, tmp_path: Path
+    ) -> None:
+        """B1: External mid-exec state mutation must preserve stdout and avoid crashing."""
+        db_path = tmp_path / "journal.db"
+        script = textwrap.dedent(
+            f"""\
+            import sys
+            from sidefx.journal import Journal
+            with Journal({str(db_path)!r}) as j:
+                j.mark_failed("agent", "t", "race-wrap", attempt=1, error="external")
+            print("important-stdout")
+            """
+        )
+        with Journal(db_path) as journal:
+            res = wrap_command(
+                [sys.executable, "-c", script],
+                journal=journal,
+                action_id="race-wrap",
+                target="t",
+            )
+            assert res.exit_code == 1
+            assert "important-stdout" in res.stdout
+            assert "concurrently" in (res.error or "")
+
+    def test_curl_github_detection_rejects_non_matching_paths_hosts_and_methods(self) -> None:
+        """B3: Only exact supported endpoints on the configured GitHub API origin match."""
+        gh_api = "https://api.github.com"
+
+        for bad_cmd in (
+            ["curl", "-X", "POST", f"{gh_api}/repos/o/r/pulls/7/comments", "-d", '{"body":"x"}'],
+            ["curl", "-X", "POST", f"{gh_api}/repos/o/r/pulls/7/reviews", "-d", '{"body":"x"}'],
+            ["curl", "-X", "POST", f"{gh_api}/repos/o/r/issues/5/labels", "-d", '{"labels":[]}'],
+            ["curl", "-X", "POST", "https://gitea.example.com/api/v1/repos/o/r/issues", "-d", "{}"],
+            ["curl", "-X", "POST", "https://ghes.corp/api/v3/repos/o/r/issues", "-d", "{}"],
+            ["curl", "-XPATCH", f"{gh_api}/repos/o/r/issues", "-d", '{"body":"x"}'],
+            ["curl", "-G", f"{gh_api}/repos/o/r/issues", "-d", '{"body":"x"}'],
+        ):
+            _, meta, exec_argv, is_gh = _inspect_curl_command(
+                bad_cmd, marker="m1", configured_github_api_url=gh_api
+            )
+            assert is_gh is False, f"Should NOT match GitHub POST: {bad_cmd}"
+            assert meta == {}
+            assert exec_argv == bad_cmd
+
+        # Attached -XPOST on exact endpoint DOES match!
+        _, meta_ok, exec_ok, is_gh_ok = _inspect_curl_command(
+            ["curl", "-XPOST", f"{gh_api}/repos/o/r/issues", "-d", '{"title":"T","body":"B"}'],
+            marker="m1",
+            configured_github_api_url=gh_api,
+        )
+        assert is_gh_ok is True
+        assert meta_ok["kind"] == "issue"
+        assert meta_ok["marker_injected"] is True
+        assert "<!-- sidefx:id=m1 -->" in exec_ok[-1]
+
+    def test_curl_github_422_is_not_confirmed_and_201_extracts_html_url(
         self,
         tmp_path: Path,
         gh_harness: tuple[str, _WriteTrackingGitHubServer, Path],
     ) -> None:
+        """B8: curl exit 0 on HTTP 422 marks UNKNOWN; HTTP 201 extracts html_url (not API url)."""
         base_url, tracker, _ = gh_harness
         db_path = tmp_path / "journal.db"
 
-        # Fake `curl` script that POSTs its -d payload to the URL
         fake_curl = tmp_path / "curl"
         fake_curl.write_text(
             textwrap.dedent(
                 f"""\
                 #!{sys.executable}
-                import sys, urllib.request
+                import sys, urllib.error, urllib.request
                 args = sys.argv[1:]
                 url = [a for a in args if a.startswith("http")][0]
                 data = args[args.index("-d") + 1]
@@ -716,8 +857,12 @@ class TestWrapCliAndEdgeCases:
                     headers={{"Content-Type": "application/json"}},
                     method="POST",
                 )
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    print(resp.read().decode("utf-8"))
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        print(resp.read().decode("utf-8"))
+                except urllib.error.HTTPError as exc:
+                    # Mimic curl without -f: prints error body and exits 0!
+                    print(exc.read().decode("utf-8"))
                 """
             ),
             encoding="utf-8",
@@ -725,7 +870,28 @@ class TestWrapCliAndEdgeCases:
         fake_curl.chmod(0o755)
 
         with Journal(db_path) as journal:
-            res = wrap_command(
+            # 1. HTTP 422 with curl exit 0 MUST be marked UNKNOWN, NOT CONFIRMED!
+            tracker.fail_posts_status = 422
+            res_err = wrap_command(
+                [
+                    str(fake_curl),
+                    "-X",
+                    "POST",
+                    f"{base_url}/repos/org/repo/issues",
+                    "-d",
+                    '{"title":"Bad","body":"Hello"}',
+                ],
+                journal=journal,
+                action_id="curl-422",
+                github_api_url=base_url,
+            )
+            assert res_err.exit_code == EXIT_OUTCOME_UNKNOWN
+            assert res_err.status == ActionStatus.UNKNOWN
+            assert tracker.post_count == 0
+
+            # 2. HTTP 201 extracts html_url (https://github.com/...) rather than API `url`!
+            tracker.fail_posts_status = None
+            res_ok = wrap_command(
                 [
                     str(fake_curl),
                     "-X",
@@ -735,11 +901,25 @@ class TestWrapCliAndEdgeCases:
                     '{"title":"FromCurl","body":"Hello"}',
                 ],
                 journal=journal,
-                action_id="curl-1",
+                action_id="curl-201",
                 github_api_url=base_url,
             )
-            assert res.exit_code == 0
-            assert res.status == ActionStatus.CONFIRMED
-            assert res.result_ref == "https://github.com/org/repo/issues/1"
+            assert res_ok.exit_code == 0
+            assert res_ok.status == ActionStatus.CONFIRMED
+            assert res_ok.result_ref == "https://github.com/org/repo/issues/1"
             assert tracker.post_count == 1
-            assert f"<!-- sidefx:id={res.marker} -->" in tracker.issues[0]["body"]
+            assert f"<!-- sidefx:id={res_ok.marker} -->" in tracker.issues[0]["body"]
+
+    def test_secret_redaction_in_target_and_summary(self, tmp_path: Path) -> None:
+        """N6: Userinfo, query strings, and generic CLI secret args are not stored in journal."""
+        db_path = tmp_path / "journal.db"
+        with Journal(db_path) as journal:
+            res = wrap_command(
+                [sys.executable, "-c", "print('ok')", "--token", "super_secret_value"],
+                journal=journal,
+                action_id="sec-1",
+            )
+            assert res.exit_code == 0
+            rec = journal.get_action("agent", res.target, "sec-1")
+            assert rec is not None
+            assert "super_secret_value" not in (rec.summary or "")

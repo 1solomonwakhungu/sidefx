@@ -7,6 +7,7 @@ import json
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from sidefx.config import SidefxConfig, load_config
@@ -24,6 +25,7 @@ from sidefx.reconcilers.base import (
     ReconcileState,
     format_summary_with_meta,
     parse_summary_meta,
+    sanitize_text,
     validate_marker_token,
 )
 from sidefx.reconcilers.git_push import GitPushReconciler, GitPushSpec, inspect_git_push
@@ -110,6 +112,22 @@ def default_reconcilers(
     ]
 
 
+def _record_age_seconds(record: ActionRecord, *, now: datetime | None = None) -> float | None:
+    """Return elapsed seconds since ``record.updated_at`` (or ``created_at``), or None."""
+    raw = record.updated_at or record.created_at
+    if not raw:
+        return None
+    try:
+        ts = datetime.strptime(raw, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+    except ValueError:
+        try:
+            ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    ref = now if now is not None else datetime.now(UTC)
+    return max(0.0, (ref - ts).total_seconds())
+
+
 def reconcile_action(
     journal: Journal,
     record: ActionRecord,
@@ -117,12 +135,18 @@ def reconcile_action(
     reconcilers: Sequence[Reconciler] | None = None,
     dry_run: bool = False,
     mark_not_found_failed: bool = True,
+    mark_pending_not_found_failed: bool = False,
 ) -> ReconcileOutcome:
     """Reconcile one ``pending`` or ``unknown`` action against external systems.
 
-    Uses attempt-fenced journal transitions so a concurrent worker or newer attempt
-    cannot be clobbered. Never marks an action ``failed`` unless the adapter explicitly
-    returned ``ReconcileState.NOT_FOUND`` AND ``mark_not_found_failed`` is True.
+    Safety invariants:
+      - Uses attempt-fenced journal transitions so a concurrent worker or newer attempt
+        cannot be clobbered.
+      - Never marks an action ``failed`` unless the adapter explicitly returned
+        ``ReconcileState.NOT_FOUND`` AND ``mark_not_found_failed`` is True.
+      - Never marks a ``pending`` action ``failed`` on ``NOT_FOUND`` unless the caller
+        explicitly opts in via ``mark_pending_not_found_failed=True`` (because a live
+        worker may still be in flight and about to commit the side effect!).
     """
     if record.status not in (ActionStatus.PENDING, ActionStatus.UNKNOWN):
         return ReconcileOutcome(
@@ -204,7 +228,26 @@ def reconcile_action(
                 applied=False,
             )
 
-    if result.state == ReconcileState.NOT_FOUND and mark_not_found_failed:
+    if result.state == ReconcileState.NOT_FOUND:
+        can_mark_failed = mark_not_found_failed and (
+            record.status == ActionStatus.UNKNOWN or mark_pending_not_found_failed
+        )
+        if not can_mark_failed:
+            safe_result = ReconcileResult(
+                state=ReconcileState.UNKNOWN,
+                details=(
+                    "Action is still pending (possibly in-flight); left pending despite "
+                    "remote not_found (pass --stale-pending-after <secs> or --force-pending "
+                    "once the worker has terminated)"
+                ),
+            )
+            return ReconcileOutcome(
+                record=record,
+                result=safe_result,
+                reconciler_name=chosen.name,
+                updated_record=None,
+                applied=False,
+            )
         try:
             updated = journal.mark_failed(
                 record.actor,
@@ -249,6 +292,16 @@ def _positive_float(raw: str) -> float:
     return value
 
 
+def _non_negative_float(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid number: {raw!r}") from exc
+    if value < 0 or value != value:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return value
+
+
 def _build_reconcile_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sidefx reconcile",
@@ -264,7 +317,26 @@ def _build_reconcile_parser() -> argparse.ArgumentParser:
         "--all",
         dest="reconcile_all",
         action="store_true",
-        help="Reconcile all pending and unknown actions.",
+        help="Reconcile all pending and unknown actions across all sessions.",
+    )
+    parser.add_argument(
+        "--stale-pending-after",
+        dest="stale_pending_after",
+        type=_non_negative_float,
+        default=None,
+        help=(
+            "Allow marking a PENDING row failed on NOT_FOUND only if it has been "
+            "pending for at least this many seconds."
+        ),
+    )
+    parser.add_argument(
+        "--force-pending",
+        dest="force_pending",
+        action="store_true",
+        help=(
+            "Allow marking PENDING rows failed on NOT_FOUND immediately "
+            "(only use once you are certain no worker is still in flight)."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -301,12 +373,18 @@ def handle_reconcile_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
 
     effective_config = load_config(sub_args.config_path) if sub_args.config_path else config
     db_raw = sub_args.db_path or getattr(args, "db_path", None)
-    session_id = sub_args.session_id or getattr(args, "session_id", None)
+    session_id = (
+        None
+        if sub_args.reconcile_all
+        else (sub_args.session_id or getattr(args, "session_id", None))
+    )
     db_path = resolve_db_path(db_raw, config=effective_config)
 
     if not db_path.exists():
         if sub_args.action_id:
-            print(f"error: journal database not found: {db_path}", file=sys.stderr)
+            print(
+                f"error: journal database not found: {sanitize_text(str(db_path))}", file=sys.stderr
+            )
             return 1
         if sub_args.as_json:
             print(
@@ -325,6 +403,7 @@ def handle_reconcile_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
     )
 
     journal_ctx = Journal.open_readonly(db_path) if sub_args.dry_run else Journal(db_path)
+    now_utc = datetime.now(UTC)
     with journal_ctx as journal:
         candidates = journal.list_actions(
             session_id=session_id,
@@ -336,19 +415,33 @@ def handle_reconcile_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
         if sub_args.action_id is not None:
             candidates = [rec for rec in candidates if rec.action_id == sub_args.action_id]
             if not candidates:
-                print(f"error: action_id not found: {sub_args.action_id}", file=sys.stderr)
+                print(
+                    f"error: action_id not found: {sanitize_text(sub_args.action_id)}",
+                    file=sys.stderr,
+                )
                 return 1
 
-        outcomes = [
-            reconcile_action(
-                journal,
-                rec,
-                reconcilers=reconcilers,
-                dry_run=sub_args.dry_run,
-                mark_not_found_failed=True,
+        outcomes: list[ReconcileOutcome] = []
+        for rec in candidates:
+            allow_pending_fail = False
+            if rec.status == ActionStatus.PENDING:
+                if sub_args.force_pending:
+                    allow_pending_fail = True
+                elif sub_args.stale_pending_after is not None:
+                    age = _record_age_seconds(rec, now=now_utc)
+                    if age is not None and age >= sub_args.stale_pending_after:
+                        allow_pending_fail = True
+
+            outcomes.append(
+                reconcile_action(
+                    journal,
+                    rec,
+                    reconcilers=reconcilers,
+                    dry_run=sub_args.dry_run,
+                    mark_not_found_failed=True,
+                    mark_pending_not_found_failed=allow_pending_fail,
+                )
             )
-            for rec in candidates
-        ]
 
     has_unknown = any(o.result.state == ReconcileState.UNKNOWN for o in outcomes)
 
@@ -370,12 +463,13 @@ def handle_reconcile_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
     for outcome in outcomes:
         rec = outcome.record
         res = outcome.result
-        adapter = outcome.reconciler_name or "none"
+        adapter = sanitize_text(outcome.reconciler_name or "none")
         mode = " (dry-run)" if sub_args.dry_run else ""
-        ref_part = f" -> {res.result_ref}" if res.result_ref else ""
-        detail_part = f" | {res.details}" if res.details else ""
+        ref_part = f" -> {sanitize_text(res.result_ref)}" if res.result_ref else ""
+        detail_part = f" | {sanitize_text(res.details)}" if res.details else ""
         print(
-            f"[{res.state.value:<9}] {rec.action_id} ({rec.tool_name} target={rec.target}) "
+            f"[{res.state.value:<9}] {sanitize_text(rec.action_id)} "
+            f"({sanitize_text(rec.tool_name)} target={sanitize_text(rec.target)}) "
             f"via {adapter}{mode}{ref_part}{detail_part}"
         )
 

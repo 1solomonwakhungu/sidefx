@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,10 +18,9 @@ DEFAULT_GIT_TIMEOUT = 15.0
 _HEX_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _GIT_PUSH_TOOLS = frozenset({"git_push", "push_branch", "git-push"})
 
-# Global git flags that consume the next argument token before the subcommand.
-_GIT_GLOBAL_VALUE_FLAGS = frozenset(
+# Global git flags that alter repo/config context and make push resolution non-trivial.
+_GIT_GLOBAL_UNSUPPORTED_VALUE_FLAGS = frozenset(
     {
-        "-C",
         "-c",
         "--git-dir",
         "--work-tree",
@@ -29,6 +29,9 @@ _GIT_GLOBAL_VALUE_FLAGS = frozenset(
         "--config-env",
         "--exec-path",
     }
+)
+_GIT_GLOBAL_UNSUPPORTED_PREFIXES = tuple(
+    f"{flag}=" for flag in _GIT_GLOBAL_UNSUPPORTED_VALUE_FLAGS if flag.startswith("--")
 )
 
 # `git push` flags that consume a separate following argument token.
@@ -82,6 +85,18 @@ class GitPushSpec:
         return meta
 
 
+def redact_remote_for_display(remote: str) -> str:
+    """Strip userinfo and query strings from URL-shaped git remotes before journaling."""
+    parsed = urllib.parse.urlsplit(remote)
+    if parsed.scheme and parsed.netloc:
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+        return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    return remote
+
+
 def _git_env() -> dict[str, str]:
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -105,6 +120,14 @@ def _run_git(
         return None
 
 
+def _resolve_push_endpoint(remote: str, *, cwd: Path) -> str:
+    """Resolve ``remote`` to its configured push URL (honoring ``pushurl``) when possible."""
+    proc = _run_git(["remote", "get-url", "--push", "--", remote], cwd=cwd)
+    if proc is not None and proc.returncode == 0 and proc.stdout.strip():
+        return proc.stdout.strip()
+    return remote
+
+
 def _ls_remote_ref(
     remote: str,
     remote_ref: str,
@@ -112,20 +135,22 @@ def _ls_remote_ref(
     cwd: Path,
     timeout_seconds: float = DEFAULT_GIT_TIMEOUT,
 ) -> tuple[bool, str | None, str | None]:
-    """Query a single remote ref read-only via ``git ls-remote``.
+    """Query a single remote ref read-only via ``git ls-remote`` against the push URL.
 
     Returns ``(ok, sha_or_none, error_message)``.
       - ``(True, "<40-hex-sha>", None)`` -> ref exists with exact SHA.
       - ``(True, None, None)`` -> command succeeded cleanly and ref is absent.
       - ``(False, None, "<error>")`` -> command failed, timed out, or returned ambiguous output.
     """
+    endpoint = _resolve_push_endpoint(remote, cwd=cwd)
     proc = _run_git(
-        ["ls-remote", "--", remote, remote_ref],
+        ["ls-remote", "--", endpoint, remote_ref],
         cwd=cwd,
         timeout_seconds=timeout_seconds,
     )
     if proc is None:
-        return False, None, f"git ls-remote failed or timed out for {remote} {remote_ref}"
+        safe_remote = redact_remote_for_display(remote)
+        return False, None, f"git ls-remote failed or timed out for {safe_remote} {remote_ref}"
     if proc.returncode != 0:
         err = (proc.stderr or "").strip() or f"exit code {proc.returncode}"
         return False, None, f"git ls-remote failed ({err})"
@@ -148,7 +173,6 @@ def _ls_remote_ref(
     if len(matched_shas) == 1:
         return True, matched_shas[0], None
     if len(matched_shas) == 0:
-        # `git ls-remote` returned refs (e.g. suffix match) none of which matched exact refname.
         return True, None, None
     return False, None, f"Ambiguous git ls-remote output for {remote_ref}"
 
@@ -158,8 +182,10 @@ def is_git_push_command(argv: Sequence[str]) -> bool:
     return _extract_push_subcommand(argv, Path.cwd()) is not None
 
 
-def _extract_push_subcommand(argv: Sequence[str], base_cwd: Path) -> tuple[Path, list[str]] | None:
-    """Return ``(effective_cwd, push_args)`` if ``argv`` is a ``git push`` command."""
+def _extract_push_subcommand(
+    argv: Sequence[str], base_cwd: Path
+) -> tuple[Path, list[str], str | None] | None:
+    """Return ``(effective_cwd, push_args, unsupported_reason)`` if ``argv`` is ``git push``."""
     if not argv:
         return None
     exe = os.path.basename(argv[0]).lower()
@@ -167,11 +193,12 @@ def _extract_push_subcommand(argv: Sequence[str], base_cwd: Path) -> tuple[Path,
         return None
 
     cwd = base_cwd
+    unsupported_reason: str | None = None
     idx = 1
     while idx < len(argv):
         tok = argv[idx]
         if tok == "push":
-            return cwd, list(argv[idx + 1 :])
+            return cwd, list(argv[idx + 1 :]), unsupported_reason
         if tok == "-C":
             if idx + 1 >= len(argv):
                 return None
@@ -182,13 +209,19 @@ def _extract_push_subcommand(argv: Sequence[str], base_cwd: Path) -> tuple[Path,
             cwd = (cwd / tok[2:]).resolve()
             idx += 1
             continue
-        if tok in _GIT_GLOBAL_VALUE_FLAGS:
+        if tok in _GIT_GLOBAL_UNSUPPORTED_VALUE_FLAGS:
+            unsupported_reason = f"Global git flag {tok!r} alters repo/config context"
             idx += 2
+            continue
+        if tok.startswith(_GIT_GLOBAL_UNSUPPORTED_PREFIXES) or (
+            tok.startswith("-c") and len(tok) > 2
+        ):
+            unsupported_reason = f"Global git flag {tok!r} alters repo/config context"
+            idx += 1
             continue
         if tok.startswith("-"):
             idx += 1
             continue
-        # Another git subcommand (e.g. `git commit`, `git status`).
         return None
     return None
 
@@ -201,10 +234,9 @@ def _normalize_remote_ref(raw_ref: str, *, src_full_ref: str | None = None) -> s
     return f"refs/heads/{raw_ref}"
 
 
-def _resolve_local_commit(ref: str, *, cwd: Path) -> str | None:
-    proc = _run_git(["rev-parse", "--verify", f"{ref}^{{commit}}"], cwd=cwd)
-    if proc is None or proc.returncode != 0:
-        proc = _run_git(["rev-parse", "--verify", ref], cwd=cwd)
+def _resolve_local_object_sha(ref: str, *, cwd: Path) -> str | None:
+    """Resolve exact local git object SHA (works for commits AND annotated tags)."""
+    proc = _run_git(["rev-parse", "--verify", ref], cwd=cwd)
     if proc is None or proc.returncode != 0:
         return None
     sha = proc.stdout.strip().lower()
@@ -217,6 +249,19 @@ def _resolve_symbolic_full_name(ref: str, *, cwd: Path) -> str | None:
         return None
     val = proc.stdout.strip()
     return val if val.startswith("refs/") else None
+
+
+def _git_config_get(key: str, *, cwd: Path) -> str | None:
+    proc = _run_git(["config", "--get", key], cwd=cwd)
+    if proc is None or proc.returncode != 0:
+        return None
+    val = proc.stdout.strip()
+    return val or None
+
+
+def _git_config_has(key: str, *, cwd: Path) -> bool:
+    proc = _run_git(["config", "--get-all", key], cwd=cwd)
+    return proc is not None and proc.returncode == 0 and bool(proc.stdout.strip())
 
 
 def inspect_git_push(
@@ -235,11 +280,11 @@ def inspect_git_push(
     if extracted is None:
         return None
 
-    repo_cwd, push_args = extracted
+    repo_cwd, push_args, global_unsupported = extracted
     is_delete = False
     is_force = False
-    is_multi_or_unsupported = False
-    unsupported_reason: str | None = None
+    is_multi_or_unsupported = global_unsupported is not None
+    unsupported_reason: str | None = global_unsupported
     repo_flag: str | None = None
     positionals: list[str] = []
 
@@ -263,7 +308,7 @@ def inspect_git_push(
             is_force = True
             idx += 1
             continue
-        if tok in ("--all", "--mirror", "--tags"):
+        if tok in ("--all", "--mirror", "--tags", "--follow-tags"):
             is_multi_or_unsupported = True
             unsupported_reason = f"Cannot safely reconcile bulk git push flag {tok!r}"
             idx += 1
@@ -330,15 +375,18 @@ def inspect_git_push(
     if branch_proc is not None and branch_proc.returncode == 0:
         current_branch = branch_proc.stdout.strip() or None
 
+    branch_remote = (
+        _git_config_get(f"branch.{current_branch}.remote", cwd=repo_cwd) if current_branch else None
+    )
+    branch_push_remote = (
+        _git_config_get(f"branch.{current_branch}.pushRemote", cwd=repo_cwd)
+        if current_branch
+        else None
+    )
+    remote_push_default = _git_config_get("remote.pushDefault", cwd=repo_cwd)
+
     if remote is None:
-        if current_branch:
-            cfg_proc = _run_git(
-                ["config", "--get", f"branch.{current_branch}.remote"], cwd=repo_cwd
-            )
-            if cfg_proc is not None and cfg_proc.returncode == 0 and cfg_proc.stdout.strip():
-                remote = cfg_proc.stdout.strip()
-        if remote is None:
-            remote = "origin"
+        remote = branch_push_remote or remote_push_default or branch_remote or "origin"
 
     remote_ref: str | None = None
     expected_sha: str | None = None
@@ -370,12 +418,86 @@ def inspect_git_push(
                 reconcilable=False,
                 reason="Detached HEAD without explicit refspec cannot be reconciled",
             )
-        merge_proc = _run_git(["config", "--get", f"branch.{current_branch}.merge"], cwd=repo_cwd)
-        if merge_proc is not None and merge_proc.returncode == 0 and merge_proc.stdout.strip():
-            remote_ref = _normalize_remote_ref(merge_proc.stdout.strip())
-        else:
+        # Custom `remote.<name>.push` refspecs alter destination arbitrarily -> do not guess.
+        if _git_config_has(f"remote.{remote}.push", cwd=repo_cwd):
+            return GitPushSpec(
+                cwd=str(repo_cwd),
+                remote=remote,
+                remote_ref=None,
+                expected_sha=None,
+                before_sha=None,
+                before_known=False,
+                is_delete=False,
+                is_force=is_force,
+                reconcilable=False,
+                reason=f"Custom remote.{remote}.push refspec configured; cannot safely reconcile",
+            )
+
+        push_default = (_git_config_get("push.default", cwd=repo_cwd) or "simple").lower()
+        branch_merge = _git_config_get(f"branch.{current_branch}.merge", cwd=repo_cwd)
+        is_triangular = branch_remote is not None and remote != branch_remote
+
+        if push_default == "current":
             remote_ref = f"refs/heads/{current_branch}"
-        expected_sha = _resolve_local_commit("HEAD", cwd=repo_cwd)
+        elif push_default == "simple":
+            if is_triangular or not branch_merge:
+                # In triangular workflows (`push.default=simple`), git pushes to same branch name.
+                remote_ref = f"refs/heads/{current_branch}"
+            else:
+                normalized_merge = _normalize_remote_ref(branch_merge)
+                if normalized_merge == f"refs/heads/{current_branch}":
+                    remote_ref = normalized_merge
+                else:
+                    return GitPushSpec(
+                        cwd=str(repo_cwd),
+                        remote=remote,
+                        remote_ref=None,
+                        expected_sha=None,
+                        before_sha=None,
+                        before_known=False,
+                        is_delete=False,
+                        is_force=is_force,
+                        reconcilable=False,
+                        reason=(
+                            f"push.default=simple mismatches upstream {normalized_merge!r} "
+                            f"for branch {current_branch!r}"
+                        ),
+                    )
+        elif push_default in ("upstream", "tracking"):
+            if not is_triangular and branch_merge:
+                remote_ref = _normalize_remote_ref(branch_merge)
+            else:
+                return GitPushSpec(
+                    cwd=str(repo_cwd),
+                    remote=remote,
+                    remote_ref=None,
+                    expected_sha=None,
+                    before_sha=None,
+                    before_known=False,
+                    is_delete=False,
+                    is_force=is_force,
+                    reconcilable=False,
+                    reason=(
+                        f"Cannot resolve push.default={push_default} destination for remote "
+                        f"{remote!r}"
+                    ),
+                )
+        else:
+            # `matching`, `nothing`, or unknown push.default
+            return GitPushSpec(
+                cwd=str(repo_cwd),
+                remote=remote,
+                remote_ref=None,
+                expected_sha=None,
+                before_sha=None,
+                before_known=False,
+                is_delete=False,
+                is_force=is_force,
+                reconcilable=False,
+                reason=f"Unsupported push.default={push_default!r} for reconciliation",
+            )
+
+        expected_sha = _resolve_local_object_sha("HEAD", cwd=repo_cwd)
     else:
         raw_spec = refspecs[0]
         if "*" in raw_spec:
@@ -416,7 +538,7 @@ def inspect_git_push(
             else:
                 src_full = _resolve_symbolic_full_name(src_ref, cwd=repo_cwd)
                 remote_ref = _normalize_remote_ref(dst_ref or src_ref, src_full_ref=src_full)
-                expected_sha = _resolve_local_commit(src_ref, cwd=repo_cwd)
+                expected_sha = _resolve_local_object_sha(src_ref, cwd=repo_cwd)
         else:
             if is_delete:
                 remote_ref = _normalize_remote_ref(raw_spec)
@@ -426,7 +548,7 @@ def inspect_git_push(
                     remote_ref = f"refs/heads/{current_branch}"
                 else:
                     remote_ref = _normalize_remote_ref(raw_spec, src_full_ref=src_full)
-                expected_sha = _resolve_local_commit(raw_spec, cwd=repo_cwd)
+                expected_sha = _resolve_local_object_sha(raw_spec, cwd=repo_cwd)
 
     if remote_ref is None or (not is_delete and expected_sha is None):
         return GitPushSpec(
@@ -439,7 +561,7 @@ def inspect_git_push(
             is_delete=is_delete,
             is_force=is_force,
             reconcilable=False,
-            reason="Could not resolve local target commit SHA or remote ref",
+            reason="Could not resolve local target object SHA or remote ref",
         )
 
     before_known = False
@@ -454,7 +576,7 @@ def inspect_git_push(
 
     return GitPushSpec(
         cwd=str(repo_cwd),
-        remote=remote,
+        remote=redact_remote_for_display(remote) if remote else None,
         remote_ref=remote_ref,
         expected_sha=expected_sha,
         before_sha=before_sha,

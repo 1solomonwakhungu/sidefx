@@ -153,6 +153,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Output or merge a Claude Code Stop hook snippet for session receipts.",
     )
+    init_parser.add_argument(
+        "--write",
+        dest="write",
+        action="store_true",
+        help="With --claude-code, merge the Stop hook into .claude/settings.json.",
+    )
+    init_parser.add_argument(
+        "--settings",
+        "--settings-path",
+        dest="settings_path",
+        default=None,
+        help="With --claude-code, merge the Stop hook into this Claude Code settings JSON path.",
+    )
     init_parser.set_defaults(handler=_cmd_init, passthrough=False)
 
     # Passthrough subcommand dispatchers for PR 2 & PR 3.

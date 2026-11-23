@@ -12,6 +12,18 @@ from sidefx.journal import ActionRecord
 
 _META_SEPARATOR = " | sidefx_meta="
 _SAFE_MARKER_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_INVISIBLE_AND_BIDI_RE = re.compile(
+    r"[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff\U000e0000-\U000e007f]"
+)
+
+
+def sanitize_text(text: str) -> str:
+    """Strip ANSI escapes, control chars, line separators, bidi, and tag chars."""
+    stripped = _ANSI_ESCAPE_RE.sub("", text)
+    stripped = _INVISIBLE_AND_BIDI_RE.sub("", stripped)
+    return _CONTROL_CHARS_RE.sub(" ", stripped).strip()
 
 
 class ReconcileState(StrEnum):

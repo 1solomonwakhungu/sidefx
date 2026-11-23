@@ -99,7 +99,9 @@ class MockGitHubState:
                 "issue_number": issue_number,
                 "body": body,
                 "user": {"login": author},
-                "html_url": f"https://github.com/{owner}/{repo}/issues/{issue_number}#issuecomment-{cid}",
+                "html_url": (
+                    f"https://github.com/{owner}/{repo}/issues/{issue_number}#issuecomment-{cid}"
+                ),
             }
             self.comments.append(item)
             return item
@@ -213,6 +215,26 @@ def mock_github() -> tuple[str, MockGitHubState]:
         thread.join(timeout=2.0)
 
 
+def _gh_summary(
+    *,
+    kind: str = "issue",
+    repo: str = "org/repo",
+    marker_injected: bool = True,
+    repo_inferred: bool = False,
+    issue_number: int | None = None,
+) -> str:
+    meta: dict[str, Any] = {
+        "adapter": "github",
+        "kind": kind,
+        "repo": repo,
+        "marker_injected": marker_injected,
+        "repo_inferred": repo_inferred,
+    }
+    if issue_number is not None:
+        meta["issue_number"] = issue_number
+    return format_summary_with_meta(f"gh {kind} ({repo})", meta)
+
+
 def _make_record(
     *,
     action_id: str = "act-1",
@@ -245,7 +267,6 @@ class TestGitHubMarkerHelpers:
         body = "Hello world\n\n<!-- sidefx:id=abc123def -->"
         assert extract_markers(body) == ["abc123def"]
         assert body_has_marker(body, "abc123def") is True
-        # Prefix substring must NOT falsely match!
         assert body_has_marker(body, "abc123") is False
 
     def test_inject_marker_into_body_is_idempotent(self) -> None:
@@ -256,7 +277,7 @@ class TestGitHubMarkerHelpers:
         assert inject_marker_into_body("", "m1") == "<!-- sidefx:id=m1 -->"
         assert inject_marker_into_body(None, "m1") == "<!-- sidefx:id=m1 -->"
 
-    def test_inject_marker_into_gh_args_variants(self) -> None:
+    def test_inject_marker_into_gh_args_variants_and_edge_cases(self) -> None:
         args1, ok1 = inject_marker_into_gh_args(
             ["gh", "issue", "create", "--title", "Bug", "--body", "Details"], "tok1"
         )
@@ -269,23 +290,57 @@ class TestGitHubMarkerHelpers:
         assert ok2 is True
         assert args2[-1] == "--body=Initial\n\n<!-- sidefx:id=tok2 -->"
 
-        # No body flag -> appends --body
-        args3, ok3 = inject_marker_into_gh_args(
-            ["gh", "issue", "create", "--title", "NoBody"], "tok3"
+        # Attached short -bUser body text (B5!)
+        args_att, ok_att = inject_marker_into_gh_args(
+            ["gh", "issue", "create", "--title", "T", "-bUser body text"], "tok_att"
         )
-        assert ok3 is True
-        assert "--body" in args3 and "<!-- sidefx:id=tok3 -->" in args3
+        assert ok_att is True
+        assert args_att[-1] == "-bUser body text\n\n<!-- sidefx:id=tok_att -->"
+        assert "--body" not in args_att
 
-        # Conflicting flags (--body-file / --fill / --web) are NOT clobbered
-        args4, ok4 = inject_marker_into_gh_args(
-            ["gh", "issue", "create", "--title", "FromFile", "--body-file", "body.md"], "tok4"
+        # Attached -Fbody.md MUST NOT append --body (B5!)
+        args_fatt, ok_fatt = inject_marker_into_gh_args(
+            ["gh", "issue", "create", "--title", "T", "-Fbody.md"], "tok_f"
         )
-        assert ok4 is False
-        assert args4 == ["gh", "issue", "create", "--title", "FromFile", "--body-file", "body.md"]
+        assert ok_fatt is False
+        assert args_fatt == ["gh", "issue", "create", "--title", "T", "-Fbody.md"]
 
-        args5, ok5 = inject_marker_into_gh_args(["gh", "pr", "create", "--fill"], "tok5")
-        assert ok5 is False
-        assert args5 == ["gh", "pr", "create", "--fill"]
+        # `--title -b --label bug` must NOT misinterpret `-b` (value of --title) as body flag (B5!)
+        args_val, ok_val = inject_marker_into_gh_args(
+            ["gh", "issue", "create", "--title", "-b", "--label", "bug"], "tok_val"
+        )
+        assert ok_val is True
+        assert args_val == [
+            "gh",
+            "issue",
+            "create",
+            "--title",
+            "-b",
+            "--label",
+            "bug",
+            "--body",
+            "<!-- sidefx:id=tok_val -->",
+        ]
+
+        # `gh issue comment 5` with NO body must NOT fabricate a marker-only comment (B5!)
+        args_cmt, ok_cmt = inject_marker_into_gh_args(["gh", "issue", "comment", "5"], "tok_c")
+        assert ok_cmt is False
+        assert args_cmt == ["gh", "issue", "comment", "5"]
+
+        # Interactive `gh issue create` with neither --title nor --body -> injected=False
+        args_int, ok_int = inject_marker_into_gh_args(["gh", "issue", "create"], "tok_i")
+        assert ok_int is False
+        assert args_int == ["gh", "issue", "create"]
+
+        # Conflicting flags (--body-file / --fill / -we) are NOT clobbered
+        for cmd in (
+            ["gh", "issue", "create", "--title", "F", "--body-file", "body.md"],
+            ["gh", "pr", "create", "--fill"],
+            ["gh", "issue", "create", "--title", "W", "-we"],
+        ):
+            out_args, ok = inject_marker_into_gh_args(cmd, "tok_x")
+            assert ok is False
+            assert out_args == cmd
 
     def test_inject_marker_into_json_body(self) -> None:
         out, ok = inject_marker_into_json_body('{"title":"T","body":"B"}', "m9")
@@ -307,8 +362,9 @@ class TestGitHubReconciler:
         base_url, state = mock_github
         reconciler = GitHubReconciler(api_base_url=base_url, token="test-token")
 
-        # Open issue
-        rec_open = _make_record(action_id="iss-open", tool_name="gh_issue_create")
+        rec_open = _make_record(
+            action_id="iss-open", tool_name="gh_issue_create", summary=_gh_summary(kind="issue")
+        )
         open_item = state.add_issue(
             title="Open", body=inject_marker_into_body("desc", rec_open.marker), state="open"
         )
@@ -316,8 +372,10 @@ class TestGitHubReconciler:
         assert res_open.state == ReconcileState.FOUND
         assert res_open.result_ref == open_item["html_url"]
 
-        # Closed issue (proves state=all is sent!)
-        rec_closed = _make_record(action_id="iss-closed", tool_name="gh_issue_create")
+        # Closed issue proves state=all is sent
+        rec_closed = _make_record(
+            action_id="iss-closed", tool_name="gh_issue_create", summary=_gh_summary(kind="issue")
+        )
         closed_item = state.add_issue(
             title="Closed", body=inject_marker_into_body("done", rec_closed.marker), state="closed"
         )
@@ -328,7 +386,9 @@ class TestGitHubReconciler:
         assert state.requests[-1]["auth"] == "Bearer test-token"
 
         # Closed PR
-        rec_pr = _make_record(action_id="pr-closed", tool_name="gh_pr_create")
+        rec_pr = _make_record(
+            action_id="pr-closed", tool_name="gh_pr_create", summary=_gh_summary(kind="pr")
+        )
         closed_pr = state.add_issue(
             title="Closed PR",
             body=inject_marker_into_body("pr body", rec_pr.marker),
@@ -344,6 +404,7 @@ class TestGitHubReconciler:
             action_id="cmt-1",
             tool_name="gh_issue_comment",
             target=f"org/repo#{open_item['number']}",
+            summary=_gh_summary(kind="comment", issue_number=open_item["number"]),
         )
         cmt = state.add_comment(
             issue_number=open_item["number"],
@@ -359,15 +420,15 @@ class TestGitHubReconciler:
         base_url, state = mock_github
         state.page_size_override = 2
 
-        rec_target = _make_record(action_id="deep-item", tool_name="gh_issue_create")
-        # Add target first (oldest -> appears on last page since newest-first!)
+        rec_target = _make_record(
+            action_id="deep-item", tool_name="gh_issue_create", summary=_gh_summary()
+        )
         target_issue = state.add_issue(
             title="Target", body=inject_marker_into_body("old", rec_target.marker)
         )
         for i in range(5):
             state.add_issue(title=f"Noise {i}", body=f"no marker {i}")
 
-        # Sufficient max_pages finds it on page 3
         reconciler_ok = GitHubReconciler(api_base_url=base_url, per_page=2, max_pages=5)
         res_found = reconciler_ok.reconcile(rec_target)
         assert res_found.state == ReconcileState.FOUND
@@ -383,18 +444,59 @@ class TestGitHubReconciler:
         self, mock_github: tuple[str, MockGitHubState]
     ) -> None:
         base_url, state = mock_github
-        rec = _make_record(action_id="missing", marker="abc123")
+        rec = _make_record(action_id="missing", marker="abc123", summary=_gh_summary())
         state.add_issue(title="Lookalike", body="<!-- sidefx:id=abc123456 -->")
 
         reconciler = GitHubReconciler(api_base_url=base_url)
         res = reconciler.reconcile(rec)
         assert res.state == ReconcileState.NOT_FOUND
 
+    def test_fails_closed_without_verified_marker_injection_or_explicit_repo(
+        self, mock_github: tuple[str, MockGitHubState]
+    ) -> None:
+        """B2 & B4: Never return NOT_FOUND when marker injection or target repo is unverified."""
+        base_url, state = mock_github
+        reconciler = GitHubReconciler(api_base_url=base_url)
+
+        # Generic non-GitHub tool `create_issue` is not claimed by GitHubReconciler
+        generic = _make_record(action_id="lin-1", tool_name="create_issue", target="org/repo")
+        assert reconciler.can_reconcile(generic) is False
+
+        # Sparse `gh_issue_create` with NO sidefx_meta: 0 remote matches -> UNKNOWN (not NOT_FOUND!)
+        unverified = _make_record(action_id="unv-1", tool_name="gh_issue_create", summary=None)
+        res_missing = reconciler.reconcile(unverified)
+        assert res_missing.state == ReconcileState.UNKNOWN
+        assert "not verified" in (res_missing.details or "")
+
+        # Inferred repo (from git origin) also caps 0-matches at UNKNOWN
+        inferred = _make_record(
+            action_id="inf-1",
+            tool_name="gh_issue_create",
+            summary=_gh_summary(repo_inferred=True),
+        )
+        assert reconciler.reconcile(inferred).state == ReconcileState.UNKNOWN
+
+        # Explicitly marker_injected=False returns UNKNOWN immediately
+        no_inj = _make_record(
+            action_id="noinj-1",
+            tool_name="gh_issue_create",
+            summary=_gh_summary(marker_injected=False),
+        )
+        assert reconciler.reconcile(no_inj).state == ReconcileState.UNKNOWN
+
+        # Even if metadata was sparse, an EXACT remote marker match still safely returns FOUND
+        found_item = state.add_issue(
+            title="Found", body=inject_marker_into_body("ok", unverified.marker)
+        )
+        res_found = reconciler.reconcile(unverified)
+        assert res_found.state == ReconcileState.FOUND
+        assert res_found.result_ref == found_item["html_url"]
+
     def test_ambiguous_duplicate_markers_returns_unknown(
         self, mock_github: tuple[str, MockGitHubState]
     ) -> None:
         base_url, state = mock_github
-        rec = _make_record(action_id="dup", marker="dup-marker")
+        rec = _make_record(action_id="dup", marker="dup-marker", summary=_gh_summary())
         state.add_issue(title="First", body=inject_marker_into_body("1", "dup-marker"))
         state.add_issue(title="Second", body=inject_marker_into_body("2", "dup-marker"))
 
@@ -409,31 +511,36 @@ class TestGitHubReconciler:
     ) -> None:
         base_url, state = mock_github
         state.force_status = status_code
-        rec = _make_record(action_id=f"err-{status_code}")
+        rec = _make_record(action_id=f"err-{status_code}", summary=_gh_summary())
 
         reconciler = GitHubReconciler(api_base_url=base_url)
         res = reconciler.reconcile(rec)
         assert res.state == ReconcileState.UNKNOWN
         assert str(status_code) in (res.details or "")
 
-    def test_malformed_json_timeout_ssrf_link_and_redirect_return_unknown(
+    def test_malformed_json_and_non_list_return_unknown(
         self, mock_github: tuple[str, MockGitHubState]
     ) -> None:
         base_url, state = mock_github
-        rec = _make_record(action_id="safety-1")
+        rec = _make_record(action_id="json-1", summary=_gh_summary())
+        reconciler = GitHubReconciler(api_base_url=base_url)
+
+        state.force_raw_body = b"{not-json"
+        assert reconciler.reconcile(rec).state == ReconcileState.UNKNOWN
+
+        state.force_raw_body = b'{"message": "not a list"}'
+        assert reconciler.reconcile(rec).state == ReconcileState.UNKNOWN
+
+    def test_cross_origin_link_redirect_and_timeout_return_unknown(
+        self, mock_github: tuple[str, MockGitHubState]
+    ) -> None:
+        base_url, state = mock_github
+        rec = _make_record(action_id="ssrf-1", summary=_gh_summary())
         reconciler = GitHubReconciler(
             api_base_url=base_url, token="secret-tok", timeout_seconds=0.3
         )
 
-        # Malformed JSON
-        state.force_raw_body = b"{not-json"
-        assert reconciler.reconcile(rec).state == ReconcileState.UNKNOWN
-
-        # Non-list JSON
-        state.force_raw_body = b'{"message": "not a list"}'
-        assert reconciler.reconcile(rec).state == ReconcileState.UNKNOWN
-
-        # Cross-origin Link header (SSRF / token leak defense)
+        # Cross-origin Link header refused
         state.force_raw_body = b"[]"
         state.force_link_header = '<http://evil.example.com/steal>; rel="next"'
         res_ssrf = reconciler.reconcile(rec)
@@ -442,43 +549,43 @@ class TestGitHubReconciler:
         state.force_raw_body = None
         state.force_link_header = None
 
-        # Cross-origin HTTP redirect (SSRF / token leak defense)
+        # Cross-origin HTTP redirect refused
         state.redirect_location = "http://evil.example.com/steal"
-        res_redir = reconciler.reconcile(rec)
-        assert res_redir.state == ReconcileState.UNKNOWN
+        assert reconciler.reconcile(rec).state == ReconcileState.UNKNOWN
         state.redirect_location = None
 
-        # Timeout
+        # Slow server timeout -> UNKNOWN
         state.delay_seconds = 1.0
-        res_timeout = reconciler.reconcile(rec)
-        assert res_timeout.state == ReconcileState.UNKNOWN
+        assert reconciler.reconcile(rec).state == ReconcileState.UNKNOWN
         state.delay_seconds = 0.0
 
-    def test_marker_not_injected_returns_unknown_never_not_found(
-        self, mock_github: tuple[str, MockGitHubState]
+    def test_ambient_token_not_leaked_to_non_github_host_and_http_non_loopback_rejected(
+        self,
+        mock_github: tuple[str, MockGitHubState],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        base_url, _ = mock_github
-        summary = format_summary_with_meta(
-            "gh issue create",
-            {"adapter": "github", "kind": "issue", "repo": "org/repo", "marker_injected": False},
-        )
-        rec = _make_record(action_id="no-marker", summary=summary)
+        """N3: Never attach ambient GITHUB_TOKEN to custom hosts; reject non-loopback http://."""
+        base_url, state = mock_github
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_super_secret")
+
         reconciler = GitHubReconciler(api_base_url=base_url)
-        res = reconciler.reconcile(rec)
-        assert res.state == ReconcileState.UNKNOWN
-        assert "not injected" in (res.details or "").lower()
+        rec = _make_record(action_id="tok-leak", summary=_gh_summary())
+        reconciler.reconcile(rec)
+        assert state.requests[-1]["auth"] is None
+
+        with pytest.raises(ValueError, match="loopback"):
+            GitHubReconciler(api_base_url="http://api.example.com")
 
     def test_author_filter_excludes_other_authors(
         self, mock_github: tuple[str, MockGitHubState]
     ) -> None:
         base_url, state = mock_github
-        rec = _make_record(action_id="auth-1", marker="auth-marker")
+        rec = _make_record(action_id="auth-1", marker="auth-marker", summary=_gh_summary())
         state.add_issue(
             title="Spoofed", body=inject_marker_into_body("x", "auth-marker"), author="attacker"
         )
         reconciler = GitHubReconciler(api_base_url=base_url, expected_author="bot-user")
-        res = reconciler.reconcile(rec)
-        assert res.state == ReconcileState.NOT_FOUND
+        assert reconciler.reconcile(rec).state == ReconcileState.NOT_FOUND
 
         legit = state.add_issue(
             title="Real", body=inject_marker_into_body("y", "auth-marker"), author="Bot-User"
@@ -524,7 +631,6 @@ class TestGitPushReconciler:
     ) -> None:
         work, bare = _setup_git_repos(tmp_path)
 
-        # Make a second commit locally (not pushed yet)
         (work / "README.md").write_text("v2\n", encoding="utf-8")
         _git(work, "add", "README.md")
         _git(work, "commit", "-m", "v2")
@@ -545,17 +651,14 @@ class TestGitPushReconciler:
         )
         reconciler = GitPushReconciler()
 
-        # Before pushing: remote still at before_sha -> NOT_FOUND
-        res_before = reconciler.reconcile(rec)
-        assert res_before.state == ReconcileState.NOT_FOUND
+        assert reconciler.reconcile(rec).state == ReconcileState.NOT_FOUND
 
-        # Now actually push -> FOUND
         _git(work, "push", "origin", "main")
         res_after = reconciler.reconcile(rec)
         assert res_after.state == ReconcileState.FOUND
         assert res_after.result_ref == f"origin refs/heads/main@{sha_v2[:12]}"
 
-        # Simulate concurrent push from another clone moving remote past sha_v2
+        # Concurrent push from another clone -> UNKNOWN
         other = tmp_path / "other"
         _git(tmp_path, "clone", str(bare), str(other))
         _git(other, "config", "user.email", "other@example.com")
@@ -569,7 +672,7 @@ class TestGitPushReconciler:
         assert res_concurrent.state == ReconcileState.UNKNOWN
         assert "concurrently" in (res_concurrent.details or "")
 
-        # Broken / unreachable remote -> UNKNOWN (never NOT_FOUND!)
+        # Broken / unreachable remote -> UNKNOWN
         bad_meta = dict(spec.to_meta())
         bad_meta["remote"] = str(tmp_path / "nonexistent-remote.git")
         rec_bad = _make_record(
@@ -578,8 +681,80 @@ class TestGitPushReconciler:
             target="bad:refs/heads/main",
             summary=format_summary_with_meta("git push bad", bad_meta),
         )
-        res_bad = reconciler.reconcile(rec_bad)
-        assert res_bad.state == ReconcileState.UNKNOWN
+        assert reconciler.reconcile(rec_bad).state == ReconcileState.UNKNOWN
+
+    def test_triangular_push_pushurl_annotated_tag_and_global_flags(self, tmp_path: Path) -> None:
+        """B4 & N11: Triangular push.default=simple, pushurl, annotated tags, and -c/--git-dir."""
+        work, bare = _setup_git_repos(tmp_path)
+        upstream_bare = tmp_path / "upstream.git"
+        upstream_bare.mkdir()
+        _git(upstream_bare, "init", "--bare")
+        _git(work, "remote", "add", "upstream", str(upstream_bare))
+        _git(work, "push", "upstream", "main")
+
+        # Branch `feat` tracks `upstream/main`, then pushes to `origin` under push.default=simple!
+        _git(work, "checkout", "-b", "feat", "--track", "upstream/main")
+        (work / "feat.txt").write_text("triangular\n", encoding="utf-8")
+        _git(work, "add", "feat.txt")
+        _git(work, "commit", "-m", "feat commit")
+        feat_sha = _git(work, "rev-parse", "HEAD")
+
+        spec = inspect_git_push(["git", "push", "origin"], cwd=work)
+        assert spec is not None
+        assert spec.reconcilable is True
+        assert spec.remote == "origin"
+        assert spec.remote_ref == "refs/heads/feat"  # NOT refs/heads/main!
+        assert spec.expected_sha == feat_sha
+
+        _git(work, "push", "origin")
+        rec = _make_record(
+            action_id="tri-1",
+            tool_name="git_push",
+            target="origin:refs/heads/feat",
+            summary=format_summary_with_meta("git push origin", spec.to_meta()),
+        )
+        assert GitPushReconciler().reconcile(rec).state == ReconcileState.FOUND
+
+        # Annotated tag push compares exact tag object SHA (N11!)
+        _git(work, "tag", "-a", "v1.0.0", "-m", "release v1.0.0")
+        tag_spec = inspect_git_push(["git", "push", "origin", "v1.0.0"], cwd=work)
+        assert tag_spec is not None and tag_spec.reconcilable is True
+        assert tag_spec.remote_ref == "refs/tags/v1.0.0"
+        _git(work, "push", "origin", "v1.0.0")
+        rec_tag = _make_record(
+            action_id="tag-1",
+            tool_name="git_push",
+            target="origin:refs/tags/v1.0.0",
+            summary=format_summary_with_meta("git push origin v1.0.0", tag_spec.to_meta()),
+        )
+        assert GitPushReconciler().reconcile(rec_tag).state == ReconcileState.FOUND
+
+        # pushurl is respected when fetch URL and push URL differ!
+        push_only_bare = tmp_path / "push_only.git"
+        push_only_bare.mkdir()
+        _git(push_only_bare, "init", "--bare")
+        _git(work, "remote", "set-url", "--push", "origin", str(push_only_bare))
+        _git(work, "checkout", "main")
+        (work / "README.md").write_text("pushurl-v2\n", encoding="utf-8")
+        _git(work, "add", "README.md")
+        _git(work, "commit", "-m", "pushurl")
+        spec_pushurl = inspect_git_push(["git", "push", "origin", "main"], cwd=work)
+        assert spec_pushurl is not None and spec_pushurl.reconcilable is True
+        assert spec_pushurl.before_sha is None  # push_only_bare has no refs yet!
+        _git(work, "push", "origin", "main")
+        rec_pu = _make_record(
+            action_id="pu-1",
+            tool_name="git_push",
+            target="origin:refs/heads/main",
+            summary=format_summary_with_meta("git push origin main", spec_pushurl.to_meta()),
+        )
+        assert GitPushReconciler().reconcile(rec_pu).state == ReconcileState.FOUND
+
+        # Global `-c` alters config -> non-reconcilable (UNKNOWN)
+        spec_c = inspect_git_push(
+            ["git", "-c", "push.default=matching", "push", "origin"], cwd=work
+        )
+        assert spec_c is not None and spec_c.reconcilable is False
 
     def test_delete_and_multi_ref_and_dash_c_flag(self, tmp_path: Path) -> None:
         work, _ = _setup_git_repos(tmp_path)
@@ -589,7 +764,6 @@ class TestGitPushReconciler:
         _git(work, "commit", "-m", "feat")
         _git(work, "push", "origin", "feat")
 
-        # Inspect delete push using `git -C <work> push --delete origin feat`
         del_spec = inspect_git_push(
             ["git", "-C", str(work), "push", "--delete", "origin", "feat"], cwd=tmp_path
         )
@@ -613,10 +787,8 @@ class TestGitPushReconciler:
         assert res_del.state == ReconcileState.FOUND
         assert res_del.result_ref == "deleted origin refs/heads/feat"
 
-        # Bulk flags like --all are marked non-reconcilable -> UNKNOWN
         all_spec = inspect_git_push(["git", "push", "--all", "origin"], cwd=work)
-        assert all_spec is not None
-        assert all_spec.reconcilable is False
+        assert all_spec is not None and all_spec.reconcilable is False
         rec_all = _make_record(
             action_id="all-1",
             tool_name="git_push",
@@ -636,7 +808,6 @@ class TestReconcileCliAndOrchestration:
         base_url, state = mock_github
         db_path = tmp_path / "journal.db"
 
-        # Missing DB does not create file
         rc_missing = main(["--db", str(db_path), "reconcile", "--all"])
         assert rc_missing == 0
         assert not db_path.exists()
@@ -651,6 +822,7 @@ class TestReconcileCliAndOrchestration:
                 tool_name="gh_issue_create",
                 target="org/repo",
                 payload={"t": "found"},
+                summary=_gh_summary(),
             )
             journal.mark_unknown("agent", "org/repo", "rec-found", attempt=1, error="timeout")
 
@@ -662,6 +834,7 @@ class TestReconcileCliAndOrchestration:
                 tool_name="gh_issue_create",
                 target="org/repo",
                 payload={"t": "missing"},
+                summary=_gh_summary(),
             )
             journal.mark_unknown("agent", "org/repo", "rec-missing", attempt=1, error="timeout")
 
@@ -690,7 +863,6 @@ class TestReconcileCliAndOrchestration:
             assert j.get_action("agent", "org/repo", "rec-found").status == ActionStatus.UNKNOWN
             assert j.get_action("agent", "org/repo", "rec-missing").status == ActionStatus.UNKNOWN
 
-        # Apply reconcile via --action-id
         rc_one = main(
             [
                 "reconcile",
@@ -703,8 +875,7 @@ class TestReconcileCliAndOrchestration:
             ]
         )
         assert rc_one == 0
-        out_one = capsys.readouterr().out
-        assert issue["html_url"] in out_one
+        assert issue["html_url"] in capsys.readouterr().out
 
         with Journal.open_readonly(db_path) as j:
             updated = j.get_action("agent", "org/repo", "rec-found")
@@ -712,7 +883,6 @@ class TestReconcileCliAndOrchestration:
             assert updated.status == ActionStatus.RECONCILED
             assert updated.result_ref == issue["html_url"]
 
-        # Reconcile remaining (--all) marks missing as FAILED
         rc_all = main(["--db", str(db_path), "reconcile", "--all", "--github-api-url", base_url])
         assert rc_all == 0
         _ = capsys.readouterr()
@@ -721,6 +891,71 @@ class TestReconcileCliAndOrchestration:
             missing_rec = j.get_action("agent", "org/repo", "rec-missing")
             assert missing_rec is not None
             assert missing_rec.status == ActionStatus.FAILED
+
+    def test_reconcile_cli_never_marks_live_pending_failed_without_explicit_opt_in(
+        self,
+        tmp_path: Path,
+        mock_github: tuple[str, MockGitHubState],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """B1: `sidefx reconcile` on a live PENDING row must leave it PENDING by default."""
+        base_url, _ = mock_github
+        db_path = tmp_path / "journal.db"
+
+        with Journal(db_path) as journal:
+            journal.begin_action(
+                action_id="live-pending",
+                session_id="s1",
+                actor="agent",
+                surface=Surface.CLI,
+                tool_name="gh_issue_create",
+                target="org/repo",
+                payload={"t": "in-flight"},
+                summary=_gh_summary(),
+            )
+
+        # Default reconcile leaves PENDING untouched and exits 1 (still unresolved!)
+        rc1 = main(["--db", str(db_path), "reconcile", "--all", "--github-api-url", base_url])
+        assert rc1 == 1
+        out1 = capsys.readouterr().out
+        assert "still pending" in out1
+        with Journal.open_readonly(db_path) as j:
+            assert j.get_action("agent", "org/repo", "live-pending").status == ActionStatus.PENDING
+
+        # `--stale-pending-after 3600` also protects fresh pending rows
+        rc2 = main(
+            [
+                "--db",
+                str(db_path),
+                "reconcile",
+                "--all",
+                "--stale-pending-after",
+                "3600",
+                "--github-api-url",
+                base_url,
+            ]
+        )
+        assert rc2 == 1
+        _ = capsys.readouterr()
+        with Journal.open_readonly(db_path) as j:
+            assert j.get_action("agent", "org/repo", "live-pending").status == ActionStatus.PENDING
+
+        # Explicit `--force-pending` allows operator to mark a known-dead pending row failed
+        rc3 = main(
+            [
+                "--db",
+                str(db_path),
+                "reconcile",
+                "--all",
+                "--force-pending",
+                "--github-api-url",
+                base_url,
+            ]
+        )
+        assert rc3 == 0
+        _ = capsys.readouterr()
+        with Journal.open_readonly(db_path) as j:
+            assert j.get_action("agent", "org/repo", "live-pending").status == ActionStatus.FAILED
 
     def test_reconcile_action_handles_stale_attempt_cleanly(
         self, tmp_path: Path, mock_github: tuple[str, MockGitHubState]
@@ -736,9 +971,9 @@ class TestReconcileCliAndOrchestration:
                 tool_name="gh_issue_create",
                 target="org/repo",
                 payload={"t": "race"},
+                summary=_gh_summary(),
             )
             stale_snapshot = b1.record
-            # Simulate concurrent worker confirming attempt 1 before reconcile finishes
             journal.mark_confirmed(
                 "agent",
                 "org/repo",

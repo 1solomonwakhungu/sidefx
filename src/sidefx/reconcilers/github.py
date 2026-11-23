@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -40,7 +41,6 @@ _LINK_NEXT_RE = re.compile(r'<([^>]+)>\s*;\s*[^,]*\brel\s*=\s*"?next"?', re.IGNO
 _GITHUB_ISSUE_TOOLS = frozenset(
     {
         "gh_issue_create",
-        "create_issue",
         "github_create_issue",
         "create_github_issue",
     }
@@ -48,8 +48,6 @@ _GITHUB_ISSUE_TOOLS = frozenset(
 _GITHUB_PR_TOOLS = frozenset(
     {
         "gh_pr_create",
-        "create_pr",
-        "create_pull_request",
         "github_create_pr",
         "github_create_pull_request",
     }
@@ -58,22 +56,52 @@ _GITHUB_COMMENT_TOOLS = frozenset(
     {
         "gh_issue_comment",
         "gh_pr_comment",
-        "create_issue_comment",
-        "create_pr_comment",
-        "comment_issue",
-        "comment_pr",
-        "add_issue_comment",
         "github_comment",
     }
 )
 _GITHUB_GENERIC_TOOLS = frozenset(
     {
         "github_post",
-        "gh_api",
     }
 )
 _ALL_GITHUB_TOOLS = (
     _GITHUB_ISSUE_TOOLS | _GITHUB_PR_TOOLS | _GITHUB_COMMENT_TOOLS | _GITHUB_GENERIC_TOOLS
+)
+
+# `gh` flags that consume a separate following value token (excluding -b/--body).
+_GH_VALUE_SHORT_FLAGS = frozenset(
+    {"-t", "-F", "-R", "-a", "-l", "-m", "-p", "-B", "-H", "-r", "-T"}
+)
+_GH_VALUE_LONG_FLAGS = frozenset(
+    {
+        "--title",
+        "--body-file",
+        "--repo",
+        "--assignee",
+        "--label",
+        "--milestone",
+        "--project",
+        "--base",
+        "--head",
+        "--reviewer",
+        "--template",
+        "--recover",
+    }
+)
+_GH_NO_INJECT_SHORT_FLAGS = frozenset({"-F", "-e", "-w", "-f", "-T"})
+_GH_NO_INJECT_LONG_FLAGS = frozenset(
+    {
+        "--body-file",
+        "--editor",
+        "--web",
+        "--fill",
+        "--fill-first",
+        "--fill-verbose",
+        "--template",
+        "--edit-last",
+        "--delete-last",
+        "--create-if-none",
+    }
 )
 
 
@@ -155,9 +183,10 @@ def inject_marker_into_gh_args(argv: Sequence[str], marker: str) -> tuple[list[s
     """Inject a deterministic sidefx HTML comment marker into a ``gh`` write command.
 
     Supports ``gh issue create``, ``gh pr create``, ``gh issue comment``, and
-    ``gh pr comment``. Avoids clobbering ``--body-file`` / ``-F``, ``--editor`` / ``-e``,
-    ``--web`` / ``-w``, or ``--fill*`` flags (returning ``injected=False`` in those cases
-    so the reconciler knows no marker was embedded).
+    ``gh pr comment``. Handles attached short flags (``-bText``, ``-Ffile``), skips
+    values of value-taking flags (such as ``--title -b``), and refuses to inject when
+    conflicting/interactive body sources (``-F``/``--body-file``, ``--editor``,
+    ``--web``, ``--fill*``, ``--template``, or ``comment`` without ``--body``) are used.
     """
     validate_marker_token(marker)
     args = list(argv)
@@ -171,48 +200,95 @@ def inject_marker_into_gh_args(argv: Sequence[str], marker: str) -> tuple[list[s
             end_opts_idx = idx
             break
 
-    # Flags where we cannot safely inject an inline --body without changing user intent.
-    no_inject_flags = {
-        "-F",
-        "--body-file",
-        "-e",
-        "--editor",
-        "-w",
-        "--web",
-        "-f",
-        "--fill",
-        "--fill-first",
-        "--fill-verbose",
-        "-T",
-        "--template",
-    }
-
+    body_locations: list[
+        tuple[int, str]
+    ] = []  # (idx, "separate" | "long_eq" | "short_eq" | "short_att")
+    has_title = False
     idx = 3
     while idx < end_opts_idx:
         tok = args[idx]
+
+        # 1. Explicit conflicting flags -> never inject.
+        if tok in _GH_NO_INJECT_SHORT_FLAGS or tok in _GH_NO_INJECT_LONG_FLAGS:
+            return args, False
+        if any(tok.startswith(f"{flag}=") for flag in _GH_NO_INJECT_LONG_FLAGS):
+            return args, False
+        if len(tok) > 2 and tok[:2] in ("-F", "-T"):
+            return args, False
+
+        # 2. Body flags: -b <val>, --body <val>, --body=<val>, -b=<val>, -b<val>
         if tok in ("-b", "--body"):
             if idx + 1 >= end_opts_idx:
                 return args, False
-            args[idx + 1] = inject_marker_into_body(args[idx + 1], marker)
-            return args, True
+            body_locations.append((idx + 1, "separate"))
+            idx += 2
+            continue
         if tok.startswith("--body="):
-            prefix, val = tok.split("=", 1)
-            args[idx] = f"{prefix}={inject_marker_into_body(val, marker)}"
-            return args, True
+            body_locations.append((idx, "long_eq"))
+            idx += 1
+            continue
         if tok.startswith("-b="):
-            prefix, val = tok.split("=", 1)
-            args[idx] = f"{prefix}={inject_marker_into_body(val, marker)}"
-            return args, True
-        if tok in no_inject_flags or any(
-            tok.startswith(f"{flag}=") for flag in ("--body-file", "-F", "--template", "-T")
-        ):
-            return args, False
+            body_locations.append((idx, "short_eq"))
+            idx += 1
+            continue
+        if tok.startswith("-b") and len(tok) > 2:
+            body_locations.append((idx, "short_att"))
+            idx += 1
+            continue
+
+        # 3. Title flags (needed to know whether create is non-interactive without --body).
+        if tok in ("-t", "--title"):
+            has_title = True
+            idx += 2
+            continue
+        if tok.startswith("--title=") or (tok.startswith("-t") and len(tok) > 2):
+            has_title = True
+            idx += 1
+            continue
+
+        # 4. Other value-taking flags: skip their argument token so it is never misread!
+        if tok in _GH_VALUE_SHORT_FLAGS or tok in _GH_VALUE_LONG_FLAGS:
+            idx += 2
+            continue
+        if any(tok.startswith(f"{flag}=") for flag in _GH_VALUE_LONG_FLAGS):
+            idx += 1
+            continue
+        if len(tok) > 2 and tok[:2] in _GH_VALUE_SHORT_FLAGS:
+            idx += 1
+            continue
+
+        # 5. Combined short flags (e.g., -we or -fb) that might hide conflicting/body flags.
+        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 2:
+            short_chars = set(tok[1:])
+            if short_chars & {"F", "e", "w", "f", "T", "b"}:
+                return args, False
+
         idx += 1
 
-    # No explicit body or conflicting flag: insert `--body <marker>` before any `--`.
-    insertion = ["--body", format_marker_comment(marker)]
-    updated = args[:end_opts_idx] + insertion + args[end_opts_idx:]
-    return updated, True
+    if len(body_locations) > 1:
+        # Multiple body flags are ambiguous; do not guess which one `gh` uses.
+        return args, False
+
+    if len(body_locations) == 1:
+        b_idx, form = body_locations[0]
+        if form == "separate":
+            args[b_idx] = inject_marker_into_body(args[b_idx], marker)
+        elif form in ("long_eq", "short_eq"):
+            prefix, val = args[b_idx].split("=", 1)
+            args[b_idx] = f"{prefix}={inject_marker_into_body(val, marker)}"
+        else:  # short_att (-bText)
+            args[b_idx] = f"-b{inject_marker_into_body(args[b_idx][2:], marker)}"
+        return args, True
+
+    # No explicit body flag:
+    # - For `comment`, never fabricate a marker-only comment!
+    # - For `issue create` / `pr create`, only append `--body` if `--title` was explicitly passed.
+    if kind in ("issue", "pr") and has_title:
+        insertion = ["--body", format_marker_comment(marker)]
+        updated = args[:end_opts_idx] + insertion + args[end_opts_idx:]
+        return updated, True
+
+    return args, False
 
 
 def parse_github_repo(value: str) -> tuple[str, str] | None:
@@ -240,6 +316,18 @@ def _is_valid_repo_segment(seg: str) -> bool:
     return bool(_REPO_SEGMENT_RE.match(seg)) and seg not in (".", "..")
 
 
+def _is_loopback_host(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    lower = hostname.lower()
+    if lower == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(lower).is_loopback
+    except ValueError:
+        return False
+
+
 def _validate_api_base_url(url: str) -> tuple[str, str, str]:
     """Validate and normalize ``api_base_url``, returning ``(base_url, scheme, netloc)``."""
     cleaned = url.strip().rstrip("/")
@@ -248,19 +336,22 @@ def _validate_api_base_url(url: str) -> tuple[str, str, str]:
         raise ValueError(f"GitHub API base URL must use http or https, got {url!r}")
     if not parsed.netloc or parsed.username is not None or parsed.password is not None:
         raise ValueError(f"Invalid GitHub API base URL (host required, no credentials): {url!r}")
+    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+        raise ValueError(
+            f"Plain HTTP GitHub API base URL is only allowed for loopback hosts, got {url!r}"
+        )
     if any(ch in cleaned for ch in ("\r", "\n", "\x00")):
         raise ValueError("GitHub API base URL must not contain control characters")
     return cleaned, parsed.scheme.lower(), parsed.netloc.lower()
 
 
-def _parse_next_link(link_header: str | None) -> str | None:
-    """Extract RFC 5988 ``rel="next"`` URL from an HTTP ``Link`` header."""
-    if not link_header:
-        return None
-    for part in link_header.split(","):
-        match = _LINK_NEXT_RE.search(part)
-        if match:
-            return match.group(1).strip()
+def _parse_next_link(link_headers: Sequence[str]) -> str | None:
+    """Extract RFC 5988 ``rel="next"`` URL across all HTTP ``Link`` headers."""
+    for header in link_headers:
+        for part in header.split(","):
+            match = _LINK_NEXT_RE.search(part)
+            if match:
+                return match.group(1).strip()
     return None
 
 
@@ -334,12 +425,18 @@ class GitHubReconciler:
         self._api_base_url = base
         self._scheme = scheme
         self._netloc = netloc
-        self._token = (
-            token
-            if token is not None
-            else (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
-            or None
-        )
+
+        # Only attach ambient GITHUB_TOKEN / GH_TOKEN to official api.github.com over HTTPS
+        # so overriding --github-api-url never leaks credentials to an untrusted host.
+        if token is not None:
+            resolved_token: str | None = token.strip() or None
+        elif scheme == "https" and netloc == "api.github.com":
+            env_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+            resolved_token = env_token.strip() or None
+        else:
+            resolved_token = None
+
+        self._token = resolved_token
         self._timeout_seconds = float(timeout_seconds)
         self._per_page = per_page
         self._max_pages = max_pages
@@ -364,13 +461,27 @@ class GitHubReconciler:
             return True
         return record.target.startswith("github:")
 
-    def _resolve_query_spec(self, record: ActionRecord) -> dict[str, Any] | None:
-        """Extract validated repo, kind, optional issue_number, and author from ``record``."""
+    def _resolve_query_spec(self, record: ActionRecord) -> dict[str, Any]:
+        """Extract validated repo, kind, optional issue_number, and proof flags."""
         _, meta = parse_summary_meta(record.summary)
         tool = record.tool_name.lower()
 
         if meta.get("marker_injected") is False:
             return {"error": "Marker was not injected into outgoing GitHub payload"}
+
+        if meta.get("host_unverified") is True:
+            return {"error": "GitHub host was non-default or unverified; refusing API lookup"}
+
+        recorded_base = meta.get("api_base_url")
+        if isinstance(recorded_base, str) and recorded_base.strip():
+            norm_recorded = recorded_base.strip().rstrip("/").lower()
+            if norm_recorded != self._api_base_url.lower():
+                return {
+                    "error": (
+                        f"Recorded GitHub API base {recorded_base!r} does not match "
+                        f"reconciler API base {self._api_base_url!r}"
+                    )
+                }
 
         repo_pair: tuple[str, str] | None = None
         if isinstance(meta.get("repo"), str):
@@ -412,12 +523,21 @@ class GitHubReconciler:
         if author is None and isinstance(meta.get("author"), str) and meta["author"].strip():
             author = meta["author"].strip()
 
+        # Fail closed on NOT_FOUND: only prove absence when we know for certain that
+        # our marker was injected into a verified GitHub target repo.
+        can_prove_not_found = (
+            meta.get("adapter") == "github"
+            and meta.get("marker_injected") is True
+            and not bool(meta.get("repo_inferred", False))
+        )
+
         return {
             "owner": owner,
             "repo": repo,
             "kind": kind,
             "issue_number": issue_number,
             "author": author,
+            "can_prove_not_found": can_prove_not_found,
         }
 
     def _build_initial_url(
@@ -462,7 +582,6 @@ class GitHubReconciler:
             )
             return f"{base}/issues/comments?{params}"
 
-        # Generic issue_or_pr fallback: GitHub /issues?state=all returns both issues and PRs.
         params = urllib.parse.urlencode(
             {
                 "state": "all",
@@ -500,7 +619,7 @@ class GitHubReconciler:
                 raw_bytes = resp.read(MAX_RESPONSE_BYTES + 1)
                 if len(raw_bytes) > MAX_RESPONSE_BYTES:
                     return None, None, "GitHub API response exceeded safety size limit"
-                link_header = resp.headers.get("Link")
+                link_headers = resp.headers.get_all("Link") or []
         except urllib.error.HTTPError as exc:
             return None, None, f"GitHub API HTTP error {exc.code}: {exc.reason}"
         except urllib.error.URLError as exc:
@@ -528,7 +647,7 @@ class GitHubReconciler:
                 )
             items.append(entry)
 
-        next_raw = _parse_next_link(link_header)
+        next_raw = _parse_next_link(link_headers)
         next_url = urllib.parse.urljoin(url, next_raw) if next_raw else None
         return items, next_url, None
 
@@ -540,11 +659,6 @@ class GitHubReconciler:
             return ReconcileResult(state=ReconcileState.UNKNOWN, details=str(exc))
 
         spec = self._resolve_query_spec(record)
-        if spec is None:
-            return ReconcileResult(
-                state=ReconcileState.UNKNOWN,
-                details="Unable to build GitHub reconciliation query",
-            )
         if "error" in spec:
             return ReconcileResult(state=ReconcileState.UNKNOWN, details=str(spec["error"]))
 
@@ -553,6 +667,7 @@ class GitHubReconciler:
         kind = spec["kind"]
         issue_number = spec["issue_number"]
         author = spec["author"]
+        can_prove_not_found = bool(spec["can_prove_not_found"])
 
         url: str | None = self._build_initial_url(
             owner=owner, repo=repo, kind=kind, issue_number=issue_number
@@ -633,6 +748,16 @@ class GitHubReconciler:
                 details=(
                     f"Pagination cap ({self._max_pages} pages) reached in {owner}/{repo} "
                     "without finding marker; cannot confirm not_found"
+                ),
+            )
+
+        if not can_prove_not_found:
+            return ReconcileResult(
+                state=ReconcileState.UNKNOWN,
+                details=(
+                    f"No match found for marker {record.marker} in {owner}/{repo}, "
+                    "but marker injection or explicit target repo was not verified; "
+                    "refusing to claim not_found"
                 ),
             )
 

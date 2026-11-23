@@ -7,6 +7,8 @@ import json
 import os
 import re
 import shlex
+import stat
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,21 +16,10 @@ from typing import Any
 
 from sidefx.config import CONFIG_FILENAME, ConfigError, SidefxConfig, load_config
 from sidefx.journal import ActionRecord, ActionStatus, Journal, resolve_db_path
-from sidefx.reconcilers.base import parse_summary_meta
+from sidefx.reconcilers.base import parse_summary_meta, sanitize_text
 
 DEFAULT_CLAUDE_SETTINGS_PATH = Path(".claude") / "settings.json"
 DEFAULT_STOP_HOOK_COMMAND = "sidefx report --format markdown"
-
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-_BIDI_OVERRIDE_RE = re.compile(r"[\u202a-\u202e\u2066-\u2069]")
-
-
-def sanitize_text(text: str) -> str:
-    """Strip ANSI escape sequences, control chars, and bidi overrides for safe display."""
-    stripped = _ANSI_ESCAPE_RE.sub("", text)
-    stripped = _BIDI_OVERRIDE_RE.sub("", stripped)
-    return _CONTROL_CHARS_RE.sub(" ", stripped).strip()
 
 
 def _md_code(text: str) -> str:
@@ -36,7 +27,6 @@ def _md_code(text: str) -> str:
     safe = sanitize_text(text)
     if "`" not in safe:
         return f"`{safe}`"
-    # Choose a fence longer than any backtick run in `safe`.
     longest = max(len(m.group(0)) for m in re.finditer(r"`+", safe))
     fence = "`" * (longest + 1)
     if safe.startswith("`") or safe.endswith("`"):
@@ -125,7 +115,11 @@ def load_receipt_data(
                 descending=False,
             )
         )
-        counts = journal.count_by_status(session_id=session_id)
+    # Derive counts directly from the single snapshot of `actions` so counts and rows
+    # are always 100% consistent even under concurrent writes!
+    counts: dict[ActionStatus, int] = {s: 0 for s in ActionStatus}
+    for action in actions:
+        counts[action.status] += 1
 
     return ReceiptData(
         db_path=db_path,
@@ -137,7 +131,12 @@ def load_receipt_data(
 
 
 def render_receipt_markdown(data: ReceiptData) -> str:
-    """Render a compact, human-scannable Markdown receipt strictly from journal rows."""
+    """Render a compact, human-scannable Markdown receipt strictly from journal rows.
+
+    All untrusted journal fields (action_id, target, result_ref, error, summary) are
+    sanitized and wrapped in inline code spans so external strings cannot inject
+    Markdown links, images, or fake headings when consumed by an AI model or terminal.
+    """
     session_label = _md_code(data.session_id) if data.session_id else "`all`"
     lines = [
         "## sidefx Session Receipt",
@@ -193,17 +192,13 @@ def render_receipt_markdown(data: ReceiptData) -> str:
 
             line = "- " + " · ".join(parts)
             if rec.result_ref:
-                safe_ref = sanitize_text(rec.result_ref)
-                if safe_ref.startswith("http://") or safe_ref.startswith("https://"):
-                    line += f" -> {safe_ref}"
-                else:
-                    line += f" -> {_md_code(safe_ref)}"
+                line += f" -> {_md_code(rec.result_ref)}"
             elif rec.error:
-                line += f" — error: {sanitize_text(rec.error)}"
+                line += f" — error: {_md_code(rec.error)}"
             else:
                 clean_sum = _clean_record_summary(rec)
                 if clean_sum:
-                    line += f" — {clean_sum}"
+                    line += f" — {_md_code(clean_sum)}"
 
             if is_unresolved:
                 line += f" (marker: {_md_code(rec.marker)})"
@@ -391,10 +386,8 @@ def _stop_hook_already_present(stop_entries: list[Any], command: str) -> bool:
     for entry in stop_entries:
         if not isinstance(entry, dict):
             continue
-        # Legacy flat hook format: {"type": "command", "command": "..."}
         if entry.get("type") == "command" and entry.get("command") == command:
             return True
-        # Current Claude Code matcher-group format: {"hooks": [{"type": "command", ...}]}
         nested = entry.get("hooks")
         if isinstance(nested, list):
             for hook in nested:
@@ -414,17 +407,24 @@ def merge_claude_code_settings(
 ) -> tuple[dict[str, Any], bool]:
     """Safely merge a ``sidefx report`` Stop hook into a Claude Code ``settings.json`` file.
 
-    Preserves all existing settings, other hook events, and existing ``Stop`` hooks.
+    Preserves symlinks (resolves symlink target before atomic replace), file permissions,
+    all existing settings, other hook events, and existing ``Stop`` hooks.
     Idempotent: if the exact hook command is already registered, does not duplicate it.
     Returns ``(merged_settings_dict, modified_bool)``.
     """
     if settings_path.is_dir():
         raise ConfigError(f"Settings path is a directory, expected a JSON file: {settings_path}")
 
+    write_target = settings_path.resolve() if settings_path.is_symlink() else settings_path
+    if write_target.is_dir():
+        raise ConfigError(f"Settings path resolves to a directory: {write_target}")
+
+    existing_mode: int | None = None
     existing: dict[str, Any] = {}
-    if settings_path.exists():
+    if write_target.exists():
         try:
-            raw_text = settings_path.read_text(encoding="utf-8-sig")
+            existing_mode = stat.S_IMODE(write_target.stat().st_mode)
+            raw_text = write_target.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError) as exc:
             raise ConfigError(f"Failed to read {settings_path}: {exc}") from exc
         if raw_text.strip():
@@ -468,13 +468,14 @@ def merge_claude_code_settings(
     )
 
     content = json.dumps(existing, indent=2) + "\n"
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    write_target.parent.mkdir(parents=True, exist_ok=True)
+    target_mode = existing_mode if existing_mode is not None else 0o644
     tmp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
-            dir=settings_path.parent,
+            dir=write_target.parent,
             prefix=".sidefx-claude-settings-",
             suffix=".tmp",
             delete=False,
@@ -483,7 +484,8 @@ def merge_claude_code_settings(
             tmp_file.write(content)
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
-        os.replace(tmp_path, settings_path)
+        os.chmod(tmp_path, target_mode)
+        os.replace(tmp_path, write_target)
         tmp_path = None
     finally:
         if tmp_path is not None:
@@ -495,24 +497,31 @@ def merge_claude_code_settings(
 def handle_init_claude_code_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
     """CLI handler for ``sidefx init --claude-code``."""
     del config  # Not required to generate hook snippet.
+    init_path = getattr(args, "init_path", CONFIG_FILENAME)
+    explicit_settings = getattr(args, "settings_path", None)
+    write_flag = bool(getattr(args, "write", False))
+
+    if init_path and str(init_path) != CONFIG_FILENAME:
+        print(
+            "error: --path is for .sidefx.json config; use --settings <path> or --write "
+            "with --claude-code",
+            file=sys.stderr,
+        )
+        return 2
+
     cmd_parts = ["sidefx", "report", "--format", "markdown"]
     db_raw = getattr(args, "db_path", None)
     if db_raw:
-        cmd_parts.extend(["--db", shlex.quote(str(db_raw))])
+        abs_db = str(Path(str(db_raw)).expanduser().resolve())
+        cmd_parts.extend(["--db", shlex.quote(abs_db)])
     session_id = getattr(args, "session_id", None)
     if session_id:
         cmd_parts.extend(["--session-id", shlex.quote(str(session_id))])
     command = " ".join(cmd_parts)
 
-    explicit_settings = getattr(args, "settings_path", None)
-    write_flag = bool(getattr(args, "write", False))
-    init_path = getattr(args, "init_path", CONFIG_FILENAME)
-
     dest: Path | None = None
     if explicit_settings:
         dest = Path(str(explicit_settings)).expanduser()
-    elif init_path and str(init_path) != CONFIG_FILENAME:
-        dest = Path(str(init_path)).expanduser()
     elif write_flag:
         dest = DEFAULT_CLAUDE_SETTINGS_PATH
 
