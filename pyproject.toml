@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sidefx"
-version = "0.1.1"
+version = "0.1.2"
 description = "Outbound effects journal, transparent stdio MCP proxy, CLI mutation wrapper, crash reconciler, and ground-truth session receipts for AI agents."
 readme = "README.md"
 license = "MIT"
@@ -33,7 +33,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Logging",
     "Typing :: Typed",
@@ -57,6 +56,14 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sidefx"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "docs/launch.md",
+    "PLAN.md",
+    "AGENTS.md",
+    ".github",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

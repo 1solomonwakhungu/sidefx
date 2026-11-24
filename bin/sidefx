@@ -40,7 +40,7 @@ fi
 
 # 4. Fallback to uvx pinned to the upstream git release tag if available.
 if command -v uvx >/dev/null 2>&1; then
-  exec uvx --from "git+https://github.com/1solomonwakhungu/sidefx@v0.1.1" sidefx "$@"
+  exec uvx --from "git+https://github.com/1solomonwakhungu/sidefx@v0.1.2" sidefx "$@"
 fi
 
 echo "sidefx: could not locate Python >= 3.11, sidefx on PATH, or uv" >&2

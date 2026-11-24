@@ -518,24 +518,25 @@ Latest benchmark results (`uv run sidefx eval`):
 
 ## Performance & Overhead
 
-Measured with `uv run python evals/benchmark.py` on macOS (`Darwin arm64`, Python 3.13.14, SQLite 3.53.1) with full durability enabled (`PRAGMA journal_mode=WAL`, `PRAGMA synchronous=FULL`, `PRAGMA fullfsync=ON`):
+Representative single-run measurements from a git clone via `uv run python evals/benchmark.py` on macOS (`Darwin arm64`, Python 3.13.14, SQLite 3.53.1) with full durability enabled (`PRAGMA journal_mode=WAL`, `PRAGMA synchronous=FULL`, `PRAGMA fullfsync=ON`); exact timings vary by disk and OS:
 
 | Operation | N | Median | p95 | Notes |
 |---|---:|---:|---:|---|
-| Journal `get_action` lookup | 300 | **0.005 ms** | 0.006 ms | Indexed SQLite read |
-| Journal `begin_action` replay hit | 300 | **0.011 ms** | 0.012 ms | Hash check + cached status hit |
-| Journal `begin_action` + `mark_confirmed` | 100 | **7.99 ms** | 8.16 ms | Two durable `fullfsync` WAL commits |
-| MCP direct stdio baseline (`get_item`) | 80 | **0.014 ms** | 0.032 ms | Unwrapped local Python MCP server |
-| MCP proxy read-only passthrough | 80 | **0.033 ms** | 0.058 ms | **+0.02 ms** median overhead (no SQLite write) |
-| MCP proxy mutating write-ahead (`create_item`) | 80 | **7.98 ms** | 9.89 ms | **+7.96 ms** median overhead (preflight + 2 durable commits) |
-| MCP proxy duplicate replay (`--deterministic-ids`) | 80 | **0.044 ms** | 0.178 ms | Answered from journal; zero upstream calls |
-| CLI bare `/usr/bin/true` baseline | 20 | **2.07 ms** | 2.44 ms | Baseline process spawn |
-| CLI `sidefx wrap` (new action) | 20 | **69.03 ms** | 77.60 ms | **+66.96 ms** median overhead (Python startup + WAL commits) |
-| CLI `sidefx wrap` (replayed hit) | 20 | **54.69 ms** | 59.47 ms | Replayed from journal without spawning child |
+| Journal `get_action` lookup | 300 | **~0.005 ms** | ~0.006 ms | Indexed SQLite read |
+| Journal `begin_action` replay hit | 300 | **~0.011 ms** | ~0.012 ms | Hash check + cached status hit |
+| Journal `begin_action` + `mark_confirmed` | 100 | **~8.0 ms** | ~8.2 ms | Two durable `fullfsync` WAL commits |
+| MCP direct stdio baseline (`get_item`) | 80 | **~0.014 ms** | ~0.032 ms | Unwrapped local Python MCP server |
+| MCP proxy read-only passthrough | 80 | **~0.033 ms** | ~0.058 ms | **~+0.02 ms** median overhead (no SQLite write) |
+| MCP proxy mutating write-ahead (`create_item`) | 80 | **~8.0 ms** | ~9.9 ms | **~+8.0 ms** median overhead (preflight + 2 durable commits) |
+| MCP proxy duplicate replay (`--deterministic-ids`) | 80 | **~0.044 ms** | ~0.18 ms | Answered from journal; zero upstream calls |
+| CLI bare `/usr/bin/true` baseline | 20 | **~2.1 ms** | ~2.4 ms | Baseline process spawn |
+| CLI `sidefx wrap` (new action) | 20 | **~69 ms** | ~78 ms | **~+67 ms** median overhead (Python startup + WAL commits) |
+| CLI `sidefx wrap` (replayed hit) | 20 | **~55 ms** | ~59 ms | Replayed from journal without spawning child |
 
-Reproduce on your own machine:
+Reproduce from a git clone on your own machine:
 
 ```bash
+git clone https://github.com/1solomonwakhungu/sidefx.git && cd sidefx
 uv run python evals/benchmark.py
 uv run python evals/benchmark.py --json
 ```
