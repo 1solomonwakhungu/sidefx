@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import subprocess
@@ -11,11 +12,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from sidefx.config import MAX_TIMEOUT_SECONDS
 from sidefx.journal import ActionRecord
 from sidefx.reconcilers.base import ReconcileResult, ReconcileState, parse_summary_meta
 
 DEFAULT_GIT_TIMEOUT = 15.0
 _HEX_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_URL_IN_TEXT_RE = re.compile(r"(?:https?|ssh|git\+ssh)://[^\s'\"<>]+", re.IGNORECASE)
 _GIT_PUSH_TOOLS = frozenset({"git_push", "push_branch", "git-push"})
 
 # Global git flags that alter repo/config context and make push resolution non-trivial.
@@ -106,6 +109,10 @@ def redact_remote_for_display(remote: str) -> str:
     return remote
 
 
+def _redact_urls_in_git_text(text: str) -> str:
+    return _URL_IN_TEXT_RE.sub(lambda m: redact_remote_for_display(m.group(0)), text)
+
+
 def _git_env() -> dict[str, str]:
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -161,7 +168,8 @@ def _ls_remote_ref(
         safe_remote = redact_remote_for_display(remote)
         return False, None, f"git ls-remote failed or timed out for {safe_remote} {remote_ref}"
     if proc.returncode != 0:
-        err = (proc.stderr or "").strip() or f"exit code {proc.returncode}"
+        raw_err = (proc.stderr or "").strip()
+        err = _redact_urls_in_git_text(raw_err) or f"exit code {proc.returncode}"
         return False, None, f"git ls-remote failed ({err})"
 
     lines = [line for line in proc.stdout.splitlines() if line.strip()]
@@ -460,9 +468,10 @@ def inspect_git_push(
             )
         # Custom `remote.<name>.push` refspecs alter destination arbitrarily -> do not guess.
         if _git_config_has(f"remote.{remote}.push", cwd=repo_cwd):
+            safe_remote = redact_remote_for_display(remote)
             return GitPushSpec(
                 cwd=str(repo_cwd),
-                remote=remote,
+                remote=safe_remote,
                 remote_ref=None,
                 expected_sha=None,
                 before_sha=None,
@@ -470,7 +479,9 @@ def inspect_git_push(
                 is_delete=False,
                 is_force=is_force,
                 reconcilable=False,
-                reason=f"Custom remote.{remote}.push refspec configured; cannot safely reconcile",
+                reason=(
+                    f"Custom remote.{safe_remote}.push refspec configured; cannot safely reconcile"
+                ),
             )
 
         push_default = (_git_config_get("push.default", cwd=repo_cwd) or "simple").lower()
@@ -490,7 +501,7 @@ def inspect_git_push(
                 else:
                     return GitPushSpec(
                         cwd=str(repo_cwd),
-                        remote=remote,
+                        remote=redact_remote_for_display(remote),
                         remote_ref=None,
                         expected_sha=None,
                         before_sha=None,
@@ -677,8 +688,16 @@ class GitPushReconciler:
     """Read-only ``git ls-remote`` reconciler for wrapped ``git push`` actions."""
 
     def __init__(self, *, timeout_seconds: float = DEFAULT_GIT_TIMEOUT) -> None:
-        if isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be > 0")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+            or timeout_seconds > MAX_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                f"timeout_seconds must be a finite number > 0 and <= {int(MAX_TIMEOUT_SECONDS)}"
+            )
         self._timeout_seconds = float(timeout_seconds)
 
     @property

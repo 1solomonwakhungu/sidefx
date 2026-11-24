@@ -25,6 +25,7 @@ from typing import Any, BinaryIO
 from sidefx.config import MAX_TIMEOUT_SECONDS, SidefxConfig, load_config
 from sidefx.guidance import OUTCOME_UNKNOWN_BANNER as OUTCOME_UNKNOWN_BANNER
 from sidefx.guidance import (
+    _sanitize_detail,
     mcp_initialize_instructions,
     outcome_unknown_data,
     outcome_unknown_message,
@@ -63,10 +64,11 @@ _AMBIGUOUS_ERROR_RE = re.compile(
     r"(?:"
     r"timed?\s*out|timeout|etimedout|esockettimedout|"
     r"deadline[\s_]*exceeded|"
-    r"econnreset|connection\s+reset|socket\s+hang\s+up|"
+    r"econnreset|connection\s+(?:reset|aborted|closed)|socket\s+hang\s+up|"
     r"broken\s+pipe|epipe|eof\s+before|unexpected\s+eof|"
     r"fetch\s+failed|network\s+error|econnaborted|"
-    r"502\s+bad\s+gateway|503\s+service\s+unavailable|504\s+gateway"
+    r"502\s+bad\s+gateway|503\s+service|504\s+gateway|"
+    r"(?:http(?:\s+(?:error|status))?|status(?:\s+code)?)\s*:?\s*(?:502|503|504)\b"
     r")",
     re.IGNORECASE,
 )
@@ -153,6 +155,19 @@ def _loads_strict_json(text: str) -> Any:
         parse_constant=_reject_json_constant,
         parse_float=_parse_finite_float,
     )
+
+
+def _is_valid_jsonrpc_id(rpc_id: Any) -> bool:
+    """Return True if ``rpc_id`` is a valid JSON-RPC 2.0 id (string, finite number, or null)."""
+    if rpc_id is None or isinstance(rpc_id, str):
+        return True
+    if isinstance(rpc_id, bool):
+        return False
+    if isinstance(rpc_id, int):
+        return True
+    if isinstance(rpc_id, float):
+        return math.isfinite(rpc_id)
+    return False
 
 
 def _rpc_id_key(rpc_id: Any) -> tuple[type, Any]:
@@ -906,12 +921,13 @@ class MCPProxy:
         chunk = stream.readline(MAX_MESSAGE_BYTES + 1)
         if not chunk:
             return None, False
-        if len(chunk) > MAX_MESSAGE_BYTES and not chunk.endswith(b"\n"):
-            # Drain remainder of oversized line so framing stays synchronized.
-            while True:
-                extra = stream.readline(65536)
-                if not extra or extra.endswith(b"\n"):
-                    break
+        if len(chunk) > MAX_MESSAGE_BYTES:
+            if not chunk.endswith(b"\n"):
+                # Drain remainder of oversized line so framing stays synchronized.
+                while True:
+                    extra = stream.readline(65536)
+                    if not extra or extra.endswith(b"\n"):
+                        break
             return b"", True
         return chunk, False
 
@@ -942,11 +958,12 @@ class MCPProxy:
         if not has_client_id:
             return
         db_path = self._journal_db_path()
+        safe_detail = _sanitize_detail(detail)
         message = outcome_unknown_message(
             action_id=action_id,
             marker=marker,
             tool_name=tool_name,
-            detail=detail,
+            detail=safe_detail,
             db_path=db_path,
         )
         self._send_client_message(
@@ -960,7 +977,7 @@ class MCPProxy:
                     "marker": marker,
                     "tool": tool_name,
                     "status": status.value,
-                    "detail": detail,
+                    "detail": safe_detail,
                     **outcome_unknown_data(action_id, db_path=db_path),
                 },
             )
@@ -1410,11 +1427,12 @@ class MCPProxy:
                                 f"dropped unmatched internal upstream response id={msg_id!r}"
                             )
                             continue
-                        with self._state_lock:
-                            if generation != self._upstream_generation:
-                                continue
-                            self._pending_passthrough.pop(_rpc_id_key(msg_id), None)
-                        msg = self._maybe_inject_init_instructions(msg_id, msg)
+                        if _is_valid_jsonrpc_id(msg_id):
+                            with self._state_lock:
+                                if generation != self._upstream_generation:
+                                    continue
+                                self._pending_passthrough.pop(_rpc_id_key(msg_id), None)
+                            msg = self._maybe_inject_init_instructions(msg_id, msg)
 
                     # Passthrough response, notification, or server-initiated request.
                     if isinstance(msg, dict):
@@ -2314,6 +2332,15 @@ class MCPProxy:
 
         has_client_id = "id" in msg
         client_id = msg.get("id")
+        if has_client_id and not _is_valid_jsonrpc_id(client_id):
+            self._send_client_message(
+                _jsonrpc_error_response(
+                    None,
+                    JSONRPC_INVALID_REQUEST,
+                    "Invalid Request: JSON-RPC 'id' must be a string, number, or null",
+                )
+            )
+            return
         method = msg.get("method")
 
         try:

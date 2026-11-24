@@ -530,7 +530,7 @@ class Journal:
             journal_dir = self._db_path.parent
             created_dir = not journal_dir.exists()
             try:
-                journal_dir.mkdir(parents=True, exist_ok=True)
+                journal_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             except OSError as exc:
                 raise JournalError(
                     f"Failed to create journal directory {journal_dir}: {exc}"
@@ -539,6 +539,13 @@ class Journal:
                 with suppress(OSError):
                     os.chmod(journal_dir, 0o700)
                 _write_journal_gitignore(journal_dir)
+            if not self._db_path.exists():
+                create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_NOFOLLOW"):
+                    create_flags |= os.O_NOFOLLOW
+                with suppress(FileExistsError, OSError):
+                    fd = os.open(self._db_path, create_flags, 0o600)
+                    os.close(fd)
             target_str = str(self._db_path)
         else:
             target_str = ":memory:"
@@ -572,6 +579,12 @@ class Journal:
         except Exception:
             conn.close()
             raise
+        if self._db_path is not None:
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(f"{self._db_path}{suffix}")
+                if sidecar.exists():
+                    with suppress(OSError):
+                        os.chmod(sidecar, 0o600)
         return conn
 
     def _open_readonly_conn(self) -> sqlite3.Connection:

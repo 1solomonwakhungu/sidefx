@@ -381,6 +381,7 @@ Every blocking error carries its own next steps in the error text, because most 
 {
   "kind": "outcome_unknown",
   "action_id": "det-1aec4c3caa608cc3782451d3",
+  "marker": "2f88db28d824e145511b6f9c",
   "tool": "create_ticket",
   "status": "unknown",
   "detail": "upstream MCP server timed out after 30s",
@@ -511,13 +512,39 @@ Latest benchmark results (`uv run sidefx eval`):
 | `preflight_policy_enforcement` | Numeric cap (`amount > 50`), protected branch denylist (`main`), and email domain allow/deny rules through `mcp-proxy` | PASS | **0** | 2/2 | — |
 | `session_receipt_ground_truth` | Mixed CLI + MCP session (`confirmed`, `reconciled`, `failed`, `unknown`) verified against remote server state (JSON & Markdown) | PASS | **0** | 5/5 | **100.0%** |
 
-**Totals:** `6/6 passed` · `0 duplicate remote writes` · `100.0% receipt accuracy`
+**Totals:** `6/6 passed` · `0 duplicate remote writes` · `100.0% receipt accuracy` · `13.1s total runtime`
+
+---
+
+## Performance & Overhead
+
+Measured with `uv run python evals/benchmark.py` on macOS (`Darwin arm64`, Python 3.13.14, SQLite 3.53.1) with full durability enabled (`PRAGMA journal_mode=WAL`, `PRAGMA synchronous=FULL`, `PRAGMA fullfsync=ON`):
+
+| Operation | N | Median | p95 | Notes |
+|---|---:|---:|---:|---|
+| Journal `get_action` lookup | 300 | **0.005 ms** | 0.006 ms | Indexed SQLite read |
+| Journal `begin_action` replay hit | 300 | **0.011 ms** | 0.012 ms | Hash check + cached status hit |
+| Journal `begin_action` + `mark_confirmed` | 100 | **7.99 ms** | 8.16 ms | Two durable `fullfsync` WAL commits |
+| MCP direct stdio baseline (`get_item`) | 80 | **0.014 ms** | 0.032 ms | Unwrapped local Python MCP server |
+| MCP proxy read-only passthrough | 80 | **0.033 ms** | 0.058 ms | **+0.02 ms** median overhead (no SQLite write) |
+| MCP proxy mutating write-ahead (`create_item`) | 80 | **7.98 ms** | 9.89 ms | **+7.96 ms** median overhead (preflight + 2 durable commits) |
+| MCP proxy duplicate replay (`--deterministic-ids`) | 80 | **0.044 ms** | 0.178 ms | Answered from journal; zero upstream calls |
+| CLI bare `/usr/bin/true` baseline | 20 | **2.07 ms** | 2.44 ms | Baseline process spawn |
+| CLI `sidefx wrap` (new action) | 20 | **69.03 ms** | 77.60 ms | **+66.96 ms** median overhead (Python startup + WAL commits) |
+| CLI `sidefx wrap` (replayed hit) | 20 | **54.69 ms** | 59.47 ms | Replayed from journal without spawning child |
+
+Reproduce on your own machine:
+
+```bash
+uv run python evals/benchmark.py
+uv run python evals/benchmark.py --json
+```
 
 ---
 
 ## Architecture & Guarantees
 
-- **Zero runtime dependencies:** Requires only Python `>=3.11` (`sqlite3`, `json`, `urllib`, `subprocess`, `hashlib`, `uuid`, `argparse`, `threading`, `http.server`). Fast startup, no native compilation, CI-tested on Python 3.11 and 3.13.
-- **Durable SQLite WAL journal (`src/sidefx/journal.py`):** Opens with `PRAGMA journal_mode=WAL`, `PRAGMA synchronous=FULL` (plus `PRAGMA fullfsync=ON` on macOS), `UNIQUE (actor, target, action_id)`, and attempt-fenced `BEGIN IMMEDIATE` state transitions.
+- **Zero runtime dependencies:** Requires only Python `>=3.11` (`sqlite3`, `json`, `urllib`, `subprocess`, `hashlib`, `uuid`, `argparse`, `threading`, `http.server`). Fast startup, no native compilation, CI-tested on Python 3.11, 3.12, and 3.13.
+- **Durable SQLite WAL journal (`src/sidefx/journal.py`):** Opens with `PRAGMA journal_mode=WAL`, `PRAGMA synchronous=FULL` (plus `PRAGMA fullfsync=ON` on macOS), `UNIQUE (actor, target, action_id)`, attempt-fenced `BEGIN IMMEDIATE` state transitions, and owner-only POSIX permissions (`0700` directory, `0600` database, `-wal`/`-shm` sidecars, and `current-session`).
 - **Read-only queries never mutate state:** `sidefx status`, `sidefx report`, and `sidefx reconcile --dry-run` open SQLite in strict read-only URI mode (`mode=ro`, `PRAGMA query_only=ON`).
-- **Sanitized receipts & terminal output:** ANSI escape sequences, control characters, and Markdown link/heading injection payloads in external tool outputs are stripped and safely code-fenced before rendering.
+- **Sanitized receipts & redacted errors:** ANSI escape sequences, BiDi/control characters, and Markdown link/heading injection payloads are stripped and code-fenced before rendering; inline URL credentials, query strings, token-like webhook path segments, and `Bearer`/`Basic` tokens are redacted before persisting targets or stderr error details.

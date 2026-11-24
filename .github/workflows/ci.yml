@@ -11,19 +11,32 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13"]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Run checks
+      - name: Run lint, format, tests, and chaos evals
         run: |
-          if [ ! -f pyproject.toml ]; then
-            echo "Bootstrap commit (no pyproject.toml yet); skipping."
-            exit 0
-          fi
           uv sync --dev
           uv run ruff check .
           uv run ruff format --check .
           uv run pytest -v
+          uv run sidefx eval
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Build and verify sdist and wheel install
+        run: |
+          uv build
+          uv venv /tmp/sidefx-smoke-venv
+          uv pip install --python /tmp/sidefx-smoke-venv/bin/python dist/*.whl
+          /tmp/sidefx-smoke-venv/bin/sidefx --version
+          /tmp/sidefx-smoke-venv/bin/sidefx doctor --json
+          /tmp/sidefx-smoke-venv/bin/python -m sidefx --version

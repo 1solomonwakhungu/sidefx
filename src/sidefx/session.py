@@ -85,7 +85,7 @@ def _create_session_file_excl(target: Path, session_id: str) -> bool:
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(target, flags, 0o644)
+        fd = os.open(target, flags, 0o600)
     except FileExistsError:
         return False
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -108,7 +108,7 @@ def ensure_persisted_session(db_path: Path, *, prefix: str = "sess") -> str:
 
     journal_dir = db_path.parent
     created_dir = not journal_dir.exists()
-    journal_dir.mkdir(parents=True, exist_ok=True)
+    journal_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if created_dir:
         with suppress(OSError):
             os.chmod(journal_dir, 0o700)
@@ -175,7 +175,7 @@ def rotate_session(
     previous = read_current_session(db_path)
     journal_dir = db_path.parent
     created_dir = not journal_dir.exists()
-    journal_dir.mkdir(parents=True, exist_ok=True)
+    journal_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if created_dir:
         with suppress(OSError):
             os.chmod(journal_dir, 0o700)
