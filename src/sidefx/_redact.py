@@ -13,12 +13,11 @@ _KNOWN_SECRET_PREFIX_RE = re.compile(
 _HEX_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{24,}$")
 _OPAQUE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]{20,}$")
 
-# Match any RFC 3986 scheme://... URL, allowing single quotes inside credentials/paths
+# Match any RFC 3986 scheme://... URL (even when immediately preceded by digits,
+# hyphens, dots, or pluses), allowing single quotes inside credentials/paths
 # while stripping trailing closing quotes/punctuation after matching.
-# Negative lookbehind prevents quadratic backtracking across long alphanumeric runs.
-_URL_SCHEME_IN_TEXT_RE = re.compile(
-    r"(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s\"<>]+", re.IGNORECASE
-)
+# Negative lookbehind over the same character class guarantees linear-time scanning.
+_URL_SCHEME_IN_TEXT_RE = re.compile(r"(?<![a-z0-9+.-])[a-z0-9+.-]+://[^\s\"<>]+", re.IGNORECASE)
 _FALLBACK_USERINFO_RE = re.compile(r"(://)[^/\s]*@")
 _FALLBACK_QUERY_FRAG_RE = re.compile(r"[?#].*$")
 
@@ -137,14 +136,25 @@ def redact_remote_for_display(remote: str) -> str:
 
 def _replace_url_match(match: re.Match[str], *, remote_mode: bool = False) -> str:
     raw = match.group(0)
-    trimmed = raw.rstrip(".,);]'")
-    suffix = raw[len(trimmed) :]
+    scheme_sep = raw.find("://")
+    if scheme_sep <= 0:
+        return raw
+    first_alpha = next(
+        (i for i, ch in enumerate(raw[:scheme_sep]) if ch.isascii() and ch.isalpha()),
+        None,
+    )
+    if first_alpha is None:
+        return raw
+    prefix = raw[:first_alpha]
+    candidate = raw[first_alpha:]
+    trimmed = candidate.rstrip(".,);]'")
+    suffix = candidate[len(trimmed) :]
     if not trimmed or "://" not in trimmed:
         return raw
     redacted = (
         redact_remote_for_display(trimmed) if remote_mode else redact_url_for_display(trimmed)
     )
-    return f"{redacted}{suffix}"
+    return f"{prefix}{redacted}{suffix}"
 
 
 def redact_secrets_in_text(text: str, *, remote_mode: bool = False) -> str:

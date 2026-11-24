@@ -623,6 +623,9 @@ def test_redact_secrets_linear_time_on_long_lines() -> None:
         "a" * 200_000,
         "A" * 200_000,
         "0123456789abcdef" * 12_500,
+        "a1." * 66_667,
+        "a-" * 100_000,
+        "0" * 200_000,
         ("word " * 40_000).strip(),
         "a" * 100_000 + " https://u:p@h:abc/ 'https://a:b@h/r' ftp://u:s@f/p",
     ]
@@ -635,3 +638,17 @@ def test_redact_secrets_linear_time_on_long_lines() -> None:
     assert "a:b@" not in outputs[-1]
     assert "u:s@" not in outputs[-1]
     assert "ftp://f/p" in outputs[-1]
+
+    # URLs immediately preceded by digits, '-', '.', or '+' must still be redacted
+    for glued in (
+        "1https://u:p@h/x",
+        "-https://u:p@h/x",
+        "...https://u:p@h/x",
+        "+https://u:p@h/x",
+        ".https://u:p@h/x",
+        "--remote-https://u:p@h/x",
+        "2026-11-24T00:00:00Z-https://u:p@h/x",
+    ):
+        redacted = redact_secrets_in_text(glued)
+        assert "u:p@" not in redacted, f"credential leaked in {glued!r} -> {redacted!r}"
+        assert "h/x" in redacted
