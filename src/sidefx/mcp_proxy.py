@@ -22,6 +22,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from sidefx._redact import redact_secrets_in_text
 from sidefx.config import MAX_TIMEOUT_SECONDS, SidefxConfig, load_config
 from sidefx.guidance import OUTCOME_UNKNOWN_BANNER as OUTCOME_UNKNOWN_BANNER
 from sidefx.guidance import (
@@ -175,13 +176,17 @@ def _rpc_id_key(rpc_id: Any) -> tuple[type, Any]:
     return (type(rpc_id), rpc_id)
 
 
-def _sanitize_text(text: str | None, *, max_len: int | None = None) -> str | None:
+def _sanitize_text(
+    text: str | None, *, max_len: int | None = None, redact: bool = False
+) -> str | None:
     """Strip NUL bytes and replace lone UTF-16 surrogates so SQLite UTF-8 encoding never fails."""
     if text is None:
         return None
     cleaned = text.replace("\x00", "")
     # Replace lone surrogates cleanly so SQLite accepts the string without UnicodeEncodeError.
     cleaned = cleaned.encode("utf-8", errors="replace").decode("utf-8")
+    if redact:
+        cleaned = redact_secrets_in_text(cleaned)
     if max_len is not None and len(cleaned) > max_len:
         cleaned = f"{cleaned[: max_len - 3]}..."
     return cleaned
@@ -241,7 +246,7 @@ def _is_ambiguous_error_text(error_text: str | None) -> bool:
 def _extract_result_ref_and_summary(result: Any) -> tuple[str | None, str | None]:
     """Extract concise ``result_ref`` and ``summary`` strings from an MCP tool result."""
     if not isinstance(result, dict):
-        summary = _sanitize_text(str(result), max_len=_MAX_SUMMARY_LENGTH)
+        summary = _sanitize_text(str(result), max_len=_MAX_SUMMARY_LENGTH, redact=True)
         return None, summary
 
     result_ref: str | None = None
@@ -250,7 +255,7 @@ def _extract_result_ref_and_summary(result: Any) -> tuple[str | None, str | None
         for key in _RESULT_REF_KEYS:
             val = mapping.get(key)
             if isinstance(val, str) and val.strip():
-                return _sanitize_text(val.strip(), max_len=_MAX_REF_LENGTH)
+                return _sanitize_text(val.strip(), max_len=_MAX_REF_LENGTH, redact=True)
             if isinstance(val, int) and not isinstance(val, bool):
                 return str(val)
         return None
@@ -282,18 +287,21 @@ def _extract_result_ref_and_summary(result: Any) -> tuple[str | None, str | None
         if result_ref is None:
             url_match = _URL_RE.search(joined_text)
             if url_match is not None:
-                result_ref = _sanitize_text(url_match.group(0), max_len=_MAX_REF_LENGTH)
+                result_ref = _sanitize_text(
+                    url_match.group(0), max_len=_MAX_REF_LENGTH, redact=True
+                )
 
     if joined_text:
-        summary = _sanitize_text(joined_text, max_len=_MAX_SUMMARY_LENGTH)
+        summary = _sanitize_text(joined_text, max_len=_MAX_SUMMARY_LENGTH, redact=True)
     elif structured is not None:
         try:
             summary = _sanitize_text(
                 json.dumps(structured, sort_keys=True, separators=(",", ":"), ensure_ascii=True),
                 max_len=_MAX_SUMMARY_LENGTH,
+                redact=True,
             )
         except (TypeError, ValueError, RecursionError):
-            summary = _sanitize_text(str(structured), max_len=_MAX_SUMMARY_LENGTH)
+            summary = _sanitize_text(str(structured), max_len=_MAX_SUMMARY_LENGTH, redact=True)
     else:
         summary = result_ref
 
@@ -310,7 +318,10 @@ def _extract_tool_error_text(result: dict[str, Any]) -> str:
                 if isinstance(text_val, str) and text_val.strip():
                     parts.append(text_val.strip())
         if parts:
-            return _sanitize_text(" ".join(parts), max_len=_MAX_SUMMARY_LENGTH) or "tool error"
+            return (
+                _sanitize_text(" ".join(parts), max_len=_MAX_SUMMARY_LENGTH, redact=True)
+                or "tool error"
+            )
     return "MCP tool returned isError=true"
 
 
@@ -1045,9 +1056,10 @@ class MCPProxy:
                     f"JSON-RPC error {err_obj.get('code')}: "
                     f"{err_obj.get('message', 'upstream JSON-RPC error')}",
                     max_len=_MAX_SUMMARY_LENGTH,
+                    redact=True,
                 )
             else:
-                err_text = _sanitize_text(str(err_obj), max_len=_MAX_SUMMARY_LENGTH)
+                err_text = _sanitize_text(str(err_obj), max_len=_MAX_SUMMARY_LENGTH, redact=True)
             if not _is_ambiguous_error_text(err_text):
                 with contextlib.suppress(
                     StaleAttemptError, InvalidStateTransitionError, JournalError
@@ -1149,10 +1161,14 @@ class MCPProxy:
                     err_code = err_obj.get("code")
                     err_msg = err_obj.get("message", "upstream JSON-RPC error")
                     err_text = _sanitize_text(
-                        f"JSON-RPC error {err_code}: {err_msg}", max_len=_MAX_SUMMARY_LENGTH
+                        f"JSON-RPC error {err_code}: {err_msg}",
+                        max_len=_MAX_SUMMARY_LENGTH,
+                        redact=True,
                     )
                 else:
-                    err_text = _sanitize_text(str(err_obj), max_len=_MAX_SUMMARY_LENGTH)
+                    err_text = _sanitize_text(
+                        str(err_obj), max_len=_MAX_SUMMARY_LENGTH, redact=True
+                    )
 
                 if _is_ambiguous_error_text(err_text):
                     try:
@@ -1415,6 +1431,11 @@ class MCPProxy:
                 try:
                     if isinstance(msg, dict) and "method" not in msg and "id" in msg:
                         msg_id = msg["id"]
+                        if not _is_valid_jsonrpc_id(msg_id):
+                            self._log_err(
+                                f"dropped upstream response with invalid JSON-RPC id={msg_id!r}"
+                            )
+                            continue
                         if self._dispatch_internal_waiter(msg_id, msg, generation):
                             continue
                         if isinstance(msg_id, str) and self._handle_upstream_response_for_mutation(
@@ -1427,12 +1448,11 @@ class MCPProxy:
                                 f"dropped unmatched internal upstream response id={msg_id!r}"
                             )
                             continue
-                        if _is_valid_jsonrpc_id(msg_id):
-                            with self._state_lock:
-                                if generation != self._upstream_generation:
-                                    continue
-                                self._pending_passthrough.pop(_rpc_id_key(msg_id), None)
-                            msg = self._maybe_inject_init_instructions(msg_id, msg)
+                        with self._state_lock:
+                            if generation != self._upstream_generation:
+                                continue
+                            self._pending_passthrough.pop(_rpc_id_key(msg_id), None)
+                        msg = self._maybe_inject_init_instructions(msg_id, msg)
 
                     # Passthrough response, notification, or server-initiated request.
                     if isinstance(msg, dict):

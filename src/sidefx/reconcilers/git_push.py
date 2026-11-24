@@ -6,19 +6,18 @@ import math
 import os
 import re
 import subprocess
-import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from sidefx._redact import redact_remote_for_display, redact_secrets_in_text
 from sidefx.config import MAX_TIMEOUT_SECONDS
 from sidefx.journal import ActionRecord
 from sidefx.reconcilers.base import ReconcileResult, ReconcileState, parse_summary_meta
 
 DEFAULT_GIT_TIMEOUT = 15.0
 _HEX_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-_URL_IN_TEXT_RE = re.compile(r"(?:https?|ssh|git\+ssh)://[^\s'\"<>]+", re.IGNORECASE)
 _GIT_PUSH_TOOLS = frozenset({"git_push", "push_branch", "git-push"})
 
 # Global git flags that alter repo/config context and make push resolution non-trivial.
@@ -88,29 +87,8 @@ class GitPushSpec:
         return meta
 
 
-def redact_remote_for_display(remote: str) -> str:
-    """Strip passwords/query strings from URL-shaped git remotes while preserving SSH user."""
-    parsed = urllib.parse.urlsplit(remote)
-    if parsed.scheme and parsed.netloc:
-        host = parsed.hostname or ""
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        hostport = f"{host}:{parsed.port}" if parsed.port is not None else host
-        # Preserve non-password username on ssh:// URLs so `git ls-remote` uses the right user.
-        if (
-            parsed.scheme.lower() in ("ssh", "git+ssh")
-            and parsed.username
-            and parsed.password is None
-        ):
-            netloc = f"{parsed.username}@{hostport}"
-        else:
-            netloc = hostport
-        return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
-    return remote
-
-
 def _redact_urls_in_git_text(text: str) -> str:
-    return _URL_IN_TEXT_RE.sub(lambda m: redact_remote_for_display(m.group(0)), text)
+    return redact_secrets_in_text(text, remote_mode=True)
 
 
 def _git_env() -> dict[str, str]:

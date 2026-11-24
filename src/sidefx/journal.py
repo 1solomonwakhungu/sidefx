@@ -523,6 +523,8 @@ class Journal:
             return self._open_readonly_conn()
 
         if self._db_path is not None:
+            if self._db_path.is_symlink():
+                raise JournalError(f"Journal database path must not be a symlink: {self._db_path}")
             if self._db_path.is_dir():
                 raise JournalError(
                     f"Journal database path is a directory, expected a file: {self._db_path}"
@@ -539,6 +541,12 @@ class Journal:
                 with suppress(OSError):
                     os.chmod(journal_dir, 0o700)
                 _write_journal_gitignore(journal_dir)
+            elif journal_dir.name == ".sidefx":
+                getuid = getattr(os, "getuid", None)
+                if getuid is not None:
+                    with suppress(OSError):
+                        if journal_dir.stat().st_uid == getuid():
+                            os.chmod(journal_dir, 0o700)
             if not self._db_path.exists():
                 create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
                 if hasattr(os, "O_NOFOLLOW"):
