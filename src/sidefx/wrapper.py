@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from sidefx._redact import redact_secrets_in_text as _redact_secrets_in_text
+from sidefx._redact import redact_url_for_display as _redact_url_for_display
 from sidefx.config import MAX_TIMEOUT_SECONDS, SidefxConfig, load_config
 from sidefx.guidance import outcome_unknown_cli_hint, payload_mismatch_message
 from sidefx.journal import (
@@ -121,76 +123,7 @@ class _CommandPlan:
     kind: str
 
 
-_TELEGRAM_BOT_SEG_RE = re.compile(r"^bot\d+:.+$")
-_KNOWN_SECRET_PREFIX_RE = re.compile(
-    r"^(?:xox[baprs]-|gh[pousr]_|github_pat_|sk_|pk_|rk_|whsec_|AIza|AKIA|eyJ)"
-)
-_HEX_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{24,}$")
-_OPAQUE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]{20,}$")
-_URL_SCHEME_IN_TEXT_RE = re.compile(r"(?:https?|ssh|git\+ssh)://[^\s'\"<>]+", re.IGNORECASE)
-_AUTH_TOKEN_RE = re.compile(r"\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE)
 _MAX_ERR_DETAIL_CHARS = 300
-
-
-def _mask_segment(segment: str, *, prefix: str = "") -> str:
-    digest = hashlib.sha256(segment.encode("utf-8")).hexdigest()[:8]
-    return f"{prefix}<redacted:{digest}>"
-
-
-def _is_token_like_path_segment(segment: str) -> bool:
-    """Return True when a URL path segment looks like an embedded webhook or API secret."""
-    if not segment:
-        return False
-    if _KNOWN_SECRET_PREFIX_RE.match(segment):
-        return True
-    if _HEX_TOKEN_RE.match(segment):
-        return True
-    if _OPAQUE_TOKEN_RE.match(segment):
-        has_lower = any("a" <= ch <= "z" for ch in segment)
-        has_upper = any("A" <= ch <= "Z" for ch in segment)
-        has_digit = any("0" <= ch <= "9" for ch in segment)
-        # Mixed case + digits (Slack/Discord/Stripe webhook tokens) or long mixed-case base64url.
-        if (has_lower and has_upper and has_digit) or (
-            len(segment) >= 24 and has_lower and has_upper
-        ):
-            return True
-    return False
-
-
-def _redact_url_path(path: str) -> str:
-    if not path or "/" not in path:
-        return path
-    out: list[str] = []
-    for seg in path.split("/"):
-        if _TELEGRAM_BOT_SEG_RE.match(seg):
-            out.append(_mask_segment(seg, prefix="bot"))
-        elif _is_token_like_path_segment(seg):
-            out.append(_mask_segment(seg))
-        else:
-            out.append(seg)
-    return "/".join(out)
-
-
-def _redact_url_for_display(url: str) -> str:
-    """Strip userinfo, query/fragment, and token-like path segments from URLs."""
-    parsed = urllib.parse.urlsplit(url)
-    if not parsed.scheme or not parsed.netloc:
-        return url
-    host = parsed.hostname or ""
-    if ":" in host and not host.startswith("["):
-        host = f"[{host}]"
-    netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
-    safe_path = _redact_url_path(parsed.path)
-    return urllib.parse.urlunsplit((parsed.scheme, netloc, safe_path, "", ""))
-
-
-def _redact_secrets_in_text(text: str) -> str:
-    """Redact inline-credential/webhook URLs and Bearer/Basic tokens from error lines."""
-    redacted = _URL_SCHEME_IN_TEXT_RE.sub(
-        lambda m: _redact_url_for_display(m.group(0)),
-        text,
-    )
-    return _AUTH_TOKEN_RE.sub(lambda m: f"{m.group(1)} <redacted>", redacted)
 
 
 def _parse_gh_repo_arg(raw: str) -> tuple[str | None, str | None]:
@@ -1877,7 +1810,10 @@ def wrap_command(
     raw_err_detail = (stderr.strip().splitlines()[-1] if stderr.strip() else None) or (
         f"Command exited with code {returncode}"
     )
-    err_detail = _redact_secrets_in_text(sanitize_text(raw_err_detail))
+    try:
+        err_detail = _redact_secrets_in_text(sanitize_text(raw_err_detail))
+    except Exception:
+        err_detail = "<redacted>"
     if len(err_detail) > _MAX_ERR_DETAIL_CHARS:
         err_detail = f"{err_detail[: _MAX_ERR_DETAIL_CHARS - 1]}…"
     if not err_detail:

@@ -13,6 +13,7 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from sidefx._redact import redact_secrets_in_text
 from sidefx.journal import PayloadMismatchError
 
 OUTCOME_UNKNOWN_BANNER = "OUTCOME UNKNOWN — reconcile before retrying"
@@ -27,6 +28,7 @@ def _sanitize_detail(text: str) -> str:
     cleaned = _ANSI_RE.sub("", text)
     cleaned = _UNSAFE_CHARS_RE.sub(" ", cleaned)
     cleaned = " ".join(cleaned.split())
+    cleaned = redact_secrets_in_text(cleaned)
     if len(cleaned) > _MAX_DETAIL_CHARS:
         cleaned = f"{cleaned[: _MAX_DETAIL_CHARS - 1]}…"
     return cleaned
