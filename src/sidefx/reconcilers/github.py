@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import os
 import re
 import urllib.error
@@ -12,6 +13,7 @@ import urllib.request
 from collections.abc import Sequence
 from typing import Any
 
+from sidefx.config import MAX_TIMEOUT_SECONDS
 from sidefx.journal import ActionRecord
 from sidefx.reconcilers.base import (
     ReconcileResult,
@@ -415,8 +417,16 @@ class GitHubReconciler:
             else os.environ.get(ENV_GITHUB_API_URL, "").strip() or DEFAULT_GITHUB_API_URL
         )
         base, scheme, netloc = _validate_api_base_url(raw_base)
-        if isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be > 0")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+            or timeout_seconds > MAX_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                f"timeout_seconds must be a finite number > 0 and <= {int(MAX_TIMEOUT_SECONDS)}"
+            )
         if (
             isinstance(per_page, bool)
             or not isinstance(per_page, int)
@@ -625,7 +635,9 @@ class GitHubReconciler:
                     return None, None, "GitHub API response exceeded safety size limit"
                 link_headers = resp.headers.get_all("Link") or []
         except urllib.error.HTTPError as exc:
-            return None, None, f"GitHub API HTTP error {exc.code}: {exc.reason}"
+            code, reason = exc.code, exc.reason
+            exc.close()
+            return None, None, f"GitHub API HTTP error {code}: {reason}"
         except urllib.error.URLError as exc:
             return None, None, f"GitHub API connection error: {exc.reason}"
         except TimeoutError as exc:

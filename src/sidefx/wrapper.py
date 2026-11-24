@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -19,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sidefx.config import SidefxConfig, load_config
+from sidefx.config import MAX_TIMEOUT_SECONDS, SidefxConfig, load_config
 from sidefx.guidance import outcome_unknown_cli_hint, payload_mismatch_message
 from sidefx.journal import (
     ActionStatus,
@@ -126,6 +127,8 @@ _KNOWN_SECRET_PREFIX_RE = re.compile(
 )
 _HEX_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{24,}$")
 _OPAQUE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]{20,}$")
+_URL_SCHEME_IN_TEXT_RE = re.compile(r"(?:https?|ssh|git\+ssh)://[^\s'\"<>]+", re.IGNORECASE)
+_AUTH_TOKEN_RE = re.compile(r"\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE)
 _MAX_ERR_DETAIL_CHARS = 300
 
 
@@ -179,6 +182,15 @@ def _redact_url_for_display(url: str) -> str:
     netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
     safe_path = _redact_url_path(parsed.path)
     return urllib.parse.urlunsplit((parsed.scheme, netloc, safe_path, "", ""))
+
+
+def _redact_secrets_in_text(text: str) -> str:
+    """Redact inline-credential/webhook URLs and Bearer/Basic tokens from error lines."""
+    redacted = _URL_SCHEME_IN_TEXT_RE.sub(
+        lambda m: _redact_url_for_display(m.group(0)),
+        text,
+    )
+    return _AUTH_TOKEN_RE.sub(lambda m: f"{m.group(1)} <redacted>", redacted)
 
 
 def _parse_gh_repo_arg(raw: str) -> tuple[str | None, str | None]:
@@ -462,6 +474,17 @@ def _inspect_curl_command(
             continue
         if tok in value_flags:
             idx += 2
+            continue
+        if tok == "--url" and idx + 1 < len(argv):
+            if argv[idx + 1].startswith(("http://", "https://")):
+                url = argv[idx + 1]
+            idx += 2
+            continue
+        if tok.startswith("--url="):
+            cand_url = tok.split("=", 1)[1]
+            if cand_url.startswith(("http://", "https://")):
+                url = cand_url
+            idx += 1
             continue
         if tok.startswith(("http://", "https://")):
             url = tok
@@ -1326,10 +1349,23 @@ def wrap_command(
     """
     if not cmd:
         raise ValueError("Wrapped command must not be empty")
-    if isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
-        raise ValueError("timeout_seconds must be > 0")
-    if isinstance(min_retry_age_seconds, bool) or min_retry_age_seconds < 0:
-        raise ValueError("min_retry_age_seconds must be >= 0")
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+        or timeout_seconds > MAX_TIMEOUT_SECONDS
+    ):
+        raise ValueError(
+            f"timeout_seconds must be a finite number > 0 and <= {int(MAX_TIMEOUT_SECONDS)}"
+        )
+    if (
+        isinstance(min_retry_age_seconds, bool)
+        or not isinstance(min_retry_age_seconds, (int, float))
+        or not math.isfinite(min_retry_age_seconds)
+        or min_retry_age_seconds < 0
+    ):
+        raise ValueError("min_retry_age_seconds must be a finite number >= 0")
     if action_id is not None and random_action_id:
         raise ValueError("Cannot specify both action_id and random_action_id")
 
@@ -1841,7 +1877,7 @@ def wrap_command(
     raw_err_detail = (stderr.strip().splitlines()[-1] if stderr.strip() else None) or (
         f"Command exited with code {returncode}"
     )
-    err_detail = sanitize_text(raw_err_detail)
+    err_detail = _redact_secrets_in_text(sanitize_text(raw_err_detail))
     if len(err_detail) > _MAX_ERR_DETAIL_CHARS:
         err_detail = f"{err_detail[: _MAX_ERR_DETAIL_CHARS - 1]}…"
     if not err_detail:
@@ -1907,8 +1943,10 @@ def _positive_float(raw: str) -> float:
         value = float(raw)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid number: {raw!r}") from exc
-    if value <= 0 or value != value:
-        raise argparse.ArgumentTypeError("value must be > 0")
+    if not math.isfinite(value) or value <= 0 or value > MAX_TIMEOUT_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"value must be a finite number > 0 and <= {int(MAX_TIMEOUT_SECONDS)}"
+        )
     return value
 
 
@@ -1917,8 +1955,8 @@ def _non_negative_float(raw: str) -> float:
         value = float(raw)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid number: {raw!r}") from exc
-    if value < 0 or value != value:
-        raise argparse.ArgumentTypeError("value must be >= 0")
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("value must be a finite number >= 0")
     return value
 
 
@@ -2093,9 +2131,18 @@ def handle_wrap_cli(args: argparse.Namespace, config: SidefxConfig) -> int:
 
     _write_stream(sys.stdout, res.stdout_bytes, res.stdout)
     _write_stream(sys.stderr, res.stderr_bytes, res.stderr)
-    if res.stderr and not res.executed and not res.stderr.endswith("\n"):
-        # A launch failure is sidefx's own message (no child output to preserve verbatim).
-        sys.stderr.write("\n")
+    will_print_diag = bool(
+        res.replayed
+        or res.reconciled
+        or (res.error and res.exit_code != 0 and res.error.strip() != res.stderr.strip())
+        or hint
+    )
+    if (res.stderr or res.stderr_bytes) and (not res.executed or will_print_diag):
+        ends_with_nl = (
+            res.stderr_bytes.endswith(b"\n") if res.stderr_bytes else res.stderr.endswith("\n")
+        )
+        if not ends_with_nl:
+            sys.stderr.write("\n")
 
     if res.replayed:
         print(
