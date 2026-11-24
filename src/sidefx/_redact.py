@@ -15,7 +15,10 @@ _OPAQUE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]{20,}$")
 
 # Match any RFC 3986 scheme://... URL, allowing single quotes inside credentials/paths
 # while stripping trailing closing quotes/punctuation after matching.
-_URL_SCHEME_IN_TEXT_RE = re.compile(r"[a-z][a-z0-9+.-]*://[^\s\"<>]+", re.IGNORECASE)
+# Negative lookbehind prevents quadratic backtracking across long alphanumeric runs.
+_URL_SCHEME_IN_TEXT_RE = re.compile(
+    r"(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s\"<>]+", re.IGNORECASE
+)
 _FALLBACK_USERINFO_RE = re.compile(r"(://)[^/\s]*@")
 _FALLBACK_QUERY_FRAG_RE = re.compile(r"[?#].*$")
 

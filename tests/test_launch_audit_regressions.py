@@ -612,3 +612,26 @@ def test_mcp_proxy_ambiguous_error_text_recognizes_http_5xx_variants() -> None:
         "403 Forbidden: insufficient scope",
     ):
         assert _is_ambiguous_error_text(msg) is False, f"expected non-ambiguous: {msg!r}"
+
+
+def test_redact_secrets_linear_time_on_long_lines() -> None:
+    import time
+
+    from sidefx._redact import redact_secrets_in_text
+
+    samples = [
+        "a" * 200_000,
+        "A" * 200_000,
+        "0123456789abcdef" * 12_500,
+        ("word " * 40_000).strip(),
+        "a" * 100_000 + " https://u:p@h:abc/ 'https://a:b@h/r' ftp://u:s@f/p",
+    ]
+    start = time.monotonic()
+    outputs = [redact_secrets_in_text(sample) for sample in samples]
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0, f"redaction took {elapsed:.3f}s on 200KB inputs (expected < 1.0s)"
+    assert "u:p@" not in outputs[-1]
+    assert "a:b@" not in outputs[-1]
+    assert "u:s@" not in outputs[-1]
+    assert "ftp://f/p" in outputs[-1]
