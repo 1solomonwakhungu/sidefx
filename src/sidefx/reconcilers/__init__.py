@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sidefx.config import SidefxConfig, load_config
+from sidefx.config import MAX_TIMEOUT_SECONDS, SidefxConfig, load_config
 from sidefx.guidance import resolve_command
 from sidefx.journal import (
     ActionRecord,
@@ -301,8 +302,10 @@ def _positive_float(raw: str) -> float:
         value = float(raw)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid number: {raw!r}") from exc
-    if value <= 0 or value != value:  # reject <= 0 and NaN
-        raise argparse.ArgumentTypeError("value must be > 0")
+    if not math.isfinite(value) or value <= 0 or value > MAX_TIMEOUT_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"value must be a finite number > 0 and <= {int(MAX_TIMEOUT_SECONDS)}"
+        )
     return value
 
 
@@ -311,8 +314,8 @@ def _non_negative_float(raw: str) -> float:
         value = float(raw)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid number: {raw!r}") from exc
-    if value < 0 or value != value:
-        raise argparse.ArgumentTypeError("value must be >= 0")
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("value must be a finite number >= 0")
     return value
 
 

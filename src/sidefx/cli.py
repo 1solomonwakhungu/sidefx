@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import sys
 import tempfile
 from collections.abc import Sequence
@@ -383,6 +384,12 @@ def _cmd_init(args: argparse.Namespace, config: SidefxConfig) -> int:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
     else:
+        target_mode = 0o644
+        if dest.exists() and not dest.is_symlink():
+            try:
+                target_mode = stat.S_IMODE(dest.stat().st_mode)
+            except OSError:
+                target_mode = 0o644
         tmp_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -397,6 +404,7 @@ def _cmd_init(args: argparse.Namespace, config: SidefxConfig) -> int:
                 tmp_file.write(content)
                 tmp_file.flush()
                 os.fsync(tmp_file.fileno())
+            os.chmod(tmp_path, target_mode)
             os.replace(tmp_path, dest)
             tmp_path = None
         finally:
