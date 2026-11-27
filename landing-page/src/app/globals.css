@@ -1,0 +1,25 @@
+@import "tailwindcss";
+@import "../styles/tonal-tokens.css";
+
+html {
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+body {
+  font-family: var(--t-font);
+  background: var(--t-bg);
+  color: var(--t-ink);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Offset in-page anchor targets below the sticky header */
+section[id] {
+  scroll-margin-top: 5.5rem;
+}

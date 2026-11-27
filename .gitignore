@@ -16,3 +16,8 @@ htmlcov/
 *.db
 *.db-wal
 *.db-shm
+landing-page/node_modules/
+landing-page/.next/
+landing-page/.vercel/
+landing-page/.env.local
+landing-page/*.tsbuildinfo

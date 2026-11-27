@@ -2,6 +2,8 @@
 
 **Outbound effects journal, transparent stdio MCP proxy, CLI mutation wrapper, crash reconciler, and ground-truth session receipts for AI agents.**
 
+**Website:** [sidefx.harlo.dev](https://sidefx.harlo.dev) · **PyPI:** [pypi.org/project/sidefx](https://pypi.org/project/sidefx/)
+
 When an AI agent mutates external state (`gh issue create`, `git push`, MCP `tools/call`, webhooks, payments), two failure modes happen repeatedly:
 
 1. **Timeouts and crashes cause duplicate writes** — the agent retries without knowing whether the first call already landed on the remote service.
