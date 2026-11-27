@@ -23,13 +23,3 @@ body {
 section[id] {
   scroll-margin-top: 5.5rem;
 }
-
-/* Subtle hide-scrollbar utility for single-row scrollable segmented controls */
-.no-scrollbar {
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-}
-
-.no-scrollbar::-webkit-scrollbar {
-  display: none;
-}

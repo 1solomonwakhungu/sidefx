@@ -108,6 +108,7 @@ export function SidefxLanding() {
   const [errorDataOpen, setErrorDataOpen] = React.useState(false);
   const [copiedKey, setCopiedKey] = React.useState<string | null>(null);
   const copyTimerRef = React.useRef<number | null>(null);
+  const mobileMenuBtnRef = React.useRef<HTMLButtonElement | null>(null);
 
   React.useEffect(() => {
     try {
@@ -128,6 +129,31 @@ export function SidefxLanding() {
       }
     };
   }, []);
+
+  React.useEffect(() => {
+    if (!mobileMenuOpen) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setMobileMenuOpen(false);
+        mobileMenuBtnRef.current?.focus();
+      }
+    };
+
+    const mql = window.matchMedia?.("(min-width: 1024px)");
+    const handleMediaChange = (e: MediaQueryListEvent) => {
+      if (e.matches) {
+        setMobileMenuOpen(false);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    mql?.addEventListener?.("change", handleMediaChange);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      mql?.removeEventListener?.("change", handleMediaChange);
+    };
+  }, [mobileMenuOpen]);
 
   const toggleTheme = React.useCallback(() => {
     setTheme((prev) => {
@@ -226,7 +252,7 @@ export function SidefxLanding() {
             <a
               href={SITE_META.repoUrl}
               target="_blank"
-              rel="noreferrer"
+              rel="noopener noreferrer"
               className="inline-flex items-center gap-1.5 rounded-full bg-[var(--t-surface)] hover:bg-[var(--t-surface-muted)] border border-[var(--t-border-subtle)] px-3.5 h-8 sm:h-9 text-[12.5px] font-medium text-[var(--t-ink)] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-ring)]"
             >
               <GithubIcon className="h-3.5 w-3.5 shrink-0" />
@@ -256,9 +282,11 @@ export function SidefxLanding() {
             </button>
 
             <button
+              ref={mobileMenuBtnRef}
               type="button"
               onClick={() => setMobileMenuOpen((open) => !open)}
               aria-expanded={mobileMenuOpen}
+              aria-controls="mobile-nav"
               aria-label="Toggle section menu"
               className="lg:hidden inline-flex h-8 w-8 sm:h-9 sm:w-9 shrink-0 items-center justify-center rounded-full bg-[var(--t-surface)] border border-[var(--t-border-subtle)] text-[var(--t-ink-secondary)] hover:text-[var(--t-ink)] hover:bg-[var(--t-surface-muted)] cursor-pointer transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-ring)]"
             >
@@ -274,6 +302,7 @@ export function SidefxLanding() {
         {/* Mobile Dropdown Navigation */}
         {mobileMenuOpen && (
           <nav
+            id="mobile-nav"
             aria-label="Mobile sections"
             className="lg:hidden border-t border-[var(--t-border-subtle)] bg-[var(--t-bg)] px-5 py-3"
           >
@@ -334,7 +363,7 @@ export function SidefxLanding() {
             <a
               href={SITE_META.repoUrl}
               target="_blank"
-              rel="noreferrer"
+              rel="noopener noreferrer"
               className="inline-flex items-center justify-center gap-2 font-medium leading-none tracking-[-0.01em] rounded-[var(--t-radius-btn)] px-7 py-3.5 text-[15px] bg-transparent text-[var(--t-ink)] border border-[var(--t-ink-muted)] hover:bg-[var(--t-hover-overlay)] transition-all duration-200 [transition-timing-function:var(--t-ease)] active:scale-[0.98] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-ring)]"
             >
               <GithubIcon className="h-4 w-4" />
@@ -349,17 +378,15 @@ export function SidefxLanding() {
             padding="md"
             className="w-full max-w-3xl text-left flex flex-col gap-4"
           >
-            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-              <div className="overflow-x-auto max-w-full no-scrollbar -mx-1 px-1">
-                <TonalSegmentedControl
-                  ariaLabel="Choose installation method"
-                  options={installOptions}
-                  value={installId}
-                  onValueChange={setInstallId}
-                  size="sm"
-                  className="flex-nowrap"
-                />
-              </div>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <TonalSegmentedControl
+                ariaLabel="Choose installation method"
+                options={installOptions}
+                value={installId}
+                onValueChange={setInstallId}
+                size="sm"
+                className="max-w-full"
+              />
 
               <TonalButton
                 type="button"
@@ -367,7 +394,7 @@ export function SidefxLanding() {
                 size="sm"
                 onClick={() => copyText(`install-${activeInstall.id}`, activeInstall.copyText)}
                 aria-label={`Copy ${activeInstall.label} command`}
-                className="self-start sm:self-auto shrink-0"
+                className="shrink-0"
               >
                 {copiedKey === `install-${activeInstall.id}` ? (
                   <>
@@ -454,44 +481,47 @@ export function SidefxLanding() {
           </div>
 
           <SurfaceTile tone="neutral" bordered padding="md" className="flex flex-col gap-5">
-            <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
-              <div className="overflow-x-auto max-w-full no-scrollbar -mx-1 px-1">
-                <TonalSegmentedControl
-                  ariaLabel="Select setup configuration or sample output"
-                  options={setupOptions}
-                  value={setupTabId}
-                  onValueChange={setSetupTabId}
-                  size="sm"
-                  className="flex-nowrap"
-                />
-              </div>
+            {/* Full-width wrapping tab switcher — all 6 tabs visible with zero clipping */}
+            <div className="w-full">
+              <TonalSegmentedControl
+                ariaLabel="Select setup configuration or sample output"
+                options={setupOptions}
+                value={setupTabId}
+                onValueChange={setSetupTabId}
+                size="sm"
+                className="max-w-full"
+              />
+            </div>
 
-              <div className="flex items-center gap-2 shrink-0">
+            {/* Dedicated metadata & copy toolbar */}
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-1 border-t border-[var(--t-border-subtle)]/70">
+              <div className="flex flex-wrap items-center gap-2.5 min-w-0">
                 <span className="inline-flex items-center gap-1.5 rounded-full bg-[var(--t-elevated)] border border-[var(--t-border-subtle)] px-3 py-1 text-[12px] font-mono text-[var(--t-ink-secondary)]">
-                  <Terminal className="h-3 w-3 text-[var(--t-ink-muted)]" />
-                  {activeSetup.filename}
+                  <Terminal className="h-3 w-3 text-[var(--t-ink-muted)] shrink-0" />
+                  <span>{activeSetup.filename}</span>
                 </span>
-
-                <TonalButton
-                  type="button"
-                  variant="tonal"
-                  size="sm"
-                  onClick={() => copyText(`setup-${activeSetup.id}`, activeSetup.code)}
-                  aria-label={`Copy ${activeSetup.label} snippet`}
-                >
-                  {copiedKey === `setup-${activeSetup.id}` ? (
-                    <>
-                      <Check className="h-3.5 w-3.5 text-[var(--t-success)]" />
-                      Copied
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="h-3.5 w-3.5" />
-                      Copy
-                    </>
-                  )}
-                </TonalButton>
               </div>
+
+              <TonalButton
+                type="button"
+                variant="tonal"
+                size="sm"
+                onClick={() => copyText(`setup-${activeSetup.id}`, activeSetup.code)}
+                aria-label={`${activeSetup.copyLabel} ${activeSetup.label} snippet`}
+                className="shrink-0"
+              >
+                {copiedKey === `setup-${activeSetup.id}` ? (
+                  <>
+                    <Check className="h-3.5 w-3.5 text-[var(--t-success)]" />
+                    Copied
+                  </>
+                ) : (
+                  <>
+                    <Copy className="h-3.5 w-3.5" />
+                    {activeSetup.copyLabel}
+                  </>
+                )}
+              </TonalButton>
             </div>
 
             <p className="t-body text-[14.5px] max-w-3xl">
@@ -507,9 +537,9 @@ export function SidefxLanding() {
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pt-1 text-[13px] text-[var(--t-ink-muted)]">
               <p className="leading-[1.5]">{activeSetup.note}</p>
               <ChevronLink
-                href={`${SITE_META.repoUrl}#drop-in-mcp-proxy-setup`}
+                href={`${SITE_META.repoUrl}${activeSetup.docsAnchor}`}
                 target="_blank"
-                rel="noreferrer"
+                rel="noopener noreferrer"
                 className="shrink-0"
               >
                 Full docs on GitHub
@@ -552,7 +582,14 @@ export function SidefxLanding() {
                       <div className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--t-radius-sm)] bg-[var(--t-elevated)] border border-[var(--t-border-subtle)] text-[var(--t-ink)]">
                         <Icon className="h-5 w-5" />
                       </div>
-                      <TonalChip tone={card.chipTone}>
+                      <TonalChip
+                        tone={card.chipTone}
+                        className={
+                          card.tone === "neutral"
+                            ? "border border-[var(--t-border-subtle)]"
+                            : "bg-[var(--t-elevated)] border border-[var(--t-border-subtle)]"
+                        }
+                      >
                         {card.chipLabel}
                       </TonalChip>
                     </div>
@@ -986,7 +1023,7 @@ export function SidefxLanding() {
               <ChevronLink
                 href={SITE_META.repoUrl}
                 target="_blank"
-                rel="noreferrer"
+                rel="noopener noreferrer"
               >
                 Read full README on GitHub
               </ChevronLink>
@@ -1015,7 +1052,7 @@ export function SidefxLanding() {
             <a
               href={SITE_META.repoUrl}
               target="_blank"
-              rel="noreferrer"
+              rel="noopener noreferrer"
               className="hover:text-[var(--t-ink)] transition-colors"
             >
               GitHub
@@ -1023,7 +1060,7 @@ export function SidefxLanding() {
             <a
               href={SITE_META.pypiUrl}
               target="_blank"
-              rel="noreferrer"
+              rel="noopener noreferrer"
               className="hover:text-[var(--t-ink)] transition-colors"
             >
               PyPI

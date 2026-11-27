@@ -52,8 +52,9 @@ export function TonalSegmentedControl<T extends string = string>({
   const handleKeyDown = (e: React.KeyboardEvent, idx: number) => {
     if (options.length === 0) return;
     let nextIdx: number | null = null;
-    if (e.key === "ArrowRight") nextIdx = (idx + 1) % options.length;
-    else if (e.key === "ArrowLeft")
+    if (e.key === "ArrowRight" || e.key === "ArrowDown")
+      nextIdx = (idx + 1) % options.length;
+    else if (e.key === "ArrowLeft" || e.key === "ArrowUp")
       nextIdx = (idx - 1 + options.length) % options.length;
     else if (e.key === "Home") nextIdx = 0;
     else if (e.key === "End") nextIdx = options.length - 1;
@@ -70,7 +71,7 @@ export function TonalSegmentedControl<T extends string = string>({
       role="radiogroup"
       aria-label={ariaLabel}
       className={cn(
-        "inline-flex flex-wrap items-center gap-0.5 rounded-full bg-[var(--t-surface-muted)] p-1 border border-[var(--t-border-subtle)]",
+        "inline-flex flex-wrap items-center gap-1 rounded-[22px] bg-[var(--t-surface-muted)] p-1 border border-[var(--t-border-subtle)]",
         className
       )}
     >

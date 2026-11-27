@@ -35,15 +35,17 @@ export const INSTALL_METHODS: InstallMethod[] = [
   {
     id: "uv-pip",
     label: "Install (uv / pip)",
-    caption: "Install globally via uv tool (recommended) or pip, then scaffold .sidefx.json.",
-    command: `uv tool install sidefx\n# or: pip install sidefx\ncd your-repo && sidefx init`,
+    caption:
+      "Install globally with uv tool (or pip install sidefx), then run sidefx init inside your repo.",
+    command: `uv tool install sidefx && sidefx init`,
     copyText: "uv tool install sidefx && sidefx init",
   },
   {
     id: "uvx",
     label: "Zero-Install (uvx)",
-    caption: "Try sidefx or run the self-contained chaos evaluation suite without installing globally.",
-    command: `uvx sidefx --help\nuvx sidefx eval --verbose`,
+    caption:
+      "Run the self-contained chaos evaluation suite (or uvx sidefx --help) without installing globally.",
+    command: `uvx sidefx eval --verbose`,
     copyText: "uvx sidefx eval --verbose",
   },
   {
@@ -75,6 +77,8 @@ export interface SetupExample {
   label: string;
   filename: string;
   language: string;
+  docsAnchor: string;
+  copyLabel: string;
   summary: string;
   note: string;
   code: string;
@@ -83,9 +87,11 @@ export interface SetupExample {
 export const SETUP_EXAMPLES: SetupExample[] = [
   {
     id: "claude-code",
-    label: "Claude Code (.mcp.json)",
+    label: "Claude Code",
     filename: ".mcp.json",
     language: "json",
+    docsAnchor: "#drop-in-mcp-proxy-setup",
+    copyLabel: "Copy",
     summary:
       "Wrap any stdio MCP server in Claude Code (.mcp.json or ~/.claude.json). Read-only calls pass straight through; mutating calls journal write-ahead in SQLite.",
     note: "Tip: If you have not installed sidefx globally, set \"command\": \"uvx\" and prepend \"sidefx\" to args.",
@@ -118,9 +124,11 @@ export const SETUP_EXAMPLES: SetupExample[] = [
   },
   {
     id: "cursor",
-    label: "Cursor (.cursor/mcp.json)",
+    label: "Cursor",
     filename: ".cursor/mcp.json",
     language: "json",
+    docsAnchor: "#drop-in-mcp-proxy-setup",
+    copyLabel: "Copy",
     summary:
       "Prefix any Cursor stdio MCP server with sidefx mcp-proxy --deterministic-ids -- for session-scoped deduplication and automatic initialize protocol guidance.",
     note: "When --target is omitted, wrapper launchers like npx, uvx, node, python3, and docker run are automatically unwrapped into readable target names.",
@@ -145,9 +153,11 @@ export const SETUP_EXAMPLES: SetupExample[] = [
   },
   {
     id: "codex",
-    label: "Codex (config.toml)",
+    label: "Codex",
     filename: "~/.codex/config.toml",
     language: "toml",
+    docsAnchor: "#drop-in-mcp-proxy-setup",
+    copyLabel: "Copy",
     summary:
       "Drop-in TOML configuration for Codex CLI MCP servers with deterministic action IDs and 30-second fail-closed timeouts.",
     note: "Session IDs persist in .sidefx/current-session across proxy restarts; inspect or rotate them with sidefx session current and sidefx session new.",
@@ -172,9 +182,11 @@ args = [
   },
   {
     id: "cli-wrap",
-    label: "CLI Wrap (gh / git push / curl)",
-    filename: "shell",
+    label: "CLI Wrap",
+    filename: "gh / git push / curl",
     language: "bash",
+    docsAnchor: "#cli-mutation-wrapper-sidefx-wrap",
+    copyLabel: "Copy",
     summary:
       "Wrap mutating shell commands directly. git push and gh issue/pr create|comment derive deterministic action IDs automatically and reconcile read-only on timeout.",
     note: "For gh writes and GitHub REST curl POSTs, sidefx injects a hidden <!-- sidefx:id=<marker> --> marker so retries recover the exact URL without double-posting.",
@@ -199,9 +211,11 @@ sidefx wrap \\
   },
   {
     id: "preflight",
-    label: "Preflight (.sidefx.json)",
+    label: "Preflight",
     filename: ".sidefx.json",
     language: "json",
+    docsAnchor: "#deterministic-preflight-guardrails-sidefxjson",
+    copyLabel: "Copy",
     summary:
       "Scaffold with sidefx init to configure read/mutate tool classification and deterministic preflight guardrails evaluated before any upstream tool runs.",
     note: "Violations fail closed with JSON-RPC -32001 and never reach the upstream server. Setting required: true prevents omitted-argument bypasses.",
@@ -256,9 +270,11 @@ sidefx wrap \\
   },
   {
     id: "receipt",
-    label: "Session Receipt (sidefx report)",
+    label: "Session Receipt",
     filename: "sidefx report --format markdown",
     language: "markdown",
+    docsAnchor: "#ground-truth-session-receipts-sidefx-report",
+    copyLabel: "Copy sample",
     summary:
       "Render compact Markdown, plain-text, or JSON receipts strictly from SQLite rows opened in read-only URI mode (mode=ro, PRAGMA query_only=ON).",
     note: "Wire Claude Code's Stop hook with sidefx init --claude-code --write: silent when 0 writes occurred, loud warning whenever pending/unknown actions remain.",
@@ -311,7 +327,7 @@ export const ARCHITECTURE_CARDS: ArchitectureCard[] = [
     description:
       "Atomically claims every mutating intent as pending before dispatching any external call, preventing race-condition double writes across concurrent workers.",
     highlights: [
-      "PRAGMA journal_mode=WAL + synchronous=FULL + fullfsync=ON",
+      "PRAGMA journal_mode=WAL + synchronous=FULL (+ fullfsync=ON on macOS)",
       "Attempt-fenced BEGIN IMMEDIATE state transitions",
       "UNIQUE (actor, target, action_id) deduplication key",
     ],
