@@ -1,3 +1,9 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/sidefx-logo-dark-256.png" />
+  <source media="(prefers-color-scheme: light)" srcset="docs/brand/sidefx-logo-256.png" />
+  <img alt="sidefx" src="docs/brand/sidefx-logo-256.png" width="72" height="72" />
+</picture>
+
 # sidefx
 
 **Outbound effects journal, transparent stdio MCP proxy, CLI mutation wrapper, crash reconciler, and ground-truth session receipts for AI agents.**

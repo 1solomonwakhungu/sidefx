@@ -18,6 +18,7 @@ import {
   Terminal,
   X,
 } from "lucide-react";
+import { BrandMark } from "@/components/brand-mark";
 import { TonalButton } from "@/components/tonal/button";
 import { SurfaceTile } from "@/components/tonal/surface-tile";
 import { TonalChip } from "@/components/tonal/chip";
@@ -54,37 +55,6 @@ const ARCH_ICONS: Record<
   "file-check": FileCheck2,
   lock: Lock,
 };
-
-function SidefxLogoMark({ className = "h-6 w-6" }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 32 32"
-      fill="none"
-      aria-hidden="true"
-      className={className}
-    >
-      <rect width="32" height="32" rx="10" fill="var(--t-ink)" />
-      <rect x="7" y="8" width="12" height="4.5" rx="2.25" fill="var(--t-bg)" />
-      <rect
-        x="7"
-        y="14.25"
-        width="18"
-        height="4.5"
-        rx="2.25"
-        fill="var(--t-blue)"
-      />
-      <rect
-        x="7"
-        y="20.5"
-        width="9"
-        height="4.5"
-        rx="2.25"
-        fill="var(--t-success)"
-      />
-      <circle cx="22.5" cy="22.75" r="2.25" fill="var(--t-success)" />
-    </svg>
-  );
-}
 
 function GithubIcon({ className = "h-4 w-4" }: { className?: string }) {
   return (
@@ -213,7 +183,7 @@ export function SidefxLanding() {
               href="#"
               className="flex items-center gap-2.5 text-[17px] font-medium tracking-[-0.02em] text-[var(--t-ink)] shrink-0 rounded-[8px] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-ring)]"
             >
-              <SidefxLogoMark className="h-6 w-6 shrink-0" />
+              <BrandMark className="h-6 w-6 shrink-0" />
               <span>sidefx</span>
             </a>
 
@@ -1040,7 +1010,7 @@ export function SidefxLanding() {
       <footer className="border-t border-[var(--t-border-subtle)] mt-auto">
         <div className="mx-auto max-w-6xl px-5 sm:px-8 py-8 flex flex-col sm:flex-row items-center justify-between gap-4 text-[13px] text-[var(--t-ink-muted)]">
           <div className="flex items-center gap-2.5">
-            <SidefxLogoMark className="h-5 w-5 shrink-0" />
+            <BrandMark className="h-5 w-5 shrink-0" />
             <span className="font-medium text-[var(--t-ink)]">sidefx</span>
             <span>·</span>
             <span>MIT License</span>
