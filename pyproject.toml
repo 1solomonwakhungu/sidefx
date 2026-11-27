@@ -40,7 +40,7 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/1solomonwakhungu/sidefx"
+Homepage = "https://sidefx.harlo.dev"
 Repository = "https://github.com/1solomonwakhungu/sidefx"
 Issues = "https://github.com/1solomonwakhungu/sidefx/issues"
 Documentation = "https://github.com/1solomonwakhungu/sidefx#readme"
@@ -63,6 +63,7 @@ exclude = [
     "PLAN.md",
     "AGENTS.md",
     ".github",
+    "landing-page",
 ]
 
 [tool.pytest.ini_options]

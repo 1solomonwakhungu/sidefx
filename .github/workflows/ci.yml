@@ -43,3 +43,21 @@ jobs:
           /tmp/sidefx-smoke-venv/bin/sidefx --version
           /tmp/sidefx-smoke-venv/bin/sidefx doctor --json
           /tmp/sidefx-smoke-venv/bin/python -m sidefx --version
+
+  landing-page:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: landing-page
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: landing-page/package-lock.json
+      - name: Install, typecheck, and build landing page
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build
