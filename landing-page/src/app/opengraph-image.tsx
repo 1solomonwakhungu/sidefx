@@ -37,49 +37,24 @@ export default function OpenGraphImage() {
               style={{
                 width: 44,
                 height: 44,
-                borderRadius: 14,
+                borderRadius: 13,
                 background: "#131314",
+                border: "1px solid rgba(255,255,255,0.1)",
                 display: "flex",
-                flexDirection: "column",
+                alignItems: "center",
                 justifyContent: "center",
-                gap: "4px",
-                padding: "9px",
               }}
             >
-              <div
-                style={{
-                  width: 16,
-                  height: 5,
-                  borderRadius: 9999,
-                  background: "#E3E3E3",
-                }}
-              />
-              <div
-                style={{
-                  width: 26,
-                  height: 5,
-                  borderRadius: 9999,
-                  background: "#8AB4F8",
-                }}
-              />
-              <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-                <div
-                  style={{
-                    width: 13,
-                    height: 5,
-                    borderRadius: 9999,
-                    background: "#81C995",
-                  }}
+              <svg width="30" height="30" viewBox="0 0 32 32" fill="none">
+                <path
+                  d="M6 9L12.5 16L6 23"
+                  stroke="#E3E3E3"
+                  strokeWidth="4"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
                 />
-                <div
-                  style={{
-                    width: 5,
-                    height: 5,
-                    borderRadius: 9999,
-                    background: "#81C995",
-                  }}
-                />
-              </div>
+                <circle cx="22.5" cy="16" r="5.25" fill="#8AB4F8" />
+              </svg>
             </div>
             <span
               style={{
